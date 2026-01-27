@@ -1,90 +1,112 @@
+"""
+Task API 端点
+从数据库读取任务数据（已移除 mock 数据）
+"""
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from typing import List
 from datetime import datetime
 
-from app.models import get_db
+from app.models import get_db, Task
 from app.schemas import TaskCreate
 
 router = APIRouter()
 
-# Mock data (mutable for create operations)
-MOCK_TASKS = [
-    {
-        "id": 1,
-        "title": "科技板块轮动监控",
-        "type": "rotation",
-        "baseIndex": "SPY",
-        "sector": None,
-        "etfs": ["XLK", "XLF", "XLV"],
-        "createdAt": "2026-01-25"
-    },
-    {
-        "id": 2,
-        "title": "科技内部行业下钻",
-        "type": "drilldown",
-        "baseIndex": "SPY",
-        "sector": "XLK",
-        "etfs": ["SOXX", "SMH", "IGV", "SKYY"],
-        "createdAt": "2026-01-24"
-    },
-    {
-        "id": 3,
-        "title": "半导体动能股追踪",
-        "type": "momentum",
-        "baseIndex": "SPY",
-        "sector": "XLK",
-        "etfs": ["SOXX", "SMH"],
-        "createdAt": "2026-01-23"
+
+def format_task_response(task: Task) -> dict:
+    """格式化任务响应数据"""
+    return {
+        "id": task.id,
+        "title": task.title,
+        "type": task.type,
+        "baseIndex": task.base_index,
+        "sector": task.sector,
+        "etfs": task.etfs or [],
+        "createdAt": task.created_at.strftime("%Y-%m-%d") if task.created_at else None
     }
-]
 
 
 @router.get("", response_model=List[dict])
 async def get_tasks(db: Session = Depends(get_db)):
-    """Get all monitoring tasks"""
-    return MOCK_TASKS
+    """
+    获取所有监控任务
+    """
+    tasks = db.query(Task).order_by(Task.created_at.desc()).all()
+    return [format_task_response(task) for task in tasks]
 
 
 @router.get("/{task_id}", response_model=dict)
 async def get_task(task_id: int, db: Session = Depends(get_db)):
-    """Get a specific task by ID"""
-    task = next((t for t in MOCK_TASKS if t["id"] == task_id), None)
+    """
+    根据 ID 获取单个任务
+    """
+    task = db.query(Task).filter(Task.id == task_id).first()
     
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     
-    return task
+    return format_task_response(task)
 
 
 @router.post("", response_model=dict)
 async def create_task(task: TaskCreate, db: Session = Depends(get_db)):
-    """Create a new monitoring task"""
-    new_id = max(t["id"] for t in MOCK_TASKS) + 1 if MOCK_TASKS else 1
+    """
+    创建新的监控任务
+    """
+    new_task = Task(
+        title=task.title,
+        type=task.type.value,
+        base_index=task.baseIndex,
+        sector=task.sector,
+        etfs=task.etfs,
+        created_at=datetime.utcnow()
+    )
     
-    new_task = {
-        "id": new_id,
-        "title": task.title,
-        "type": task.type.value,
-        "baseIndex": task.baseIndex,
-        "sector": task.sector,
-        "etfs": task.etfs,
-        "createdAt": datetime.now().strftime("%Y-%m-%d")
-    }
+    db.add(new_task)
+    db.commit()
+    db.refresh(new_task)
     
-    MOCK_TASKS.append(new_task)
-    return new_task
+    return format_task_response(new_task)
 
 
-@router.delete("/{task_id}")
-async def delete_task(task_id: int, db: Session = Depends(get_db)):
-    """Delete a monitoring task"""
-    global MOCK_TASKS
-    
-    task = next((t for t in MOCK_TASKS if t["id"] == task_id), None)
+@router.put("/{task_id}", response_model=dict)
+async def update_task(
+    task_id: int,
+    task_update: TaskCreate,
+    db: Session = Depends(get_db)
+):
+    """
+    更新任务
+    """
+    task = db.query(Task).filter(Task.id == task_id).first()
     
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     
-    MOCK_TASKS = [t for t in MOCK_TASKS if t["id"] != task_id]
+    task.title = task_update.title
+    task.type = task_update.type.value
+    task.base_index = task_update.baseIndex
+    task.sector = task_update.sector
+    task.etfs = task_update.etfs
+    
+    db.commit()
+    db.refresh(task)
+    
+    return format_task_response(task)
+
+
+@router.delete("/{task_id}")
+async def delete_task(task_id: int, db: Session = Depends(get_db)):
+    """
+    删除任务
+    """
+    task = db.query(Task).filter(Task.id == task_id).first()
+    
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    db.delete(task)
+    db.commit()
+    
     return {"message": "Task deleted successfully"}

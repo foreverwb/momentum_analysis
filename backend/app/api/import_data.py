@@ -6,16 +6,24 @@ Data Import API Endpoints
 - Finviz 技术指标数据导入
 - MarketChameleon 期权数据导入
 - CSV/JSON 批量导入
+- ETF Holdings xlsx 文件上传
 """
 
-from fastapi import APIRouter, HTTPException, File, UploadFile, Form
+from fastapi import APIRouter, HTTPException, File, UploadFile, Form, Depends, Query
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+from sqlalchemy import func
 from typing import List, Dict, Optional, Any
 from datetime import datetime, date
 import json
 import csv
 import io
 import logging
+
+from app.models import (
+    get_db, ETF, ETFHolding, HoldingsUploadLog,
+    is_valid_ticker, is_valid_sector_symbol, VALID_SECTOR_SYMBOLS
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +86,350 @@ class HoldingsImportResponse(BaseModel):
     scored_holdings: Optional[List[Dict[str, Any]]] = None
 
 
+class HoldingsUploadResponse(BaseModel):
+    """Holdings xlsx 上传响应"""
+    status: str
+    etf_symbol: str
+    etf_type: str
+    data_date: str
+    records_imported: int
+    records_skipped: int
+    skipped_details: Optional[List[Dict[str, str]]] = None
+
+
+# ==================== 辅助函数 ====================
+
+def parse_xlsx_holdings(file_content: bytes) -> List[Dict[str, Any]]:
+    """
+    解析 xlsx 文件，提取 Ticker 和 Weight 列
+    
+    支持的表头格式:
+    | Name | Ticker | Identifier | SEDOL | Weight | Sector | Shares Held | Local Currency |
+    """
+    try:
+        import openpyxl
+        from io import BytesIO
+        import re
+        
+        workbook = openpyxl.load_workbook(BytesIO(file_content), read_only=False, data_only=True)
+        
+        def normalize_header(value) -> str:
+            if value is None:
+                return ""
+            text = str(value).strip().lower().replace("\u00a0", " ")
+            text = re.sub(r"\s+", " ", text)
+            return re.sub(r"[^a-z0-9]", "", text)
+        
+        def find_header_in_sheet(sheet, max_rows: int = 50):
+            for row_idx, row in enumerate(
+                sheet.iter_rows(min_row=1, max_row=max_rows, max_col=sheet.max_column, values_only=True), start=1
+            ):
+                row_ticker = None
+                row_weight = None
+                for idx, cell in enumerate(row):
+                    header_key = normalize_header(cell)
+                    if not header_key:
+                        continue
+                    if row_ticker is None and ("ticker" in header_key or header_key == "symbol"):
+                        row_ticker = idx
+                    if row_weight is None and "weight" in header_key:
+                        row_weight = idx
+                if row_ticker is not None and row_weight is not None:
+                    return row_idx, row_ticker, row_weight
+            return None, None, None
+
+        header_row = None
+        ticker_idx = None
+        weight_idx = None
+        target_sheet = None
+        for sheet in workbook.worksheets:
+            header_row, ticker_idx, weight_idx = find_header_in_sheet(sheet)
+            if header_row is not None:
+                target_sheet = sheet
+                break
+
+        if header_row is None or target_sheet is None:
+            raise ValueError("未找到包含 Ticker 和 Weight 的表头行")
+        
+        # 解析数据行
+        holdings = []
+        for row_idx, row in enumerate(
+            target_sheet.iter_rows(
+                min_row=header_row + 1,
+                max_row=target_sheet.max_row,
+                max_col=target_sheet.max_column,
+                values_only=True
+            ),
+            start=header_row + 1
+        ):
+            if len(row) > max(ticker_idx, weight_idx):
+                ticker = row[ticker_idx]
+                weight = row[weight_idx]
+                
+                if ticker and weight is not None:
+                    holdings.append({
+                        "row": row_idx,
+                        "ticker": str(ticker).strip(),
+                        "weight": weight
+                    })
+        
+        return holdings
+        
+    except ImportError:
+        raise HTTPException(
+            status_code=500, 
+            detail="需要安装 openpyxl 库: pip install openpyxl"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"解析 xlsx 文件失败: {str(e)}")
+
+
+def validate_and_filter_holdings(holdings: List[Dict[str, Any]]) -> tuple:
+    """
+    验证并过滤持仓数据
+    返回: (有效持仓列表, 跳过的记录详情)
+    """
+    valid_holdings = []
+    skipped = []
+    
+    for h in holdings:
+        ticker = h.get("ticker", "")
+        weight = h.get("weight")
+        row = h.get("row", "unknown")
+        
+        # 验证 Ticker
+        if not is_valid_ticker(ticker):
+            skipped.append({
+                "row": str(row),
+                "ticker": ticker,
+                "reason": "Ticker 为空或不是有效的英文字符"
+            })
+            continue
+        
+        # 验证 Weight
+        try:
+            weight_float = float(weight)
+            if weight_float <= 0:
+                skipped.append({
+                    "row": str(row),
+                    "ticker": ticker,
+                    "reason": f"Weight 值无效: {weight}"
+                })
+                continue
+        except (ValueError, TypeError):
+            skipped.append({
+                "row": str(row),
+                "ticker": ticker,
+                "reason": f"Weight 无法转换为数字: {weight}"
+            })
+            continue
+        
+        valid_holdings.append({
+            "ticker": ticker.upper(),
+            "weight": weight_float
+        })
+    
+    return valid_holdings, skipped
+
+
 # ==================== API Endpoints ====================
+
+@router.post("/holdings/xlsx", response_model=HoldingsUploadResponse)
+async def upload_holdings_xlsx(
+    file: UploadFile = File(..., description="xlsx 文件"),
+    etf_type: str = Form(..., description="ETF 类型: sector 或 industry"),
+    etf_symbol: str = Form(..., description="ETF 符号"),
+    data_date: str = Form(..., description="数据日期 (YYYY-MM-DD)"),
+    parent_sector: Optional[str] = Form(None, description="父板块符号（仅 industry 类型需要）"),
+    db: Session = Depends(get_db)
+):
+    """
+    上传 ETF Holdings xlsx 文件
+    
+    - 板块 ETF: etf_type=sector, etf_symbol 必须是 11 个默认板块之一
+    - 行业 ETF: etf_type=industry, 需要提供 parent_sector（所属板块）
+    
+    xlsx 文件格式:
+    | Name | Ticker | Identifier | SEDOL | Weight | Sector | Shares Held | Local Currency |
+    
+    只会提取 Ticker 和 Weight 列
+    """
+    # 验证 etf_type
+    if etf_type not in ["sector", "industry"]:
+        raise HTTPException(status_code=400, detail="etf_type 必须是 'sector' 或 'industry'")
+    
+    etf_symbol = etf_symbol.upper()
+    
+    # 板块 ETF 验证
+    if etf_type == "sector":
+        if not is_valid_sector_symbol(etf_symbol):
+            raise HTTPException(
+                status_code=400, 
+                detail=f"无效的板块 ETF 符号。有效值: {', '.join(VALID_SECTOR_SYMBOLS)}"
+            )
+    
+    # 行业 ETF 验证
+    if etf_type == "industry":
+        if parent_sector:
+            parent_sector = parent_sector.upper()
+            if not is_valid_sector_symbol(parent_sector):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"无效的父板块符号。有效值: {', '.join(VALID_SECTOR_SYMBOLS)}"
+                )
+    
+    # 验证日期格式
+    try:
+        parsed_date = datetime.strptime(data_date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="日期格式无效，请使用 YYYY-MM-DD 格式")
+    
+    # 验证文件类型
+    if not file.filename.endswith(('.xlsx', '.xls')):
+        raise HTTPException(status_code=400, detail="只支持 xlsx 或 xls 文件格式")
+    
+    try:
+        # 读取文件内容
+        file_content = await file.read()
+        
+        # 解析 xlsx
+        raw_holdings = parse_xlsx_holdings(file_content)
+        
+        if not raw_holdings:
+            raise HTTPException(status_code=400, detail="xlsx 文件中没有找到有效的持仓数据")
+        
+        # 验证和过滤数据
+        valid_holdings, skipped = validate_and_filter_holdings(raw_holdings)
+        
+        if not valid_holdings:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"所有持仓数据都无效。跳过 {len(skipped)} 条记录"
+            )
+        
+        # 查找或创建 ETF
+        etf = db.query(ETF).filter(ETF.symbol == etf_symbol).first()
+        
+        if not etf:
+            # 创建新的 ETF 记录
+            etf = ETF(
+                symbol=etf_symbol,
+                name=etf_symbol,
+                type=etf_type,
+                parent_sector=parent_sector if etf_type == "industry" else None,
+                score=0.0,
+                rank=0,
+                delta={"delta3d": None, "delta5d": None},
+                completeness=0.0,
+                holdings_count=0
+            )
+            db.add(etf)
+            db.flush()
+            logger.info(f"创建新的 ETF 记录: {etf_symbol}")
+        
+        # 删除该 ETF 在指定日期的旧持仓数据
+        db.query(ETFHolding).filter(
+            ETFHolding.etf_id == etf.id,
+            ETFHolding.data_date == parsed_date
+        ).delete()
+        
+        # 插入新的持仓数据
+        for h in valid_holdings:
+            holding = ETFHolding(
+                etf_id=etf.id,
+                etf_symbol=etf_symbol,
+                ticker=h["ticker"],
+                weight=h["weight"],
+                data_date=parsed_date
+            )
+            db.add(holding)
+        
+        # 更新 ETF 的持仓数量
+        etf.holdings_count = len(valid_holdings)
+        etf.updated_at = datetime.utcnow()
+        
+        # 记录上传日志
+        upload_log = HoldingsUploadLog(
+            etf_symbol=etf_symbol,
+            etf_type=etf_type,
+            data_date=parsed_date,
+            file_name=file.filename,
+            records_count=len(valid_holdings),
+            skipped_count=len(skipped),
+            status="success"
+        )
+        db.add(upload_log)
+        
+        db.commit()
+        
+        logger.info(f"成功上传 {etf_symbol} 的持仓数据: {len(valid_holdings)} 条记录, 跳过 {len(skipped)} 条")
+        
+        return HoldingsUploadResponse(
+            status="success",
+            etf_symbol=etf_symbol,
+            etf_type=etf_type,
+            data_date=data_date,
+            records_imported=len(valid_holdings),
+            records_skipped=len(skipped),
+            skipped_details=skipped[:20] if skipped else None  # 最多返回前 20 条跳过记录
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        # 记录失败日志
+        try:
+            upload_log = HoldingsUploadLog(
+                etf_symbol=etf_symbol,
+                etf_type=etf_type,
+                data_date=parsed_date,
+                file_name=file.filename if file else None,
+                records_count=0,
+                skipped_count=0,
+                status="error",
+                error_message=str(e)
+            )
+            db.add(upload_log)
+            db.commit()
+        except:
+            db.rollback()
+        
+        logger.error(f"上传 Holdings 失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/holdings/logs", response_model=List[dict])
+async def get_holdings_upload_logs(
+    etf_symbol: Optional[str] = Query(None, description="ETF 符号"),
+    limit: int = Query(50, description="返回数量限制"),
+    db: Session = Depends(get_db)
+):
+    """
+    获取 Holdings 上传日志
+    """
+    query = db.query(HoldingsUploadLog)
+    
+    if etf_symbol:
+        query = query.filter(HoldingsUploadLog.etf_symbol == etf_symbol.upper())
+    
+    logs = query.order_by(HoldingsUploadLog.created_at.desc()).limit(limit).all()
+    
+    return [
+        {
+            "id": log.id,
+            "etfSymbol": log.etf_symbol,
+            "etfType": log.etf_type,
+            "dataDate": log.data_date.isoformat() if log.data_date else None,
+            "fileName": log.file_name,
+            "recordsCount": log.records_count,
+            "skippedCount": log.skipped_count,
+            "status": log.status,
+            "errorMessage": log.error_message,
+            "createdAt": log.created_at.isoformat() if log.created_at else None
+        }
+        for log in logs
+    ]
+
 
 @router.post("/finviz", response_model=FinvizImportResponse)
 async def import_finviz_data(request: FinvizImportRequest):
@@ -448,6 +799,38 @@ async def get_mc_template():
             'term_score: 基于 iv30, iv60, iv90 斜率计算',
             'heat_type: 热度类型分类'
         ]
+    }
+    return template
+
+
+@router.get("/templates/holdings")
+async def get_holdings_template():
+    """
+    获取 ETF Holdings xlsx 导入模板
+    """
+    template = {
+        'description': 'ETF Holdings 数据导入模板',
+        'file_format': 'xlsx',
+        'required_columns': ['Ticker', 'Weight'],
+        'all_columns': [
+            'Name', 'Ticker', 'Identifier', 'SEDOL', 
+            'Weight', 'Sector', 'Shares Held', 'Local Currency'
+        ],
+        'sample_data': [
+            {'Name': 'Apple Inc.', 'Ticker': 'AAPL', 'Weight': 22.5},
+            {'Name': 'Microsoft Corp', 'Ticker': 'MSFT', 'Weight': 21.0},
+            {'Name': 'NVIDIA Corp', 'Ticker': 'NVDA', 'Weight': 6.5}
+        ],
+        'validation_rules': [
+            'Ticker 必须是有效的英文字符（以字母开头，可包含数字、点号、短横线）',
+            'Ticker 为空或无效时，该行会被忽略',
+            'Weight 必须是正数'
+        ],
+        'valid_sector_etfs': VALID_SECTOR_SYMBOLS,
+        'upload_commands': {
+            'sector_etf': 'uploads -d YYYY-MM-DD -t sector -a ETF_SYMBOL',
+            'industry_etf': 'uploads -d YYYY-MM-DD -t industry -s PARENT_SECTOR -a ETF_SYMBOL'
+        }
     }
     return template
 

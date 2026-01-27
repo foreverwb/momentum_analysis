@@ -88,7 +88,8 @@ export interface ETF {
   optionsConfirm?: OptionsConfirm;
   holdings?: Holding[];
   // 行业 ETF 额外字段
-  sector?: string;
+  parentSector?: string;  // 父板块符号 (后端返回的字段名)
+  sector?: string;        // 别名，兼容旧代码
   sectorName?: string;
 }
 
