@@ -132,3 +132,15 @@ The app uses a custom design system extracted from the prototype:
 
 ### Windows
 关闭 "Momentum Radar - Backend" 和 "Momentum Radar - Frontend" 两个命令行窗口
+
+# 上传板块 ETF holdings
+python cli.py uploads -d 2026-01-25 -t sector -a XLK holdings.xlsx
+
+# 上传行业 ETF holdings（需要指定父板块）
+python cli.py uploads -d 2026-01-25 -t industry -s XLK -a SOXX holdings.xlsx
+
+# 列出所有 ETF
+python cli.py list-etfs
+
+# 列出 ETF 持仓
+python cli.py list-holdings XLK

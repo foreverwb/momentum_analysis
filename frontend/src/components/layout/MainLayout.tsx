@@ -7,7 +7,7 @@ interface MainLayoutProps {
 }
 
 export function MainLayout({ children }: MainLayoutProps) {
-  const [activeSection, setActiveSection] = useState<NavSection>('momentum');
+  const [activeSection, setActiveSection] = useState<NavSection>('sector');
 
   const handleNavigate = (section: NavSection) => {
     console.log('Navigating to:', section);
@@ -15,11 +15,13 @@ export function MainLayout({ children }: MainLayoutProps) {
   };
 
   return (
-    <div className="min-h-screen bg-[var(--bg-secondary)]">
-      <Header activeSection={activeSection} onNavigate={handleNavigate} />
-      <main className="py-7 px-8 max-w-[1600px] mx-auto">
-        {children(activeSection)}
-      </main>
+    <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50 to-slate-100 text-slate-900">
+      <div className="p-4 max-w-[1600px] mx-auto">
+        <Header activeSection={activeSection} onNavigate={handleNavigate} />
+        <main>
+          {children(activeSection)}
+        </main>
+      </div>
     </div>
   );
 }

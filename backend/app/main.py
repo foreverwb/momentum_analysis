@@ -5,7 +5,7 @@ import logging
 
 from app.api import stocks, etfs, tasks
 from app.api import market, import_data, broker
-from app.models.database import engine, Base
+from app.models.database import engine, Base, init_db, init_default_sector_etfs
 
 # 配置日志
 logging.basicConfig(
@@ -14,8 +14,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Create database tables
-Base.metadata.create_all(bind=engine)
+# 初始化数据库表
+init_db()
+
+# 初始化默认板块 ETF
+try:
+    init_default_sector_etfs()
+    logger.info("默认板块 ETF 初始化完成")
+except Exception as e:
+    logger.warning(f"默认板块 ETF 初始化失败: {e}")
 
 
 @asynccontextmanager

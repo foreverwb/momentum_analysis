@@ -205,7 +205,7 @@ frontend/dist/
 frontend/.vite/
 frontend/package-lock.json
 # SQLite data
-data/*.db
+backend/*.db
 data/*.db-journal
 .cursorignore
 .cursorindexingignore

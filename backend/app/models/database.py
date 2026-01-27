@@ -1,11 +1,16 @@
 from sqlalchemy import (
-    create_engine, Column, Integer, String, Float, DateTime, 
-    ForeignKey, Enum, JSON, Date, BigInteger, Boolean, UniqueConstraint
+    create_engine, Column, Integer, String, Float, DateTime,
+    ForeignKey, Enum, JSON, Date, BigInteger, Boolean, UniqueConstraint, Text,
+    inspect, text
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
-from datetime import datetime
+from datetime import datetime, date
 import enum
+import re
+import logging
+
+logger = logging.getLogger(__name__)
 
 SQLALCHEMY_DATABASE_URL = "sqlite:///./momentum_radar.db"
 
@@ -15,6 +20,26 @@ engine = create_engine(
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
+
+
+# ============ 默认板块 ETF 配置 ============
+
+DEFAULT_SECTOR_ETFS = [
+    {"symbol": "XLK", "name": "Technology Select Sector SPDR", "type": "sector"},
+    {"symbol": "XLC", "name": "Communication Services Select Sector SPDR", "type": "sector"},
+    {"symbol": "XLY", "name": "Consumer Discretionary Select Sector SPDR", "type": "sector"},
+    {"symbol": "XLP", "name": "Consumer Staples Select Sector SPDR", "type": "sector"},
+    {"symbol": "XLV", "name": "Health Care Select Sector SPDR", "type": "sector"},
+    {"symbol": "XLF", "name": "Financial Select Sector SPDR", "type": "sector"},
+    {"symbol": "XLI", "name": "Industrial Select Sector SPDR", "type": "sector"},
+    {"symbol": "XLE", "name": "Energy Select Sector SPDR", "type": "sector"},
+    {"symbol": "XLU", "name": "Utilities Select Sector SPDR", "type": "sector"},
+    {"symbol": "XLRE", "name": "Real Estate Select Sector SPDR", "type": "sector"},
+    {"symbol": "XLB", "name": "Materials Select Sector SPDR", "type": "sector"},
+]
+
+# 有效的板块 ETF 符号列表
+VALID_SECTOR_SYMBOLS = [etf["symbol"] for etf in DEFAULT_SECTOR_ETFS]
 
 
 class ETFType(enum.Enum):
@@ -59,17 +84,43 @@ class ETF(Base):
     symbol = Column(String, unique=True, index=True)
     name = Column(String)
     type = Column(String)  # 'sector' or 'industry'
-    score = Column(Float)
-    rank = Column(Integer)
+    parent_sector = Column(String, nullable=True)  # 行业 ETF 所属板块
+    score = Column(Float, default=0.0)
+    rank = Column(Integer, default=0)
     
     # Delta JSON: {delta3d, delta5d}
-    delta = Column(JSON)
+    delta = Column(JSON, default=dict)
     
-    completeness = Column(Float)
-    holdings_count = Column(Integer)
+    completeness = Column(Float, default=0.0)
+    holdings_count = Column(Integer, default=0)
     
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # 关联持仓
+    holdings = relationship("ETFHolding", back_populates="etf", cascade="all, delete-orphan")
+
+
+class ETFHolding(Base):
+    """ETF 持仓数据表"""
+    __tablename__ = "etf_holdings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    etf_id = Column(Integer, ForeignKey("etfs.id"), nullable=False, index=True)
+    etf_symbol = Column(String, nullable=False, index=True)
+    ticker = Column(String, nullable=False, index=True)
+    weight = Column(Float, nullable=False)
+    data_date = Column(Date, nullable=False, index=True)
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # 关联 ETF
+    etf = relationship("ETF", back_populates="holdings")
+    
+    __table_args__ = (
+        UniqueConstraint('etf_symbol', 'ticker', 'data_date', name='uix_holding_etf_ticker_date'),
+    )
 
 
 class Task(Base):
@@ -177,8 +228,53 @@ class BrokerStatus(Base):
     config = Column(JSON)  # 存储连接配置
 
 
-# Dependency to get DB session
+class HoldingsUploadLog(Base):
+    """Holdings 上传记录表"""
+    __tablename__ = 'holdings_upload_logs'
+    
+    id = Column(Integer, primary_key=True)
+    etf_symbol = Column(String(20), nullable=False, index=True)
+    etf_type = Column(String(20), nullable=False)  # sector / industry
+    data_date = Column(Date, nullable=False, index=True)
+    file_name = Column(String(255))
+    records_count = Column(Integer, default=0)
+    skipped_count = Column(Integer, default=0)
+    status = Column(String(20), default='success')  # success / error
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    __table_args__ = (
+        UniqueConstraint('etf_symbol', 'data_date', name='uix_upload_etf_date'),
+    )
+
+
+# ============ 辅助函数 ============
+
+def is_valid_ticker(ticker: str) -> bool:
+    """
+    验证 Ticker 是否有效
+    - 不为空
+    - 只包含英文字母(可能带数字，如 BRK.B)
+    """
+    if not ticker or not isinstance(ticker, str):
+        return False
+    ticker = ticker.strip()
+    if not ticker:
+        return False
+    # 允许字母、数字、点号和短横线
+    pattern = r'^[A-Za-z][A-Za-z0-9.\-]*$'
+    return bool(re.match(pattern, ticker))
+
+
+def is_valid_sector_symbol(symbol: str) -> bool:
+    """验证是否为有效的板块 ETF 符号"""
+    return symbol.upper() in VALID_SECTOR_SYMBOLS
+
+
+# ============ 数据库操作函数 ============
+
 def get_db():
+    """获取数据库会话"""
     db = SessionLocal()
     try:
         yield db
@@ -189,3 +285,49 @@ def get_db():
 def init_db():
     """初始化数据库，创建所有表"""
     Base.metadata.create_all(bind=engine)
+    _ensure_etfs_parent_sector_column()
+    logger.info("数据库表已创建")
+
+
+def _ensure_etfs_parent_sector_column():
+    """为旧版 SQLite 数据库补齐缺失列"""
+    if engine.dialect.name != "sqlite":
+        return
+    inspector = inspect(engine)
+    if "etfs" not in inspector.get_table_names():
+        return
+    column_names = {col["name"] for col in inspector.get_columns("etfs")}
+    if "parent_sector" not in column_names:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE etfs ADD COLUMN parent_sector VARCHAR"))
+        logger.info("已补齐列: etfs.parent_sector")
+
+
+def init_default_sector_etfs():
+    """初始化默认的 11 个板块 ETF"""
+    db = SessionLocal()
+    try:
+        for etf_data in DEFAULT_SECTOR_ETFS:
+            existing = db.query(ETF).filter(ETF.symbol == etf_data["symbol"]).first()
+            if not existing:
+                etf = ETF(
+                    symbol=etf_data["symbol"],
+                    name=etf_data["name"],
+                    type=etf_data["type"],
+                    score=0.0,
+                    rank=0,
+                    delta={"delta3d": None, "delta5d": None},
+                    completeness=0.0,
+                    holdings_count=0
+                )
+                db.add(etf)
+                logger.info(f"初始化板块 ETF: {etf_data['symbol']}")
+        
+        db.commit()
+        logger.info(f"已初始化 {len(DEFAULT_SECTOR_ETFS)} 个默认板块 ETF")
+    except Exception as e:
+        db.rollback()
+        logger.error(f"初始化板块 ETF 失败: {e}")
+        raise
+    finally:
+        db.close()
