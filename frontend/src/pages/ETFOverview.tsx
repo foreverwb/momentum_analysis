@@ -22,8 +22,13 @@ export function ETFOverview({ type }: ETFOverviewProps) {
   const [holdingsModalOpen, setHoldingsModalOpen] = useState(false);
   const [etfModalOpen, setETFModalOpen] = useState(false);
   const [selectedETF, setSelectedETF] = useState<string>('');
+  const [showAll, setShowAll] = useState(false);
 
   const title = type === 'sector' ? '板块 ETF 分析矩阵' : '行业 ETF 分析矩阵';
+
+  // 过滤只有 holdings 的 ETF（除非用户选择显示全部）
+  const filteredETFs = etfs?.filter(etf => showAll || etf.holdingsCount > 0) || [];
+  const etfsWithoutHoldings = etfs?.filter(etf => etf.holdingsCount === 0) || [];
 
   const handleViewHoldings = (symbol: string) => {
     setSelectedETF(symbol);
@@ -54,16 +59,35 @@ export function ETFOverview({ type }: ETFOverviewProps) {
         <div className="flex items-center gap-3">
           <span className="w-5 h-5 text-blue-600">{TrendingUpIcon}</span>
           <h2 className="text-xl font-bold text-slate-900">{title}</h2>
-          <span className="text-sm text-slate-600">共 {etfs?.length ?? 0} 个{type === 'sector' ? '板块' : '行业'}</span>
+          <span className="text-sm text-slate-600">
+            {filteredETFs.length} 个{type === 'sector' ? '板块' : '行业'}
+            {!showAll && etfsWithoutHoldings.length > 0 && (
+              <span className="text-slate-400 ml-1">
+                (已隐藏 {etfsWithoutHoldings.length} 个无持仓)
+              </span>
+            )}
+          </span>
         </div>
         <div className="flex items-center gap-4">
+          {/* Show All Toggle */}
+          {etfsWithoutHoldings.length > 0 && (
+            <label className="flex items-center gap-2 text-sm text-slate-600 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={showAll}
+                onChange={(e) => setShowAll(e.target.checked)}
+                className="w-4 h-4 rounded border-slate-300"
+              />
+              显示全部
+            </label>
+          )}
           <div className="text-sm text-slate-600">实时更新 · {timeStr}</div>
           {/* View Toggle */}
           <div className="flex gap-1 bg-white p-1 rounded-xl border border-slate-200 shadow-sm">
             <button
               onClick={() => setViewMode('card')}
               className={`
-                px-4 py-2 rounded-lg text-sm font-medium transition-all
+                px-4 py-2 rounded-sm text-sm font-medium transition-all
                 ${viewMode === 'card'
                   ? 'bg-gradient-to-r from-blue-600 to-purple-600 text-white shadow-md'
                   : 'text-slate-600 hover:text-slate-900'
@@ -75,7 +99,7 @@ export function ETFOverview({ type }: ETFOverviewProps) {
             <button
               onClick={() => setViewMode('table')}
               className={`
-                px-4 py-2 rounded-lg text-sm font-medium transition-all
+                px-4 py-2 rounded-sm text-sm font-medium transition-all
                 ${viewMode === 'table'
                   ? 'bg-gradient-to-r from-blue-600 to-purple-600 text-white shadow-md'
                   : 'text-slate-600 hover:text-slate-900'
@@ -108,7 +132,7 @@ export function ETFOverview({ type }: ETFOverviewProps) {
               </tr>
             </thead>
             <tbody>
-              {etfs?.map((etf) => {
+              {filteredETFs.map((etf) => {
                 const formatDelta = (value: number | null) => {
                   if (value === null) return { text: '--', className: '' };
                   if (value > 0) return { text: `+${value.toFixed(1)}`, className: 'text-[var(--accent-green)]' };
@@ -125,12 +149,12 @@ export function ETFOverview({ type }: ETFOverviewProps) {
                     {type === 'industry' && (
                       <td className="py-3 px-4">
                         <span className="px-2 py-0.5 bg-blue-50 text-[var(--accent-blue)] rounded text-xs font-medium">
-                          XLK
+                          {etf.parentSector || 'XLK'}
                         </span>
                       </td>
                     )}
-                    <td className="text-right py-3 px-4 font-bold text-lg">{etf.score.toFixed(1)}</td>
-                    <td className="text-right py-3 px-4 text-[var(--text-muted)]">#{etf.rank}</td>
+                    <td className="text-right py-3 px-4 font-bold text-lg">{etf.score > 0 ? etf.score.toFixed(1) : '--'}</td>
+                    <td className="text-right py-3 px-4 text-[var(--text-muted)]">{etf.rank > 0 ? `#${etf.rank}` : '--'}</td>
                     <td className={`text-right py-3 px-4 font-medium ${delta3d.className}`}>{delta3d.text}</td>
                     <td className={`text-right py-3 px-4 font-medium ${delta5d.className}`}>{delta5d.text}</td>
                     <td className="text-right py-3 px-4">
@@ -165,12 +189,17 @@ export function ETFOverview({ type }: ETFOverviewProps) {
               })}
             </tbody>
           </table>
+          {filteredETFs.length === 0 && (
+            <div className="text-center py-12 text-slate-500">
+              暂无已导入持仓的 ETF 数据
+            </div>
+          )}
         </div>
       ) : (
         /* Card View - 单列布局，参考 data_config_etf_panel.html */
         <div className="space-y-4">
-          {etfs && etfs.length > 0 ? (
-            etfs.map((etf) => (
+          {filteredETFs.length > 0 ? (
+            filteredETFs.map((etf) => (
               <ETFCard
                 key={etf.id}
                 etf={etf}
@@ -180,7 +209,7 @@ export function ETFOverview({ type }: ETFOverviewProps) {
             ))
           ) : (
             <div className="text-center py-12 text-slate-500">
-              暂无 ETF 数据
+              暂无已导入持仓的 ETF 数据
             </div>
           )}
         </div>

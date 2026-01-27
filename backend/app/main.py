@@ -1,21 +1,28 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
-import logging
+from uuid import uuid4
+
+import structlog
+from structlog.contextvars import bind_contextvars, clear_contextvars
 
 from app.api import stocks, etfs, tasks
 from app.api import market, import_data, broker
-from app.models.database import engine, Base
+from app.core.logging_config import configure_logging
+from app.models.database import engine, Base, init_db, init_default_sector_etfs
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+configure_logging()
+logger = structlog.get_logger(__name__)
 
-# Create database tables
-Base.metadata.create_all(bind=engine)
+# 初始化数据库表
+init_db()
+
+# 初始化默认板块 ETF
+try:
+    init_default_sector_etfs()
+    logger.info("默认板块 ETF 初始化完成")
+except Exception as e:
+    logger.exception("默认板块 ETF 初始化失败", err=str(e))
 
 
 @asynccontextmanager
@@ -32,7 +39,7 @@ async def lifespan(app: FastAPI):
         orchestrator = get_orchestrator()
         await orchestrator.disconnect_all()
     except Exception as e:
-        logger.error(f"关闭 Broker 连接时出错: {e}")
+        logger.exception("关闭 Broker 连接时出错", err=str(e))
 
 
 app = FastAPI(
@@ -52,6 +59,22 @@ app = FastAPI(
     version="0.2.0",
     lifespan=lifespan
 )
+
+
+@app.middleware("http")
+async def add_request_context(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID", str(uuid4()))
+    bind_contextvars(
+        request_id=request_id,
+        path=request.url.path,
+        method=request.method
+    )
+    try:
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+    finally:
+        clear_contextvars()
 
 # CORS middleware
 app.add_middleware(

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { useTasks, useCreateTask } from '../hooks/useData';
+import { useTasks, useCreateTask, useDeleteTask } from '../hooks/useData';
 import { TaskCard, TaskDetail } from '../components/task';
 import { LoadingState, ErrorMessage, Button } from '../components/common';
 import { CreateTaskModal } from '../components/modal';
@@ -9,6 +9,7 @@ import type { Task } from '../types';
 export function Tasks() {
   const { data: tasks, isLoading, error, refetch } = useTasks();
   const createTaskMutation = useCreateTask();
+  const deleteTaskMutation = useDeleteTask();
   
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
@@ -34,6 +35,18 @@ export function Tasks() {
 
   const handleBackToList = () => {
     setSelectedTask(null);
+  };
+
+  const handleDeleteTask = async (task: Task) => {
+    if (!task?.id) return;
+    const confirmed = window.confirm(`确认删除监控任务「${task.title || task.id}」吗？`);
+    if (!confirmed) return;
+    try {
+      await deleteTaskMutation.mutateAsync(task.id);
+    } catch (err) {
+      console.error('删除任务失败', err);
+      alert('删除失败，请稍后重试');
+    }
   };
 
   if (isLoading) {
@@ -76,6 +89,8 @@ export function Tasks() {
               key={task.id}
               task={task}
               onClick={() => handleViewTask(task)}
+              onDelete={() => handleDeleteTask(task)}
+              deleting={deleteTaskMutation.isPending}
             />
           ))
         ) : (

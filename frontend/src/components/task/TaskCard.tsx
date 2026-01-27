@@ -4,6 +4,8 @@ import type { Task, TaskType } from '../../types';
 interface TaskCardProps {
   task: Task;
   onClick?: () => void;
+  onDelete?: () => void;
+  deleting?: boolean;
 }
 
 const taskTypeLabels: Record<TaskType, string> = {
@@ -12,7 +14,7 @@ const taskTypeLabels: Record<TaskType, string> = {
   momentum: '动能股追踪'
 };
 
-export function TaskCard({ task, onClick }: TaskCardProps) {
+export function TaskCard({ task, onClick, onDelete, deleting }: TaskCardProps) {
   if (!task) return null;
 
   const handleClick = () => {
@@ -40,6 +42,25 @@ export function TaskCard({ task, onClick }: TaskCardProps) {
             {taskTypeLabels[task.type] ?? task.type}
           </span>
         </div>
+        {onDelete && (
+          <button
+            className="p-1.5 rounded-full text-[var(--text-muted)] hover:text-[var(--accent-red)] hover:bg-[var(--bg-tertiary)] transition-colors disabled:opacity-50"
+            onClick={(e) => {
+              e.stopPropagation();
+              onDelete();
+            }}
+            disabled={deleting}
+            aria-label="删除任务"
+            title="删除任务"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M3 6h18" />
+              <path d="M8 6v12a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2V6" />
+              <path d="M10 11v6M14 11v6" />
+              <path d="M9 6l1-3h4l1 3" />
+            </svg>
+          </button>
+        )}
       </div>
 
       {/* Meta Info */}

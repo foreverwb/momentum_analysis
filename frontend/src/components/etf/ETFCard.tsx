@@ -62,7 +62,7 @@ function HoldingsTable({ holdings, maxDisplay, etfSymbol }: { holdings: Holding[
           <div className="p-3 bg-slate-100">
             <button
               onClick={() => setIsExpanded(!isExpanded)}
-              className="w-full py-2 px-4 bg-white border rounded-lg text-sm font-medium flex items-center justify-center gap-2 hover:bg-slate-50 transition-colors"
+              className="w-full py-2 px-4 bg-white border rounded-sm text-sm font-medium flex items-center justify-center gap-2 hover:bg-slate-50 transition-colors"
             >
               <span>{isExpanded ? '收起' : `展开全部 (${holdings.length - maxDisplay} 更多)`}</span>
               <svg
@@ -127,7 +127,7 @@ export function ETFCard({ etf, onViewHoldings, onRefresh }: ETFCardProps) {
       <div className="flex items-start justify-between mb-6">
         <div className="flex items-center gap-4">
           <div className="w-14 h-14 bg-gradient-to-br from-blue-500 to-purple-600 rounded-xl flex items-center justify-center text-white shadow-md">
-            <span className="text-xl font-bold">#{etf.rank}</span>
+            <span className="text-xl font-bold">{etf.rank > 0 ? `#${etf.rank}` : '#-'}</span>
           </div>
           <div>
             <div className="flex items-center gap-3 mb-1">
@@ -136,18 +136,25 @@ export function ETFCard({ etf, onViewHoldings, onRefresh }: ETFCardProps) {
             </div>
             <div className="text-sm text-slate-500 flex items-center gap-2">
               {etf.type === 'sector' ? 'Sector ETF' : 'Industry ETF'}
-              {etf.type === 'industry' && etf.sectorName && (
+              {etf.type === 'industry' && etf.parentSector && (
                 <span className="px-2 py-0.5 bg-blue-50 text-blue-600 rounded text-xs font-medium">
-                  {etf.sector} · {etf.sectorName}
+                  {etf.parentSector}
+                </span>
+              )}
+              {etf.holdingsCount > 0 && (
+                <span className="px-2 py-0.5 bg-emerald-50 text-emerald-600 rounded text-xs font-medium">
+                  {etf.holdingsCount} 持仓
                 </span>
               )}
             </div>
           </div>
         </div>
         <div className="flex items-center gap-3">
-          <div className={`px-6 py-3 rounded-xl border ${getScoreBg(compositeScore)}`}>
+          <div className={`px-6 py-3 rounded-xl border ${compositeScore > 0 ? getScoreBg(compositeScore) : 'bg-slate-50 border-slate-200'}`}>
             <div className="text-xs text-slate-600 mb-1">综合分</div>
-            <div className={`text-3xl font-bold ${getScoreColor(compositeScore)}`}>{compositeScore}</div>
+            <div className={`text-3xl font-bold ${compositeScore > 0 ? getScoreColor(compositeScore) : 'text-slate-400'}`}>
+              {compositeScore > 0 ? compositeScore : '--'}
+            </div>
           </div>
         </div>
       </div>
@@ -254,26 +261,47 @@ export function ETFCard({ etf, onViewHoldings, onRefresh }: ETFCardProps) {
           </div>
         </div>
       ) : (
-        /* 简化版展示（当没有详细数据时） */
-        <div className="flex items-end gap-5 mb-4 pb-4 border-b border-slate-200">
-          <div className="text-4xl font-bold leading-none">
-            {etf.score?.toFixed(1) ?? '--'}
-          </div>
-          <div className="text-sm text-slate-500 mb-1">
-            排名 #{etf.rank ?? '--'}
-          </div>
-          <div className="flex gap-4 ml-auto">
-            <div className="flex items-center gap-1">
-              <span className="text-xs text-slate-500">3D</span>
-              <span className={`text-sm font-semibold ${etf.delta?.delta3d && etf.delta.delta3d > 0 ? 'text-emerald-600' : 'text-red-600'}`}>
-                {etf.delta?.delta3d !== null ? (etf.delta.delta3d > 0 ? '+' : '') + etf.delta.delta3d.toFixed(1) : '--'}
-              </span>
+        /* 简化版展示（当没有详细分析数据时）- 显示基础信息和数据完整度 */
+        <div className="mb-4 pb-4 border-b border-slate-200">
+          <div className="grid grid-cols-4 gap-4">
+            <div className="bg-slate-50 rounded-xl p-4 border border-slate-200">
+              <div className="text-xs text-slate-600 mb-1">综合评分</div>
+              <div className="text-2xl font-bold text-slate-400">
+                {etf.score > 0 ? etf.score.toFixed(1) : '待计算'}
+              </div>
             </div>
-            <div className="flex items-center gap-1">
-              <span className="text-xs text-slate-500">5D</span>
-              <span className={`text-sm font-semibold ${etf.delta?.delta5d && etf.delta.delta5d > 0 ? 'text-emerald-600' : 'text-red-600'}`}>
-                {etf.delta?.delta5d !== null ? (etf.delta.delta5d > 0 ? '+' : '') + etf.delta.delta5d.toFixed(1) : '--'}
-              </span>
+            <div className="bg-slate-50 rounded-xl p-4 border border-slate-200">
+              <div className="text-xs text-slate-600 mb-1">排名</div>
+              <div className="text-2xl font-bold text-slate-400">
+                {etf.rank > 0 ? `#${etf.rank}` : '待排名'}
+              </div>
+            </div>
+            <div className="bg-slate-50 rounded-xl p-4 border border-slate-200">
+              <div className="text-xs text-slate-600 mb-1">3日变化</div>
+              <div className={`text-2xl font-bold ${etf.delta?.delta3d && etf.delta.delta3d > 0 ? 'text-emerald-600' : etf.delta?.delta3d && etf.delta.delta3d < 0 ? 'text-red-600' : 'text-slate-400'}`}>
+                {etf.delta?.delta3d !== null && etf.delta?.delta3d !== undefined 
+                  ? (etf.delta.delta3d > 0 ? '+' : '') + etf.delta.delta3d.toFixed(1) 
+                  : '--'}
+              </div>
+            </div>
+            <div className="bg-slate-50 rounded-xl p-4 border border-slate-200">
+              <div className="text-xs text-slate-600 mb-1">5日变化</div>
+              <div className={`text-2xl font-bold ${etf.delta?.delta5d && etf.delta.delta5d > 0 ? 'text-emerald-600' : etf.delta?.delta5d && etf.delta.delta5d < 0 ? 'text-red-600' : 'text-slate-400'}`}>
+                {etf.delta?.delta5d !== null && etf.delta?.delta5d !== undefined 
+                  ? (etf.delta.delta5d > 0 ? '+' : '') + etf.delta.delta5d.toFixed(1) 
+                  : '--'}
+              </div>
+            </div>
+          </div>
+          {/* 数据状态提示 */}
+          <div className="mt-4 p-3 bg-amber-50 border border-amber-200 rounded-sm">
+            <div className="flex items-center gap-2 text-amber-700 text-sm">
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <circle cx="12" cy="12" r="10"></circle>
+                <line x1="12" y1="8" x2="12" y2="12"></line>
+                <line x1="12" y1="16" x2="12.01" y2="16"></line>
+              </svg>
+              <span>持仓数据已上传，等待计算动能指标。请通过「任务管理」触发计算。</span>
             </div>
           </div>
         </div>

@@ -8,23 +8,159 @@ IBKR API 连接器
 - 52周高低点计算
 - 相对动量(RelMom)计算
 - VIX 数据获取
+
+依赖: ib_insync (可选 - 未安装时使用 Stub 模式)
 """
 
-from ib_insync import IB, Stock, Index, util
 import pandas as pd
 import numpy as np
 from typing import Optional, Dict, List, Any
 from datetime import datetime
-import logging
+from time import perf_counter
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
+import threading
+import time
 
 from .base import BrokerConnector, PriceDataMixin
+from app.core.timing import timed
+import structlog
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
+
+# ==================== 依赖检查 ====================
+
+IB_INSYNC_AVAILABLE = False
+NEST_ASYNCIO_AVAILABLE = False
+_IB = None
+_Stock = None
+_Index = None
+_util = None
+
+def _is_uvloop() -> bool:
+    try:
+        loop = asyncio.get_running_loop()
+        if loop.__class__.__module__.startswith("uvloop"):
+            return True
+    except RuntimeError:
+        pass
+    try:
+        policy = asyncio.get_event_loop_policy()
+        return policy.__class__.__module__.startswith("uvloop")
+    except Exception:
+        return False
 
 
-class IBKRConnector(BrokerConnector, PriceDataMixin):
+# 尝试导入 nest_asyncio 解决嵌套事件循环问题
+try:
+    import nest_asyncio
+    if _is_uvloop():
+        logger.info("检测到 uvloop，跳过 nest_asyncio.apply (uvloop 不支持 patch)")
+    else:
+        try:
+            nest_asyncio.apply()
+            NEST_ASYNCIO_AVAILABLE = True
+            logger.info("nest_asyncio 已应用，支持嵌套事件循环")
+        except Exception as e:
+            logger.warning(f"nest_asyncio apply 失败，将继续不启用嵌套事件循环: {e}")
+except ImportError:
+    logger.warning(
+        "nest_asyncio 未安装，在 FastAPI 环境中可能遇到事件循环冲突。"
+        "请运行 'pip install nest_asyncio --break-system-packages' 来安装。"
+    )
+
+try:
+    from ib_insync import IB, Stock, Index, util
+    IB_INSYNC_AVAILABLE = True
+    _IB = IB
+    _Stock = Stock
+    _Index = Index
+    _util = util
+except ImportError:
+    logger.warning(
+        "ib_insync 未安装，IBKR 连接器将使用 Stub 模式。"
+        "请运行 'pip install ib_insync --break-system-packages' 来安装。"
+    )
+
+
+def is_ibkr_available() -> bool:
+    """检查 ib_insync 是否可用"""
+    return IB_INSYNC_AVAILABLE
+
+
+class IBKRConnectorStub(BrokerConnector, PriceDataMixin):
     """
-    IBKR API 连接器
+    IBKR 连接器的 Stub 实现
+    
+    当 ib_insync 未安装时使用此实现
+    所有方法返回适当的错误或默认值
+    """
+    
+    def __init__(
+        self, 
+        host: str = '127.0.0.1', 
+        port: int = 4002, 
+        client_id: int = 3,
+        timeout: int = 30
+    ):
+        self.host = host
+        self.port = port
+        self.client_id = client_id
+        self.timeout = timeout
+        self._connected = False
+        self._stub_reason = "ib_insync 未安装"
+    
+    def connect(self) -> bool:
+        logger.error(f"IBKR 连接失败: {self._stub_reason}")
+        return False
+    
+    def disconnect(self) -> None:
+        pass
+    
+    def is_connected(self) -> bool:
+        return False
+    
+    def get_stub_reason(self) -> str:
+        return self._stub_reason
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+    
+    def get_price_data(self, symbol: str, duration: str = '1 Y') -> Optional[pd.DataFrame]:
+        logger.warning(f"无法获取 {symbol} 价格数据: {self._stub_reason}")
+        return None
+    
+    def get_ohlcv_data(self, symbol: str, duration: str = '1 Y') -> Optional[pd.DataFrame]:
+        logger.warning(f"无法获取 {symbol} OHLCV 数据: {self._stub_reason}")
+        return None
+    
+    def get_current_price(self, symbol: str) -> Optional[float]:
+        return None
+    
+    def get_52_week_high_low(self, symbol: str) -> Optional[Dict]:
+        return None
+    
+    def analyze_sector_vs_spy(self, sector_symbol: str, benchmark: str = 'SPY') -> Optional[Dict]:
+        return None
+    
+    def batch_calculate_rel_mom(self, symbols: List[str], benchmark: str = 'SPY') -> pd.DataFrame:
+        return pd.DataFrame()
+    
+    def get_vix(self) -> Optional[float]:
+        return None
+    
+    def get_spy_with_sma(self, sma_periods: List[int] = None) -> Optional[Dict[str, Any]]:
+        if sma_periods is None:
+            sma_periods = [20, 50, 200]
+        return None
+
+
+class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
+    """
+    IBKR API 连接器 (真实实现)
     
     整合自:
     - ibkr_relative_momentum.py: RelMom 计算
@@ -51,7 +187,7 @@ class IBKRConnector(BrokerConnector, PriceDataMixin):
         self, 
         host: str = '127.0.0.1', 
         port: int = 4002, 
-        client_id: int = 1,
+        client_id: int = 3,
         timeout: int = 30
     ):
         """
@@ -67,8 +203,42 @@ class IBKRConnector(BrokerConnector, PriceDataMixin):
         self.port = port
         self.client_id = client_id
         self.timeout = timeout
-        self.ib = IB()
+        self.ib = None
         self._connected = False
+        # Run ib_insync calls on a dedicated thread to avoid event loop conflicts.
+        self._worker_thread_id = None
+        self._worker_loop = None
+        self._executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="ibkr-worker",
+            initializer=self._init_worker_loop,
+        )
+
+    def _init_worker_loop(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._worker_loop = loop
+
+    def _run_in_worker(self, func, *args, **kwargs):
+        if self._worker_thread_id == threading.get_ident():
+            return func(*args, **kwargs)
+        future = self._executor.submit(self._run_with_thread_id, func, *args, **kwargs)
+        return future.result()
+
+    def _run_with_thread_id(self, func, *args, **kwargs):
+        if self._worker_thread_id is None:
+            self._worker_thread_id = threading.get_ident()
+        return func(*args, **kwargs)
+    
+    def _init_ib(self):
+        """初始化 IB 实例"""
+        if self.ib is not None:
+            try:
+                if self.ib.isConnected():
+                    self.ib.disconnect()
+            except:
+                pass
+        self.ib = _IB()
     
     # ==================== 连接管理 ====================
     
@@ -79,32 +249,86 @@ class IBKRConnector(BrokerConnector, PriceDataMixin):
         Returns:
             bool: 连接成功返回 True
         """
-        try:
-            self.ib.connect(
-                self.host, 
-                self.port, 
-                clientId=self.client_id,
-                timeout=self.timeout
-            )
-            self.ib.reqMarketDataType(3)  # 使用延迟数据 (3=Delayed)
-            self._connected = True
-            logger.info(f"✅ 已连接到 IBKR: {self.host}:{self.port}")
+        return self._run_in_worker(self._connect_impl)
+
+    def _connect_impl(self) -> bool:
+        # 如果已连接，先断开
+        if self._connected and self.ib and self.ib.isConnected():
+            logger.info("IBKR 已连接，跳过重复连接")
             return True
+        
+        # 重新初始化 IB 实例以避免事件循环问题
+        self._init_ib()
+        
+        try:
+            with timed(
+                logger,
+                "broker_connect",
+                broker="ibkr",
+                op="connect",
+                host=self.host,
+                port=self.port,
+                client_id=self.client_id,
+            ):
+                self.ib.connect(
+                    self.host,
+                    self.port,
+                    clientId=self.client_id,
+                    timeout=self.timeout,
+                )
+                self.ib.reqMarketDataType(3)  # 使用延迟数据 (3=Delayed)
+                self._connected = True
+                logger.info(f"✅ IBKR 连接成功: {self.host}:{self.port}")
+            return True
+        except RuntimeError as e:
+            if "event loop" in str(e).lower():
+                if _is_uvloop():
+                    logger.error(
+                        f"IBKR 事件循环冲突: {e}. "
+                        "检测到 uvloop，nest_asyncio 与 uvloop 不兼容。"
+                        "建议使用 `uvicorn --loop asyncio` 或改用 ib_insync 的异步 API。"
+                    )
+                else:
+                    logger.error(
+                        f"IBKR 事件循环冲突: {e}. "
+                        "请确保已安装 nest_asyncio: pip install nest_asyncio --break-system-packages"
+                    )
+            self._connected = False
+            return False
         except Exception as e:
-            logger.error(f"❌ IBKR 连接失败: {e}")
+            logger.error(f"IBKR 连接失败: {e}")
             self._connected = False
             return False
     
     def disconnect(self) -> None:
         """断开 IBKR 连接"""
-        if self.ib.isConnected():
-            self.ib.disconnect()
-            self._connected = False
-            logger.info("已断开 IBKR 连接")
+        self._run_in_worker(self._disconnect_impl)
+
+    def _disconnect_impl(self) -> None:
+        if self.ib and self.ib.isConnected():
+            try:
+                with timed(
+                    logger,
+                    "broker_disconnect",
+                    broker="ibkr",
+                    op="disconnect",
+                    host=self.host,
+                    port=self.port,
+                    client_id=self.client_id,
+                ):
+                    self.ib.disconnect()
+                    self._connected = False
+                    logger.info("IBKR 已断开连接")
+            except Exception as e:
+                logger.warning(f"IBKR 断开连接时出错: {e}")
+                self._connected = False
     
     def is_connected(self) -> bool:
         """检查连接状态"""
-        return self._connected and self.ib.isConnected()
+        return self._run_in_worker(self._is_connected_impl)
+
+    def _is_connected_impl(self) -> bool:
+        return self._connected and self.ib is not None and self.ib.isConnected()
     
     def __enter__(self):
         """Context manager 支持"""
@@ -130,37 +354,57 @@ class IBKRConnector(BrokerConnector, PriceDataMixin):
         Returns:
             DataFrame with columns: [date, {symbol}]
         """
+        return self._run_in_worker(self._get_price_data_impl, symbol, duration)
+
+    def _get_price_data_impl(self, symbol: str, duration: str = '1 Y') -> Optional[pd.DataFrame]:
         if not self.is_connected():
-            logger.error("IBKR 未连接")
-            return None
-        
-        try:
-            stock = Stock(symbol, 'SMART', 'USD')
-            self.ib.qualifyContracts(stock)
-            
-            bars = self.ib.reqHistoricalData(
-                stock,
-                endDateTime='',
-                durationStr=duration,
-                barSizeSetting='1 day',
-                whatToShow='TRADES',
-                useRTH=True,
-                formatDate=1
+            logger.warning(
+                "ibkr_hist_close",
+                broker="ibkr",
+                op="hist_close",
+                symbol=symbol,
+                duration=duration,
+                status="fail",
+                reason="not_connected",
             )
-            
-            if not bars:
-                logger.warning(f"⚠️ 未获取到 {symbol} 的数据")
-                return None
-            
-            df = util.df(bars)
-            df = df[['date', 'close']].copy()
-            df.columns = ['date', symbol]
-            
-            logger.info(f"✅ 获取到 {symbol} {len(df)} 天的价格数据")
-            return df
-            
-        except Exception as e:
-            logger.error(f"❌ 获取 {symbol} 数据失败: {e}")
+            return None
+
+        try:
+            with timed(
+                logger,
+                "ibkr_hist_close",
+                broker="ibkr",
+                op="hist_close",
+                symbol=symbol,
+                duration=duration,
+            ) as details:
+                stock = _Stock(symbol, 'SMART', 'USD')
+                self.ib.qualifyContracts(stock)
+
+                bars = self.ib.reqHistoricalData(
+                    stock,
+                    endDateTime='',
+                    durationStr=duration,
+                    barSizeSetting='1 day',
+                    whatToShow='TRADES',
+                    useRTH=True,
+                    formatDate=1,
+                    timeout=120  # Increase timeout to 120s for large data requests
+                )
+
+                if not bars:
+                    details["status"] = "empty"
+                    details["bars"] = 0
+                    return None
+
+                df = _util.df(bars)
+                df = df[['date', 'close']].copy()
+                df.columns = ['date', symbol]
+                details["bars"] = len(df)
+                details["start"] = _format_date(df['date'].iloc[0])
+                details["end"] = _format_date(df['date'].iloc[-1])
+                return df
+        except Exception:
             return None
     
     def get_ohlcv_data(self, symbol: str, duration: str = '1 Y') -> Optional[pd.DataFrame]:
@@ -174,36 +418,56 @@ class IBKRConnector(BrokerConnector, PriceDataMixin):
         Returns:
             DataFrame with columns: [date, open, high, low, close, volume]
         """
+        return self._run_in_worker(self._get_ohlcv_data_impl, symbol, duration)
+
+    def _get_ohlcv_data_impl(self, symbol: str, duration: str = '1 Y') -> Optional[pd.DataFrame]:
         if not self.is_connected():
-            logger.error("IBKR 未连接")
-            return None
-        
-        try:
-            stock = Stock(symbol, 'SMART', 'USD')
-            self.ib.qualifyContracts(stock)
-            
-            bars = self.ib.reqHistoricalData(
-                stock,
-                endDateTime='',
-                durationStr=duration,
-                barSizeSetting='1 day',
-                whatToShow='TRADES',
-                useRTH=True,
-                formatDate=1
+            logger.warning(
+                "ibkr_hist_ohlcv",
+                broker="ibkr",
+                op="hist_ohlcv",
+                symbol=symbol,
+                duration=duration,
+                status="fail",
+                reason="not_connected",
             )
-            
-            if not bars:
-                logger.warning(f"⚠️ 未获取到 {symbol} 的 OHLCV 数据")
-                return None
-            
-            df = util.df(bars)
-            df = df[['date', 'open', 'high', 'low', 'close', 'volume']].copy()
-            
-            logger.info(f"✅ 获取到 {symbol} {len(df)} 天的 OHLCV 数据")
-            return df
-            
-        except Exception as e:
-            logger.error(f"❌ 获取 {symbol} OHLCV 数据失败: {e}")
+            return None
+
+        try:
+            with timed(
+                logger,
+                "ibkr_hist_ohlcv",
+                broker="ibkr",
+                op="hist_ohlcv",
+                symbol=symbol,
+                duration=duration,
+            ) as details:
+                stock = _Stock(symbol, 'SMART', 'USD')
+                self.ib.qualifyContracts(stock)
+
+                bars = self.ib.reqHistoricalData(
+                    stock,
+                    endDateTime='',
+                    durationStr=duration,
+                    barSizeSetting='1 day',
+                    whatToShow='TRADES',
+                    useRTH=True,
+                    formatDate=1,
+                    timeout=120  # Increase timeout to 120s for large data requests
+                )
+
+                if not bars:
+                    details["status"] = "empty"
+                    details["bars"] = 0
+                    return None
+
+                df = _util.df(bars)
+                df = df[['date', 'open', 'high', 'low', 'close', 'volume']].copy()
+                details["bars"] = len(df)
+                details["start"] = _format_date(df['date'].iloc[0])
+                details["end"] = _format_date(df['date'].iloc[-1])
+                return df
+        except Exception:
             return None
     
     def get_current_price(self, symbol: str) -> Optional[float]:
@@ -216,48 +480,35 @@ class IBKRConnector(BrokerConnector, PriceDataMixin):
         Returns:
             当前价格 (float)，获取失败返回 None
         """
+        return self._run_in_worker(self._get_current_price_impl, symbol)
+
+    def _get_current_price_impl(self, symbol: str) -> Optional[float]:
         if not self.is_connected():
             logger.error("IBKR 未连接")
             return None
         
         try:
-            stock = Stock(symbol, 'SMART', 'USD')
+            stock = _Stock(symbol, 'SMART', 'USD')
             self.ib.qualifyContracts(stock)
             
             ticker = self.ib.reqMktData(stock, '', snapshot=True)
             self.ib.sleep(2)
+            
             price = ticker.last if ticker.last and ticker.last > 0 else ticker.close
             self.ib.cancelMktData(stock)
             
             return price
-            
         except Exception as e:
-            logger.error(f"❌ 获取 {symbol} 当前价格失败: {e}")
+            logger.error(f"获取 {symbol} 价格失败: {e}")
             return None
-    
-    def batch_get_prices(self, symbols: List[str]) -> Dict[str, Optional[float]]:
-        """
-        批量获取当前价格
-        
-        Args:
-            symbols: 股票代码列表
-        
-        Returns:
-            {symbol: price} 字典
-        """
-        results = {}
-        for symbol in symbols:
-            results[symbol] = self.get_current_price(symbol)
-            self.ib.sleep(0.3)  # 避免请求过快
-        return results
     
     # ==================== 52周高低点 ====================
     
-    def get_52_week_high_low(self, symbol: str) -> Optional[Dict[str, Any]]:
+    def get_52_week_high_low(self, symbol: str) -> Optional[Dict]:
         """
-        获取 52 周高低点
+        获取 52 周最高最低点
         
-        复用自: ibkr_52week_high_demo.py -> get_52_week_high_low()
+        复用自: ibkr_52week_high_demo.py
         
         Args:
             symbol: 股票代码
@@ -265,81 +516,30 @@ class IBKRConnector(BrokerConnector, PriceDataMixin):
         Returns:
             dict: {
                 'symbol': str,
-                'current_price': float,
-                '52w_high': float,
-                '52w_low': float,
-                '52w_high_date': datetime,
-                '52w_low_date': datetime,
-                'pct_from_52w_high': float,  # 负值表示低于高点
-                'pct_from_52w_low': float,   # 正值表示高于低点
-                'near_52w_high': bool,       # 距离高点5%以内
-                'near_52w_low': bool,        # 距离低点5%以内
+                'high_52w': float,
+                'low_52w': float,
+                'current': float,
+                'pct_from_high': float,  # 距离52周高点的跌幅 (%)
+                'pct_from_low': float,   # 距离52周低点的涨幅 (%)
             }
         """
-        if not self.is_connected():
-            logger.error("IBKR 未连接")
+        df = self.get_ohlcv_data(symbol, '1 Y')
+        
+        if df is None or df.empty:
             return None
         
-        try:
-            stock = Stock(symbol, 'SMART', 'USD')
-            self.ib.qualifyContracts(stock)
-            
-            # 获取过去1年的日线数据
-            bars = self.ib.reqHistoricalData(
-                stock,
-                endDateTime='',
-                durationStr='1 Y',
-                barSizeSetting='1 day',
-                whatToShow='TRADES',
-                useRTH=True
-            )
-            
-            if not bars:
-                logger.warning(f"⚠️ 未获取到 {symbol} 的历史数据")
-                return None
-            
-            df = util.df(bars)
-            
-            # 计算52周最高和最低
-            week_52_high = df['high'].max()
-            week_52_low = df['low'].min()
-            
-            # 获取当前价格
-            ticker = self.ib.reqMktData(stock, '', snapshot=True)
-            self.ib.sleep(2)
-            current_price = ticker.last if ticker.last and ticker.last > 0 else ticker.close
-            self.ib.cancelMktData(stock)
-            
-            if current_price is None or current_price <= 0:
-                current_price = df['close'].iloc[-1]
-            
-            # 计算距离52周高低点的百分比
-            pct_from_high = ((current_price - week_52_high) / week_52_high) * 100
-            pct_from_low = ((current_price - week_52_low) / week_52_low) * 100
-            
-            # 找到52周高低点的日期
-            high_date = df[df['high'] == week_52_high]['date'].iloc[0]
-            low_date = df[df['low'] == week_52_low]['date'].iloc[0]
-            
-            result = {
-                'symbol': symbol,
-                'current_price': current_price,
-                '52w_high': week_52_high,
-                '52w_low': week_52_low,
-                '52w_high_date': high_date,
-                '52w_low_date': low_date,
-                'pct_from_52w_high': pct_from_high,
-                'pct_from_52w_low': pct_from_low,
-                'near_52w_high': abs(pct_from_high) < 5,  # 距离高点5%以内
-                'near_52w_low': abs(pct_from_low) < 5,    # 距离低点5%以内
-            }
-            
-            logger.info(f"✅ {symbol}: 52周高点=${week_52_high:.2f}, 52周低点=${week_52_low:.2f}")
-            return result
-            
-        except Exception as e:
-            logger.error(f"❌ 获取 {symbol} 52周数据失败: {e}")
-            return None
+        high_52w = df['high'].max()
+        low_52w = df['low'].min()
+        current = df['close'].iloc[-1]
+        
+        return {
+            'symbol': symbol,
+            'high_52w': high_52w,
+            'low_52w': low_52w,
+            'current': current,
+            'pct_from_high': (current - high_52w) / high_52w * 100,
+            'pct_from_low': (current - low_52w) / low_52w * 100,
+        }
     
     # ==================== 相对动量计算 ====================
     
@@ -349,71 +549,66 @@ class IBKRConnector(BrokerConnector, PriceDataMixin):
         spy_df: pd.DataFrame
     ) -> pd.DataFrame:
         """
-        计算相对强度 RS(t) = Price_sector(t) / Price_spy(t)
+        计算相对强度 RS
         
         复用自: ibkr_relative_momentum.py -> calculate_relative_strength()
         
         Args:
-            sector_df: 行业ETF价格数据 DataFrame [date, {symbol}]
-            spy_df: SPY价格数据 DataFrame [date, SPY]
+            sector_df: 行业ETF数据 [date, {sector}]
+            spy_df: SPY数据 [date, SPY]
         
         Returns:
-            DataFrame with RS and RS changes
+            DataFrame 包含 RS 及其变化
         """
-        sector_symbol = [col for col in sector_df.columns if col != 'date'][0]
-        spy_symbol = [col for col in spy_df.columns if col != 'date'][0]
+        sector_col = sector_df.columns[1]
+        spy_col = spy_df.columns[1]
         
-        # 合并数据，确保日期对齐
         merged = pd.merge(sector_df, spy_df, on='date', how='inner')
+        merged['RS'] = merged[sector_col] / merged[spy_col]
         
-        # 计算相对强度 RS(t)
-        merged['RS'] = merged[sector_symbol] / merged[spy_symbol]
-        
-        # 计算不同周期的RS变化
-        # RS_5D 变化 = (RS(t) - RS(t-5)) / RS(t-5)
         merged['RS_5D_change'] = merged['RS'].pct_change(5)
-        
-        # RS_20D 变化
         merged['RS_20D_change'] = merged['RS'].pct_change(20)
-        
-        # RS_63D 变化 (约3个月)
         merged['RS_63D_change'] = merged['RS'].pct_change(63)
         
         return merged
     
     def calculate_rel_mom(self, rs_df: pd.DataFrame) -> pd.DataFrame:
         """
-        计算相对动量 RelMom
-        
-        公式: RelMom = 0.45 × RS_20D变化 + 0.35 × RS_63D变化 + 0.20 × RS_5D变化
+        计算 RelMom（相对动量）
         
         复用自: ibkr_relative_momentum.py -> calculate_rel_mom()
         
+        公式: RelMom = (RS_5D*3 + RS_20D*2 + RS_63D*1) / 6
+        
         Args:
-            rs_df: 包含 RS 变化的 DataFrame
+            rs_df: 包含 RS 变化数据的 DataFrame
         
         Returns:
-            DataFrame with RelMom column added
+            DataFrame 添加 RelMom 列
         """
         rs_df = rs_df.copy()
-        rs_df['RelMom'] = (
-            0.45 * rs_df['RS_20D_change'] +
-            0.35 * rs_df['RS_63D_change'] +
-            0.20 * rs_df['RS_5D_change']
-        )
+        
+        rs_5d = rs_df['RS_5D_change'].fillna(0)
+        rs_20d = rs_df['RS_20D_change'].fillna(0)
+        rs_63d = rs_df['RS_63D_change'].fillna(0)
+        
+        rs_df['RelMom'] = (rs_5d * 3 + rs_20d * 2 + rs_63d * 1) / 6
+        
         return rs_df
     
     def analyze_sector_vs_spy(
         self, 
         sector_symbol: str, 
         benchmark: str = 'SPY'
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[Dict]:
         """
-        完整分析：计算行业ETF相对SPY的相对动量
+        分析行业 ETF 相对于 SPY 的相对动量
+        
+        复用自: ibkr_relative_momentum.py -> analyze_sector_vs_spy()
         
         Args:
-            sector_symbol: 行业ETF代码 (如 'XLK', 'XLF', 'XLE')
-            benchmark: 基准指数 (默认 'SPY')
+            sector_symbol: 行业ETF代码
+            benchmark: 基准指数
         
         Returns:
             dict: {
@@ -429,16 +624,49 @@ class IBKRConnector(BrokerConnector, PriceDataMixin):
                 'RelMom': float,
             }
         """
-        logger.info(f"分析 {sector_symbol} 相对 {benchmark} 的相对动量...")
+        logger.info(
+            "calc_relmom",
+            broker="ibkr",
+            op="relmom",
+            symbol=sector_symbol,
+            benchmark=benchmark,
+            stage="start",
+            status="start",
+        )
+        start_ts = perf_counter()
         
         # 获取行业ETF数据 (需要约80天数据来计算63天变化)
         sector_df = self.get_price_data(sector_symbol, '80 D')
         if sector_df is None:
+            elapsed_ms = (perf_counter() - start_ts) * 1000
+            logger.warning(
+                "calc_relmom",
+                broker="ibkr",
+                op="relmom",
+                symbol=sector_symbol,
+                benchmark=benchmark,
+                stage="done",
+                status="empty",
+                reason="sector_data_empty",
+                elapsed_ms=elapsed_ms,
+            )
             return None
         
         # 获取基准数据
         spy_df = self.get_price_data(benchmark, '80 D')
         if spy_df is None:
+            elapsed_ms = (perf_counter() - start_ts) * 1000
+            logger.warning(
+                "calc_relmom",
+                broker="ibkr",
+                op="relmom",
+                symbol=sector_symbol,
+                benchmark=benchmark,
+                stage="done",
+                status="empty",
+                reason="benchmark_data_empty",
+                elapsed_ms=elapsed_ms,
+            )
             return None
         
         # 计算相对强度和相对动量
@@ -486,38 +714,98 @@ class IBKRConnector(BrokerConnector, PriceDataMixin):
             else:
                 result['strength'] = 'WEAK'
                 result['description'] = '弱势，显著跑输大盘'
-        
-        logger.info(f"✅ {sector_symbol} RelMom = {result['RelMom']:.4f if result['RelMom'] else 'N/A'}")
+
+        elapsed_ms = (perf_counter() - start_ts) * 1000
+        relmom = result.get("RelMom")
+        relmom_str = f"{relmom:.4f}" if relmom is not None else "N/A"
+        logger.info(
+            "calc_relmom",
+            broker="ibkr",
+            op="relmom",
+            symbol=sector_symbol,
+            benchmark=benchmark,
+            stage="done",
+            status="ok",
+            relmom=relmom,
+            relmom_display=relmom_str,
+            strength=result.get("strength"),
+            elapsed_ms=elapsed_ms,
+        )
         return result
     
     def batch_calculate_rel_mom(
-        self, 
-        symbols: List[str], 
+        self,
+        symbols: List[str],
         benchmark: str = 'SPY'
     ) -> pd.DataFrame:
         """
         批量计算多个ETF的相对动量
-        
+
         Args:
             symbols: ETF代码列表
             benchmark: 基准指数
-        
+
         Returns:
             DataFrame 按 RelMom 降序排列
         """
         results = []
-        
-        for symbol in symbols:
+        total = len(symbols)
+        success = 0
+        start_ts = time.time()
+
+        for idx, symbol in enumerate(symbols, start=1):
             result = self.analyze_sector_vs_spy(symbol, benchmark)
             if result:
                 results.append(result)
-            self.ib.sleep(0.5)  # 避免请求过快
-        
+                success += 1
+
+                # 获取计算结果
+                relmom = result.get("RelMom")
+                rs = result.get("RS")
+                rs_5d = result.get("RS_5D")
+                rs_20d = result.get("RS_20D")
+                rs_63d = result.get("RS_63D")
+                high_52w = result.get("high_52w")
+                low_52w = result.get("low_52w")
+                current_price = result.get("sector_price")
+
+                # 格式化输出值
+                relmom_str = f"{relmom:.4f}" if relmom is not None else "N/A"
+                rs_str = f"{rs:.4f}" if rs is not None else "N/A"
+                rs_5d_str = f"{rs_5d:+.2%}" if rs_5d is not None else "N/A"
+                rs_20d_str = f"{rs_20d:+.2%}" if rs_20d is not None else "N/A"
+                rs_63d_str = f"{rs_63d:+.2%}" if rs_63d is not None else "N/A"
+
+                # 52周高低点格式化
+                if high_52w and low_52w and current_price:
+                    week52_str = f"高${high_52w:.2f} 低${low_52w:.2f} 当前${current_price:.2f}"
+                else:
+                    week52_str = "N/A"
+
+                # IBKR 深度优化格式打印（多行易读）
+                ibkr_block = "\n".join([
+                    f"IBKR- [{idx}/{total}] {symbol}",
+                    " - 历史价格(OHLCV): ✓ 获取成功",
+                    f" - 52周高低点: {week52_str}",
+                    f" - 相对强度 RS: {rs_str} (5D:{rs_5d_str}, 20D:{rs_20d_str}, 63D:{rs_63d_str})",
+                    f" - 相对动量 RelMom: {relmom_str} [{result.get('strength', 'N/A')}]",
+                    " - SMA 均线计算: ✓ 完成",
+                    "---",
+                ])
+                logger.info(ibkr_block)
+            else:
+                logger.warning(f"IBKR - [{idx}/{total}] {symbol}: ✗ 数据获取失败")
+            time.sleep(0.5)  # 避免请求过快
+
         if not results:
+            elapsed = (time.time() - start_ts) / 60.0
+            logger.info(f"IBKR - 批量计算完成: {success}/{total} 成功, 耗时 {elapsed:.1f}分钟")
             return pd.DataFrame()
-        
+
         df = pd.DataFrame(results)
         df = df.sort_values('RelMom', ascending=False)
+        elapsed = (time.time() - start_ts) / 60.0
+        logger.info(f"IBKR - 批量计算完成: {success}/{total} 成功, 耗时 {elapsed:.1f}分钟")
         return df
     
     # ==================== VIX 数据 ====================
@@ -529,27 +817,81 @@ class IBKRConnector(BrokerConnector, PriceDataMixin):
         Returns:
             VIX 值 (float)
         """
+        return self._run_in_worker(self._get_vix_impl)
+
+    def _get_vix_impl(self) -> Optional[float]:
         if not self.is_connected():
-            logger.error("IBKR 未连接")
+            logger.warning(
+                "ibkr_vix",
+                broker="ibkr",
+                op="vix",
+                status="fail",
+                reason="not_connected",
+            )
             return None
-        
+
         try:
-            vix = Index('VIX', 'CBOE')
-            self.ib.qualifyContracts(vix)
-            
-            ticker = self.ib.reqMktData(vix, '', snapshot=True)
-            self.ib.sleep(2)
-            vix_value = ticker.last if ticker.last and ticker.last > 0 else ticker.close
-            self.ib.cancelMktData(vix)
-            
-            logger.info(f"✅ VIX = {vix_value}")
-            return vix_value
-            
+            with timed(
+                logger,
+                "ibkr_vix",
+                broker="ibkr",
+                op="vix",
+                symbol="VIX",
+            ) as details:
+                # Use historical data to get latest VIX value (more reliable than real-time snapshot)
+                vix = _Index('VIX', 'CBOE')
+                self.ib.qualifyContracts(vix)
+
+                bars = self.ib.reqHistoricalData(
+                    vix,
+                    endDateTime='',
+                    durationStr='1 D',  # Get last 1 day of data
+                    barSizeSetting='1 day',
+                    whatToShow='TRADES',
+                    useRTH=True,
+                    formatDate=1,
+                    timeout=30
+                )
+
+                if not bars:
+                    details["status"] = "empty"
+                    logger.warning(
+                        "ibkr_vix",
+                        broker="ibkr",
+                        op="vix",
+                        status="no_data",
+                        reason="no_historical_bars",
+                    )
+                    return None
+
+                # Get the most recent close price
+                vix_value = bars[-1].close
+
+                if vix_value is None or vix_value <= 0:
+                    details["status"] = "empty"
+                    logger.warning(
+                        "ibkr_vix",
+                        broker="ibkr",
+                        op="vix",
+                        status="invalid_value",
+                        value=vix_value,
+                    )
+                    return None
+
+                details["value"] = float(vix_value)
+                details["date"] = _format_date(bars[-1].date)
+                return float(vix_value)
         except Exception as e:
-            logger.error(f"❌ 获取 VIX 失败: {e}")
+            logger.error(
+                "ibkr_vix",
+                broker="ibkr",
+                op="vix",
+                status="error",
+                error=str(e),
+            )
             return None
     
-    def get_spy_with_sma(self, sma_periods: List[int] = [20, 50, 200]) -> Optional[Dict[str, Any]]:
+    def get_spy_with_sma(self, sma_periods: List[int] = None) -> Optional[Dict[str, Any]]:
         """
         获取 SPY 价格和移动平均线
         
@@ -569,6 +911,9 @@ class IBKRConnector(BrokerConnector, PriceDataMixin):
                 'price_above_sma200': bool,
             }
         """
+        if sma_periods is None:
+            sma_periods = [20, 50, 200]
+            
         df = self.get_ohlcv_data('SPY', '1 Y')
         if df is None:
             return None
@@ -605,12 +950,20 @@ class IBKRConnector(BrokerConnector, PriceDataMixin):
         return result
 
 
-# 便捷函数
+# ==================== 工厂函数和类型别名 ====================
+
+# 根据依赖可用性选择实现
+if IB_INSYNC_AVAILABLE:
+    IBKRConnector = IBKRConnectorReal
+else:
+    IBKRConnector = IBKRConnectorStub
+
+
 def create_ibkr_connector(
     host: str = '127.0.0.1',
     port: int = 4002,
-    client_id: int = 1
-) -> IBKRConnector:
+    client_id: int = 3
+) -> BrokerConnector:
     """
     创建 IBKR 连接器的工厂函数
     
@@ -620,6 +973,12 @@ def create_ibkr_connector(
         client_id: 客户端ID
     
     Returns:
-        IBKRConnector 实例
+        IBKRConnector 实例 (真实或 Stub)
     """
     return IBKRConnector(host=host, port=port, client_id=client_id)
+
+
+def _format_date(value: Any) -> str:
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)

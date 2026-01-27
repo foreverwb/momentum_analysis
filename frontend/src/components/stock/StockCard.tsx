@@ -11,6 +11,23 @@ interface StockCardProps {
 export function StockCard({ stock, rank, onClick }: StockCardProps) {
   if (!stock) return null;
 
+  const formatPercent = (value?: number | null, digits = 1, withSign = true) => {
+    if (value === null || value === undefined || Number.isNaN(value)) return '--';
+    const sign = value > 0 && withSign ? '+' : '';
+    return `${sign}${value.toFixed(digits)}%`;
+  };
+
+  const formatNumber = (value?: number | null, digits = 2, withSign = false) => {
+    if (value === null || value === undefined || Number.isNaN(value)) return '--';
+    const sign = value > 0 && withSign ? '+' : '';
+    return `${sign}${value.toFixed(digits)}`;
+  };
+
+  const formatMultiple = (value?: number | null, digits = 2) => {
+    if (value === null || value === undefined || Number.isNaN(value)) return '--';
+    return `${value.toFixed(digits)}x`;
+  };
+
   const handleClick = () => {
     if (!stock?.id) return;
     console.log('Stock card clicked:', stock.symbol);
@@ -40,6 +57,47 @@ export function StockCard({ stock, rank, onClick }: StockCardProps) {
 
   const delta3d = formatDelta(stock.changes?.delta3d);
   const delta5d = formatDelta(stock.changes?.delta5d);
+
+  const metrics = (stock.metrics ?? {}) as Stock['metrics'];
+  const momentumMetrics = [
+    { label: '20D收益', value: formatPercent(metrics.return20d, 1), variant: 'highlight' as const },
+    { label: '20D收益(去3日)', value: formatPercent(metrics.return20dEx3d, 1) },
+    { label: '63D收益', value: formatPercent(metrics.return63d, 1), variant: 'highlight' as const },
+    { label: '相对行业强度', value: formatNumber(metrics.relativeStrength, 2) },
+    { label: '距20日高点', value: formatPercent(metrics.distanceToHigh20d, 1, false), variant: 'warning' as const },
+    { label: '放量倍数', value: formatMultiple(metrics.volumeMultiple ?? metrics.breakoutVolume, 2), variant: 'warning' as const }
+  ];
+
+  const maAlignmentValue = metrics.maAlignment ?? 'N/A';
+  const maAlignmentVariant = maAlignmentValue === 'N/A' ? 'muted' as const : undefined;
+  const trendMetrics = [
+    { label: '均线排列', value: maAlignmentValue, variant: maAlignmentVariant },
+    { label: '20DMA斜率', value: formatNumber(metrics.sma20Slope, 2, true), variant: 'highlight' as const },
+    { label: '趋势持续度', value: formatPercent(metrics.trendPersistence, 0, false) }
+  ];
+
+  const volumeMetrics = [
+    { label: '突破放量', value: formatMultiple(metrics.breakoutVolume, 2) },
+    { label: '量比结构', value: formatNumber(metrics.volumeRatio, 2) },
+    { label: 'OBV趋势', value: metrics.obvTrend ?? 'Neutral', variant: metrics.obvTrend ? undefined : 'muted' as const }
+  ];
+
+  const overheatValue = metrics.overheat ?? 'Normal';
+  const overheatVariant = overheatValue === 'Hot' ? 'warning' as const : undefined;
+  const qualityMetrics = [
+    { label: '20D回撤', value: formatPercent(metrics.maxDrawdown20d, 1, true), variant: 'highlight' as const },
+    { label: 'ATR%', value: formatPercent(metrics.atrPercent, 1, false), variant: 'highlight' as const },
+    { label: '偏离20MA', value: formatPercent(metrics.deviationFrom20ma, 1, true), variant: 'highlight' as const },
+    { label: '过热程度', value: overheatValue, variant: overheatVariant }
+  ];
+
+  const optionsHeatValue = metrics.optionsHeat ?? 'Medium';
+  const optionsHeatClass =
+    optionsHeatValue === 'High'
+      ? 'text-[var(--accent-red)]'
+      : optionsHeatValue === 'Low'
+        ? 'text-[var(--text-muted)]'
+        : 'text-[var(--text-secondary)]';
 
   return (
     <div 
@@ -126,14 +184,7 @@ export function StockCard({ stock, rank, onClick }: StockCardProps) {
           subtitle="主要权重"
           score={stock.scores?.momentum ?? 0}
           scoreColor={getScoreColor(stock.scores?.momentum ?? 0)}
-          metrics={[
-            { label: '20D收益', value: `+${stock.metrics?.return20d ?? 0}%`, variant: 'highlight' },
-            { label: '20D收益(去3日)', value: `+${stock.metrics?.return20d ?? 0}%` },
-            { label: '63D收益', value: `+${stock.metrics?.return63d ?? 0}%`, variant: 'highlight' },
-            { label: '相对行业强度', value: '1' },
-            { label: '距20日高点', value: '47184%', variant: 'warning' },
-            { label: '放量倍数', value: '1x', variant: 'warning' }
-          ]}
+          metrics={momentumMetrics}
         />
 
         {/* Trend Structure */}
@@ -142,11 +193,7 @@ export function StockCard({ stock, rank, onClick }: StockCardProps) {
           title="趋势结构"
           score={stock.scores?.trend ?? 0}
           scoreColor={getScoreColor(stock.scores?.trend ?? 0)}
-          metrics={[
-            { label: '均线排列', value: 'N/A', variant: 'muted' },
-            { label: '20DMA斜率', value: `+${stock.metrics?.sma20Slope?.toFixed(2) ?? '0.00'}`, variant: 'highlight' },
-            { label: '趋势持续度', value: '0%' }
-          ]}
+          metrics={trendMetrics}
         />
 
         {/* Volume Confirmation */}
@@ -155,11 +202,7 @@ export function StockCard({ stock, rank, onClick }: StockCardProps) {
           title="量价确认"
           score={stock.scores?.volume ?? 0}
           scoreColor={getScoreColor(stock.scores?.volume ?? 0)}
-          metrics={[
-            { label: '突破放量', value: '1x' },
-            { label: '量比结构', value: '1' },
-            { label: 'OBV趋势', value: 'Neutral', variant: 'muted' }
-          ]}
+          metrics={volumeMetrics}
         />
 
         {/* Quality Filter */}
@@ -168,12 +211,7 @@ export function StockCard({ stock, rank, onClick }: StockCardProps) {
           title="质量过滤"
           score={stock.scores?.quality ?? 0}
           scoreColor="blue"
-          metrics={[
-            { label: '20D回撤', value: '0%', variant: 'highlight' },
-            { label: 'ATR%', value: '0%', variant: 'highlight' },
-            { label: '偏离20MA', value: '+0.0%', variant: 'highlight' },
-            { label: '过热程度', value: 'Hot', variant: 'warning' }
-          ]}
+          metrics={qualityMetrics}
         />
       </div>
 
@@ -197,19 +235,21 @@ export function StockCard({ stock, rank, onClick }: StockCardProps) {
         <div className="flex gap-8">
           <div className="flex items-center gap-2">
             <span className="text-[13px] text-[var(--text-secondary)]">热度</span>
-            <span className="text-sm font-semibold text-[var(--accent-red)]">High</span>
+            <span className={`text-sm font-semibold ${optionsHeatClass}`}>
+              {optionsHeatValue}
+            </span>
           </div>
           <div className="flex items-center gap-2">
             <span className="text-[13px] text-[var(--text-secondary)]">相对成交</span>
-            <span className="text-sm font-semibold">1.8x</span>
+            <span className="text-sm font-semibold">{formatMultiple(metrics.optionsRelVolume, 2)}</span>
           </div>
           <div className="flex items-center gap-2">
             <span className="text-[13px] text-[var(--text-secondary)]">IVR</span>
-            <span className="text-sm font-semibold">{stock.metrics?.ivr ?? '--'}</span>
+            <span className="text-sm font-semibold">{metrics.ivr ?? '--'}</span>
           </div>
           <div className="flex items-center gap-2">
             <span className="text-[13px] text-[var(--text-secondary)]">IV30</span>
-            <span className="text-sm font-semibold">{stock.metrics?.iv30?.toFixed(2) ?? '--'}</span>
+            <span className="text-sm font-semibold">{metrics.iv30?.toFixed(2) ?? '--'}</span>
           </div>
         </div>
       </div>

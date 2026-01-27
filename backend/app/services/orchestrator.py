@@ -17,9 +17,11 @@ from dataclasses import dataclass, asdict, field
 from datetime import datetime, date
 from enum import Enum
 import asyncio
-import logging
+from time import perf_counter
 
-logger = logging.getLogger(__name__)
+import structlog
+
+logger = structlog.get_logger(__name__)
 
 
 # ==================== 枚举和数据类 ====================
@@ -621,6 +623,7 @@ class DataOrchestrator:
                 calculate_breadth_metrics,
                 get_summary_statistics
             )
+            from app.models import get_db, ETF
             
             # 解析数据
             parsed = parse_finviz_json(data)
@@ -633,6 +636,23 @@ class DataOrchestrator:
             
             # 获取统计摘要
             stats = get_summary_statistics(parsed)
+            
+            # 更新 ETF 的 coverage_ranges
+            db = next(get_db())
+            try:
+                etf = db.query(ETF).filter(ETF.symbol == etf_symbol.upper()).first()
+                if etf:
+                    existing_ranges = getattr(etf, 'coverage_ranges', None) or []
+                    if coverage not in existing_ranges:
+                        existing_ranges.append(coverage)
+                        etf.coverage_ranges = existing_ranges
+                        db.commit()
+                        logger.info(f"已更新 {etf_symbol} 的 coverage_ranges: {existing_ranges}")
+            except Exception as e:
+                logger.warning(f"更新 coverage_ranges 失败 (可能数据库列不存在): {e}")
+                db.rollback()
+            finally:
+                db.close()
             
             result = {
                 'etf_symbol': etf_symbol,
@@ -802,17 +822,68 @@ class DataOrchestrator:
         
         synced = []
         failed = []
+        ok = 0
+        fail = 0
+        total = len(symbols)
+        start_ts = perf_counter()
+        log = logger.bind(broker="ibkr", op="sync_price", duration=duration)
+        log.info(
+            "sync_price",
+            stage="start",
+            total=total,
+            status="start",
+        )
         
-        for symbol in symbols:
+        for idx, symbol in enumerate(symbols, start=1):
             try:
                 df = self._ibkr.get_ohlcv_data(symbol, duration)
                 if df is not None and not df.empty:
                     synced.append(symbol)
+                    ok += 1
                 else:
                     failed.append(symbol)
+                    fail += 1
+                    logger.warning(
+                        "sync_price_item",
+                        broker="ibkr",
+                        op="sync_price",
+                        symbol=symbol,
+                        status="empty",
+                        reason="no_data",
+                    )
             except Exception as e:
-                logger.error(f"同步 {symbol} 失败: {e}")
                 failed.append(symbol)
+                fail += 1
+                logger.exception(
+                    "sync_price_item",
+                    broker="ibkr",
+                    op="sync_price",
+                    symbol=symbol,
+                    status="fail",
+                    err=str(e),
+                )
+            if idx % 10 == 0 or idx == total:
+                log.info(
+                    "sync_price",
+                    stage="progress",
+                    total=total,
+                    done=idx,
+                    ok=ok,
+                    fail=fail,
+                    status="progress",
+                )
+
+        elapsed_ms = (perf_counter() - start_ts) * 1000
+        status = "ok" if fail == 0 else "partial"
+        log.info(
+            "sync_price",
+            stage="done",
+            total=total,
+            ok=ok,
+            fail=fail,
+            status=status,
+            elapsed_ms=elapsed_ms,
+        )
         
         return {
             'synced': synced,
@@ -837,19 +908,90 @@ class DataOrchestrator:
                 'synced': []
             }
         
+        total = len(symbols)
+        start_ts = perf_counter()
+        log = logger.bind(broker="futu", op="sync_iv")
+        log.info(
+            "sync_iv",
+            stage="start",
+            total=total,
+            status="start",
+        )
+
         try:
-            iv_data = await self.fetch_iv_data(symbols)
-            return {
-                'synced': list(iv_data.keys()),
-                'data': iv_data,
-                'success_count': len(iv_data)
-            }
+            iv_results = self._futu.fetch_iv_terms(symbols)
         except Exception as e:
-            logger.error(f"同步 IV 数据失败: {e}")
+            elapsed_ms = (perf_counter() - start_ts) * 1000
+            log.exception(
+                "sync_iv",
+                stage="done",
+                total=total,
+                ok=0,
+                fail=total,
+                status="fail",
+                elapsed_ms=elapsed_ms,
+                err=str(e),
+            )
             return {
                 'error': str(e),
                 'synced': []
             }
+
+        ok = 0
+        fail = 0
+        for idx, symbol in enumerate(symbols, start=1):
+            data = iv_results.get(symbol)
+            if data and data.is_valid():
+                ok += 1
+            else:
+                fail += 1
+                logger.warning(
+                    "sync_iv_item",
+                    broker="futu",
+                    op="sync_iv",
+                    symbol=symbol,
+                    status="empty",
+                    reason="no_iv_data",
+                )
+            if idx % 10 == 0 or idx == total:
+                log.info(
+                    "sync_iv",
+                    stage="progress",
+                    total=total,
+                    done=idx,
+                    ok=ok,
+                    fail=fail,
+                    status="progress",
+                )
+
+        iv_data = {
+            symbol: {
+                'iv7': data.iv7,
+                'iv30': data.iv30,
+                'iv60': data.iv60,
+                'iv90': data.iv90,
+                'total_oi': data.total_oi
+            }
+            for symbol, data in iv_results.items()
+        }
+
+        elapsed_ms = (perf_counter() - start_ts) * 1000
+        status = "ok" if fail == 0 else "partial"
+        log.info(
+            "sync_iv",
+            stage="done",
+            total=total,
+            ok=ok,
+            fail=fail,
+            status=status,
+            elapsed_ms=elapsed_ms,
+        )
+
+        return {
+            'synced': list(iv_data.keys()),
+            'data': iv_data,
+            'success_count': len(iv_data)
+        }
     
     # ==================== 缓存管理 ====================
     

@@ -25,15 +25,25 @@ router = APIRouter(prefix="/api/market", tags=["Market"])
 class SPYData(BaseModel):
     """SPY 数据模型"""
     price: float
-    vs200ma: str
-    trend: str
+    sma20: float
+    sma50: float
+    dist_to_sma20: Optional[float] = None
+    dist_to_sma50: Optional[float] = None
+    return_20d: float
+    sma20_slope: float
 
 
 class RegimeIndicators(BaseModel):
     """Regime 指标模型"""
+    price_above_sma20: bool
     price_above_sma50: bool
+    sma20_slope: float
     sma20_slope_positive: bool
+    sma20_above_sma50: bool
     return_20d: float
+    dist_to_sma20: Optional[float] = None
+    dist_to_sma50: Optional[float] = None
+    near_sma50: Optional[bool] = None
 
 
 class RegimeResponse(BaseModel):

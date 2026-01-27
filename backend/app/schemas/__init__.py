@@ -32,7 +32,22 @@ class StockChanges(BaseModel):
 
 class StockMetrics(BaseModel):
     return20d: float
+    return20dEx3d: Optional[float] = None
     return63d: float
+    relativeStrength: Optional[float] = None
+    distanceToHigh20d: Optional[float] = None
+    volumeMultiple: Optional[float] = None
+    maAlignment: Optional[str] = None
+    trendPersistence: Optional[float] = None
+    breakoutVolume: Optional[float] = None
+    volumeRatio: Optional[float] = None
+    obvTrend: Optional[str] = None
+    maxDrawdown20d: Optional[float] = None
+    atrPercent: Optional[float] = None
+    deviationFrom20ma: Optional[float] = None
+    overheat: Optional[str] = None
+    optionsHeat: Optional[str] = None
+    optionsRelVolume: Optional[float] = None
     sma20Slope: float
     ivr: float
     iv30: float

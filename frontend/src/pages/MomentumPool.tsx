@@ -8,11 +8,12 @@ export function MomentumPool() {
   const { data: stocks, isLoading, error, refetch } = useStocks();
 
   // Filter options
+  const industryOptions = Array.from(
+    new Set((stocks ?? []).map(stock => stock.industry).filter(Boolean))
+  ).sort();
   const filterOptions = [
     { value: 'all', label: '全部行业' },
-    { value: '半导体', label: '半导体' },
-    { value: '软件', label: '软件' },
-    { value: '硬件', label: '硬件' },
+    ...industryOptions.map((industry) => ({ value: industry, label: industry }))
   ];
 
   // Filter stocks based on industry

@@ -7,18 +7,18 @@ Regime Gate 计算器
 - B档 (NEUTRAL): 半火力，谨慎做多
 - C档 (RISK_OFF): 低火力/空仓，防守为主
 
-判断依据:
-- SPY 价格与均线关系
-- SMA20 斜率
-- 20日收益率
-- VIX 水平
+更新后的判断依据:
+- SPY 收盘价相对 20DMA / 50DMA
+- SMA20 斜率 或 20日收益率
+- (可选) 市场广度
+- VIX 仅用于参考展示，不参与档位切换
 
 数据源: IBKR
 """
 
 from typing import Dict, Optional, Any
 from dataclasses import dataclass, asdict
-from datetime import datetime
+import math
 import logging
 
 logger = logging.getLogger(__name__)
@@ -30,15 +30,15 @@ class RegimeData:
     spy_price: float
     sma20: float
     sma50: float
-    sma200: float
-    vs_200ma: str
+    dist_to_sma20: Optional[float]
+    dist_to_sma50: Optional[float]
     sma20_slope: float
     return_20d: float
     vix: Optional[float]
+    price_above_sma20: bool
     price_above_sma50: bool
-    price_above_sma200: bool
     sma20_above_sma50: bool
-    sma50_above_sma200: bool
+    near_sma50: bool
     
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -73,20 +73,17 @@ class RegimeGateCalculator:
     市场环境分为三档:
     
     A档 - RISK_ON (满火力):
-    - SPY > SMA50
-    - SMA20 斜率 > 0
-    - SMA20 > SMA50
-    条件：全部满足
+    - SPY > 50DMA
+    - SMA20 斜率 > 0 或 20日收益率为正
+    - （可选）市场广度不差
+    - 且与 50DMA 距离超过 2%
     
     B档 - NEUTRAL (半火力):
-    - 不满足 A档 条件
-    - 不满足 C档 条件
-    条件：A、C 都不满足
+    - 价格贴近 50DMA（|price-50DMA| < 2%）或趋势方向不明
     
     C档 - RISK_OFF (低火力/空仓):
-    - SPY < SMA50
-    - 20日收益率 < -5%
-    条件：全部满足
+    - SPY < 50DMA 且 20日收益率为负
+    - 或广度快速坍塌
     
     使用示例:
     ```python
@@ -108,7 +105,7 @@ class RegimeGateCalculator:
     THRESHOLDS = {
         'vix_low': 15,      # VIX 低于此值为低波动
         'vix_high': 25,     # VIX 高于此值为高波动
-        'return_20d_bad': -0.05,  # 20日收益率低于此值为差
+        'return_20d_bad': 0.0,  # 20日收益率低于此值为负
     }
     
     def __init__(self, ibkr):
@@ -119,6 +116,22 @@ class RegimeGateCalculator:
             ibkr: IBKRConnector 实例
         """
         self.ibkr = ibkr
+
+    @staticmethod
+    def _safe_number(value: Optional[float], default=None):
+        """Return a JSON-safe number; strip NaN/inf to default."""
+        try:
+            if value is None:
+                return default
+            # bool is subclass of int; keep as-is
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                if math.isnan(value) or math.isinf(value):
+                    return default
+            return value
+        except Exception:
+            return default
     
     def calculate_regime(self) -> Dict:
         """
@@ -138,10 +151,10 @@ class RegimeGateCalculator:
         logger.info("开始计算市场环境 (Regime Gate)...")
         
         try:
-            # 获取 SPY 数据 (需要 250 天来计算 200日均线)
-            spy_df = self.ibkr.get_price_data('SPY', duration='250 D')
+            # 获取 SPY 数据（约 120 天足够覆盖 50DMA 与斜率）
+            spy_df = self.ibkr.get_price_data('SPY', duration='120 D')
             
-            if spy_df is None or len(spy_df) < 200:
+            if spy_df is None or len(spy_df) < 60:
                 logger.error("无法获取足够的 SPY 数据")
                 return {
                     'status': 'UNKNOWN',
@@ -156,12 +169,14 @@ class RegimeGateCalculator:
             # 计算均线
             sma20 = calculate_sma(prices, 20)
             sma50 = calculate_sma(prices, 50)
-            sma200 = calculate_sma(prices, 200)
             
             current_price = prices.iloc[-1]
             current_sma20 = sma20.iloc[-1]
             current_sma50 = sma50.iloc[-1]
-            current_sma200 = sma200.iloc[-1]
+            
+            # 与均线的距离
+            dist_to_sma20 = (current_price - current_sma20) / current_sma20 if current_sma20 else math.nan
+            dist_to_sma50 = (current_price - current_sma50) / current_sma50 if current_sma50 else math.nan
             
             # 计算斜率和收益率
             sma20_slope = calculate_sma_slope(sma20, period=5)
@@ -169,51 +184,69 @@ class RegimeGateCalculator:
             
             # 获取 VIX
             vix = self.ibkr.get_vix()
-            
-            # 计算相对 200MA 的位置
-            vs_200ma = ((current_price / current_sma200) - 1) * 100
-            vs_200ma_str = f"{vs_200ma:+.1f}%"
-            
-            # 构建数据对象
+
+            # JSON 安全的数值（去除 NaN/Inf）
+            safe_price = self._safe_number(float(current_price))
+            safe_sma20 = self._safe_number(float(current_sma20))
+            safe_sma50 = self._safe_number(float(current_sma50))
+            safe_dist20 = self._safe_number(dist_to_sma20)
+            safe_dist50 = self._safe_number(dist_to_sma50)
+            safe_sma20_slope = self._safe_number(float(sma20_slope), 0.0)
+            safe_return_20d = self._safe_number(float(return_20d), 0.0)
+            safe_vix = self._safe_number(vix)
+
+            # 构建数据对象（布尔值也需防 None 比较报错）
+            near_50dma = False
+            try:
+                near_50dma = abs(dist_to_sma50) < 0.02
+            except Exception:
+                near_50dma = False
+
             data = RegimeData(
-                spy_price=round(current_price, 2),
-                sma20=round(current_sma20, 2),
-                sma50=round(current_sma50, 2),
-                sma200=round(current_sma200, 2),
-                vs_200ma=vs_200ma_str,
-                sma20_slope=round(sma20_slope, 4),
-                return_20d=round(return_20d, 4),
-                vix=vix,
-                price_above_sma50=current_price > current_sma50,
-                price_above_sma200=current_price > current_sma200,
-                sma20_above_sma50=current_sma20 > current_sma50,
-                sma50_above_sma200=current_sma50 > current_sma200
+                spy_price=safe_price,
+                sma20=safe_sma20,
+                sma50=safe_sma50,
+                dist_to_sma20=safe_dist20,
+                dist_to_sma50=safe_dist50,
+                sma20_slope=safe_sma20_slope,
+                return_20d=safe_return_20d,
+                vix=safe_vix,
+                price_above_sma20=bool(
+                    safe_price is not None and safe_sma20 is not None and safe_price > safe_sma20
+                ),
+                price_above_sma50=bool(
+                    safe_price is not None and safe_sma50 is not None and safe_price > safe_sma50
+                ),
+                sma20_above_sma50=bool(
+                    safe_sma20 is not None and safe_sma50 is not None and safe_sma20 > safe_sma50
+                ),
+                near_sma50=near_50dma
             )
             
             # ============ 判断 Regime ============
             
-            # A档（Risk-On）条件: 全部满足
-            risk_on_conditions = [
-                current_price > current_sma50,      # SPY > SMA50
-                sma20_slope > 0,                     # SMA20 斜率 > 0
-                current_sma20 > current_sma50       # SMA20 > SMA50
-            ]
-            
-            # C档（Risk-Off）条件: 全部满足
-            risk_off_conditions = [
-                current_price < current_sma50,      # SPY < SMA50
-                return_20d < self.THRESHOLDS['return_20d_bad']  # 20日收益 < -5%
-            ]
-            
-            # 判断
-            if all(risk_on_conditions):
-                regime = 'RISK_ON'
-                fire_power = '满火力'
-                status = 'A'
-            elif all(risk_off_conditions):
+            # C档（Risk-Off）条件: 价格跌破50DMA且20日收益为负
+            price_below_50 = safe_price is not None and safe_sma50 is not None and safe_price < safe_sma50
+            slope_positive = safe_sma20_slope is not None and safe_sma20_slope > 0
+            return_positive = safe_return_20d is not None and safe_return_20d > 0
+            risk_off = price_below_50 and (safe_return_20d or 0) < self.THRESHOLDS['return_20d_bad']
+            # A档（Risk-On）条件: 价格站上50DMA且短期趋势向上
+            price_above_50 = data.price_above_sma50
+            risk_on = price_above_50 and (slope_positive or return_positive)
+            near_50dma = data.near_sma50  # ±2% 视为靠近
+
+            if risk_off:
                 regime = 'RISK_OFF'
                 fire_power = '低火力/空仓'
                 status = 'C'
+            elif near_50dma:
+                regime = 'NEUTRAL'
+                fire_power = '半火力'
+                status = 'B'
+            elif risk_on:
+                regime = 'RISK_ON'
+                fire_power = '满火力'
+                status = 'A'
             else:
                 regime = 'NEUTRAL'
                 fire_power = '半火力'
@@ -271,16 +304,24 @@ class RegimeGateCalculator:
             'regime_text': f"{result['regime']} {result['fire_power']}",
             'spy': {
                 'price': data['spy_price'],
-                'vs200ma': data['vs_200ma'],
-                'trend': 'up' if data['price_above_sma200'] else 'down'
+                'sma20': data['sma20'],
+                'sma50': data['sma50'],
+                'dist_to_sma20': data.get('dist_to_sma20'),
+                'dist_to_sma50': data.get('dist_to_sma50'),
+                'return_20d': data['return_20d'],
+                'sma20_slope': data['sma20_slope'],
             },
             'vix': data['vix'],
             'indicators': {
+                'price_above_sma20': data['price_above_sma20'],
                 'price_above_sma50': data['price_above_sma50'],
-                'price_above_sma200': data['price_above_sma200'],
+                'sma20_slope': data['sma20_slope'],
                 'sma20_slope_positive': data['sma20_slope'] > 0,
                 'sma20_above_sma50': data['sma20_above_sma50'],
-                'return_20d': data['return_20d']
+                'return_20d': data['return_20d'],
+                'dist_to_sma20': data.get('dist_to_sma20'),
+                'dist_to_sma50': data.get('dist_to_sma50'),
+                'near_sma50': data.get('near_sma50'),
             }
         }
     
@@ -312,22 +353,22 @@ class RegimeGateCalculator:
         """分析趋势状态"""
         price = data['spy_price']
         sma50 = data['sma50']
-        sma200 = data['sma200']
+        sma20 = data['sma20']
         sma20_slope = data['sma20_slope']
         
         # 趋势强度评估
-        if data['price_above_sma200'] and data['sma50_above_sma200']:
+        if data['price_above_sma50'] and data['sma20_above_sma50'] and sma20_slope > 0:
             trend_strength = 'STRONG_UPTREND'
-            trend_description = '强势上升趋势，均线多头排列'
+            trend_description = '强势上升趋势，价格与短中期均线均向上'
         elif data['price_above_sma50']:
             trend_strength = 'UPTREND'
             trend_description = '上升趋势，价格在 SMA50 上方'
-        elif data['price_above_sma200']:
+        elif price is not None and sma20 is not None and price > sma20:
             trend_strength = 'WEAK_UPTREND'
-            trend_description = '弱上升趋势，价格在 SMA200 上方但在 SMA50 下方'
-        elif price < sma200:
+            trend_description = '弱上升趋势，价格在 20DMA 上方但在 50DMA 下方'
+        elif price < sma50:
             trend_strength = 'DOWNTREND'
-            trend_description = '下降趋势，价格在 SMA200 下方'
+            trend_description = '下降趋势，价格在 50DMA 下方'
         else:
             trend_strength = 'SIDEWAYS'
             trend_description = '横盘整理'
