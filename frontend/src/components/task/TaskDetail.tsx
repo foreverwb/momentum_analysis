@@ -3,7 +3,7 @@ import { TrendChart, type TrendDataPoint } from '../chart';
 import { ETFDetailCard } from './ETFDetailCard';
 import { HoldingsImportModal, ETFImportModal } from '../modal';
 import { LoadingState, ErrorMessage } from '../common';
-import type { Task, ETF } from '../../types';
+import type { Task, ETF, Holding } from '../../types';
 import * as api from '../../services/api';
 
 interface TaskDetailProps {
@@ -58,6 +58,7 @@ interface ETFDetailData {
   delta3d: number | null;
   delta5d: number | null;
   completeness: number;
+  holdings: Holding[];
   dataStatus: Array<{
     source: 'Finviz' | 'MarketChameleon' | '市场/期权数据';
     status: 'complete' | 'pending' | 'missing';
@@ -71,6 +72,7 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
   const [holdingsModalOpen, setHoldingsModalOpen] = useState(false);
   const [etfModalOpen, setETFModalOpen] = useState(false);
   const [selectedETF, setSelectedETF] = useState<string>('');
+  const [coverageRangesByETF, setCoverageRangesByETF] = useState<Record<string, string[]>>({});
   
   // API 数据状态
   const [etfDetails, setEtfDetails] = useState<ETFDetailData[]>([]);
@@ -90,7 +92,7 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
     try {
       const etfDataPromises = task.etfs.map(async (symbol) => {
         try {
-          const etf = await api.getETFBySymbol(symbol, false);
+          const etf = await api.getETFBySymbol(symbol, true);
           if (etf) {
             return {
               symbol: etf.symbol,
@@ -102,6 +104,7 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
               delta3d: etf.delta?.delta3d ?? null,
               delta5d: etf.delta?.delta5d ?? null,
               completeness: etf.completeness || 0,
+              holdings: etf.holdings || [],
               dataStatus: generateDataStatus(etf),
             };
           }
@@ -120,6 +123,7 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
           delta3d: null,
           delta5d: null,
           completeness: 0,
+          holdings: [],
           dataStatus: [
             { source: 'Finviz' as const, status: 'missing' as const, updatedAt: null },
             { source: 'MarketChameleon' as const, status: 'missing' as const, updatedAt: null },
@@ -130,6 +134,7 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
       
       const results = await Promise.all(etfDataPromises);
       setEtfDetails(results);
+      setSelectedETF((prev) => prev || results[0]?.symbol || '');
       
       // 生成趋势数据（基于真实数据或空数据）
       setTrendData(generateEmptyTrendData(trendPeriod === '3d' ? 3 : 5));
@@ -202,10 +207,6 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
     momentum: '动能追踪',
   };
 
-  const handleExport = () => {
-    console.log('Exporting task data...');
-    alert('导出功能开发中');
-  };
 
   const handleRefreshAll = () => {
     loadETFData();
@@ -238,8 +239,13 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
     setHoldingsModalOpen(true);
   };
 
-  const handleOpenETFModal = (symbol: string) => {
-    setSelectedETF(symbol);
+  const handleOpenETFImport = () => {
+    const targetSymbol = selectedETF || etfDetails[0]?.symbol || task.etfs[0];
+    if (!targetSymbol) {
+      alert('暂无可导入的 ETF');
+      return;
+    }
+    setSelectedETF(targetSymbol);
     setETFModalOpen(true);
   };
 
@@ -284,26 +290,18 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
         <div className="flex items-center gap-3">
           <button
             onClick={handleRefreshAll}
-            className="px-4 py-2 text-sm font-medium rounded-[var(--radius-sm)] bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:bg-[var(--border-light)] transition-colors flex items-center gap-2"
+            className="px-4 py-2 text-sm font-medium rounded-[var(--radius-sm)] bg-[var(--accent-blue)] text-white hover:bg-blue-600 transition-colors flex items-center gap-2"
           >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
-              <path d="M3 3v5h5" />
-              <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
-              <path d="M16 16h5v5" />
-            </svg>
             刷新全部
           </button>
           <button
-            onClick={handleExport}
-            className="px-4 py-2 text-sm font-medium rounded-[var(--radius-sm)] bg-[var(--accent-blue)] text-white hover:bg-blue-600 transition-colors flex items-center gap-2"
+            onClick={handleOpenETFImport}
+            className="px-4 py-2 text-sm font-medium rounded-[var(--radius-sm)] bg-[var(--bg-secondary)] border border-[var(--border-light)] text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] transition-colors flex items-center gap-2"
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-              <polyline points="7 10 12 15 17 10" />
-              <line x1="12" y1="15" x2="12" y2="3" />
+              <path d="M12 5v14M5 12l7-7 7 7" />
             </svg>
-            导出报告
+            导入 ETF 数据
           </button>
         </div>
       </div>
@@ -367,8 +365,8 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
             <ETFDetailCard
               key={etf.symbol}
               etf={etf}
+              coverageRanges={coverageRangesByETF[etf.symbol] || []}
               onRefreshETF={() => handleRefreshETF(etf.symbol)}
-              onImportETFData={() => handleOpenETFModal(etf.symbol)}
               onRefreshHoldings={() => handleRefreshHoldings(etf.symbol)}
               onImportHoldings={() => handleOpenHoldingsModal(etf.symbol)}
             />
@@ -383,6 +381,13 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
         etfSymbol={selectedETF}
         onImport={(data) => {
           console.log('Import holdings:', selectedETF, data);
+          if (selectedETF) {
+            setCoverageRangesByETF((prev) => {
+              const existing = new Set(prev[selectedETF] || []);
+              existing.add(data.coverage);
+              return { ...prev, [selectedETF]: Array.from(existing) };
+            });
+          }
           loadETFData();
         }}
       />
