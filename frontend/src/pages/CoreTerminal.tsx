@@ -223,7 +223,7 @@ export function CoreTerminal() {
         </div>
         <button 
           onClick={handleRefresh}
-          className="px-4 py-2 text-sm font-medium rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors flex items-center gap-2"
+          className="px-4 py-2 text-sm font-medium rounded-sm bg-blue-600 text-white hover:bg-blue-700 transition-colors flex items-center gap-2"
         >
           <RefreshIcon className={isRefreshing ? 'animate-spin' : ''} />
           刷新数据
@@ -315,7 +315,7 @@ export function CoreTerminal() {
               <p className="text-slate-600">{currentSectorDetail.name} · {currentSectorDetail.name.replace('板块', '')} Sector</p>
             </div>
             <div className="flex items-center gap-3">
-              <div className={`px-4 py-2 rounded-lg border ${getTrendLevelColor(currentSectorDetail.trendLevel)}`}>
+              <div className={`px-4 py-2 rounded-sm border ${getTrendLevelColor(currentSectorDetail.trendLevel)}`}>
                 <div className="text-xs mb-1">趋势等级</div>
                 <div className="text-xl font-bold">{currentSectorDetail.trendLevel}</div>
               </div>
@@ -354,9 +354,9 @@ export function CoreTerminal() {
               {currentSectorDetail.industries.map((ind, idx) => (
                 <div 
                   key={ind.name}
-                  className="flex items-center gap-3 p-3 bg-slate-50 rounded-lg hover:bg-slate-100 border border-slate-200 transition-colors"
+                  className="flex items-center gap-3 p-3 bg-slate-50 rounded-sm hover:bg-slate-100 border border-slate-200 transition-colors"
                 >
-                  <div className="w-8 h-8 bg-gradient-to-br from-blue-500 to-purple-600 rounded-lg flex items-center justify-center font-bold text-sm text-white">
+                  <div className="w-8 h-8 bg-gradient-to-br from-blue-500 to-purple-600 rounded-sm flex items-center justify-center font-bold text-sm text-white">
                     {idx + 1}
                   </div>
                   <div className="flex-1">
