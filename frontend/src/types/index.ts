@@ -68,6 +68,11 @@ export interface OptionsConfirm {
 export interface Holding {
   ticker: string;
   weight: number;
+  beta?: number | null;
+  rsi?: number | null;
+  sma50?: number | null;
+  sma200?: number | null;
+  high52w?: number | null;
 }
 
 export interface ETF {

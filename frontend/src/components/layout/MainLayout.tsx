@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Header } from './Header';
 import type { NavSection } from '../../types';
 
@@ -6,8 +6,35 @@ interface MainLayoutProps {
   children: (activeSection: NavSection) => React.ReactNode;
 }
 
+const STORAGE_KEY = 'momentum-radar-active-section';
+
+// 验证是否为有效的导航项
+function isValidSection(section: string): section is NavSection {
+  return ['core', 'sector', 'industry', 'momentum', 'tracking'].includes(section);
+}
+
 export function MainLayout({ children }: MainLayoutProps) {
-  const [activeSection, setActiveSection] = useState<NavSection>('sector');
+  // 从 localStorage 读取初始状态
+  const [activeSection, setActiveSection] = useState<NavSection>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved && isValidSection(saved)) {
+        return saved;
+      }
+    } catch (e) {
+      console.warn('Failed to read from localStorage:', e);
+    }
+    return 'sector'; // 默认页面
+  });
+
+  // 当 activeSection 变化时保存到 localStorage
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, activeSection);
+    } catch (e) {
+      console.warn('Failed to save to localStorage:', e);
+    }
+  }, [activeSection]);
 
   const handleNavigate = (section: NavSection) => {
     console.log('Navigating to:', section);
