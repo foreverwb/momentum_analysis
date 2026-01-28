@@ -18,11 +18,12 @@ import os
 import time
 import json
 import threading
-import logging
+import structlog
 
 from .base import BrokerConnector
+from app.core.timing import timed
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 @dataclass
@@ -297,33 +298,64 @@ class FutuConnector(BrokerConnector):
     
     def _fetch_symbol_iv_terms(self, symbol: str, max_days: int = 120) -> IVTermResult:
         """获取单个标的的 IV 期限结构"""
-        code = self._format_code(symbol)
-        today = datetime.now().date()
-        end_date = today + timedelta(days=max_days)
-        
-        # 收集到期日和期权合约
-        expirations = self._collect_expirations(code, today, end_date)
-        
-        if not expirations:
-            logger.warning(f"⚠ {symbol}: 无可用期权到期日")
-            return IVTermResult()
-        
-        # 获取快照数据
-        snapshot_map = self._fetch_snapshot_map(expirations)
-        
-        # 构建 DTE 点
-        dte_points = self._build_dte_points(today, expirations, snapshot_map)
-        
-        # 计算总 OI
-        total_oi = self._sum_open_interest(snapshot_map)
-        
-        # 插值计算各期限 IV
-        iv7 = self._interpolate_iv(dte_points, 7)
-        iv30 = self._interpolate_iv(dte_points, 30)
-        iv60 = self._interpolate_iv(dte_points, 60)
-        iv90 = self._interpolate_iv(dte_points, 90)
-        
-        return IVTermResult(iv7=iv7, iv30=iv30, iv60=iv60, iv90=iv90, total_oi=total_oi)
+        with timed(
+            logger,
+            "futu_iv_fetch",
+            broker="futu",
+            op="iv_terms",
+            symbol=symbol,
+        ) as details:
+            code = self._format_code(symbol)
+            today = datetime.now().date()
+            end_date = today + timedelta(days=max_days)
+
+            # 收集到期日和期权合约
+            expirations = self._collect_expirations(code, today, end_date)
+
+            if not expirations:
+                details["status"] = "empty"
+                details["reason"] = "no_expirations"
+                details["expirations"] = 0
+                return IVTermResult()
+
+            contracts_count = sum(len(contracts) for contracts in expirations.values())
+            details["expirations"] = len(expirations)
+            details["contracts"] = contracts_count
+
+            # 获取快照数据
+            snapshot_map = self._fetch_snapshot_map(expirations)
+            details["snapshots"] = len(snapshot_map)
+
+            # 构建 DTE 点
+            dte_points = self._build_dte_points(today, expirations, snapshot_map)
+            details["points"] = len(dte_points)
+
+            # 计算总 OI
+            total_oi = self._sum_open_interest(snapshot_map)
+
+            # 插值计算各期限 IV
+            iv7 = self._interpolate_iv(dte_points, 7)
+            iv30 = self._interpolate_iv(dte_points, 30)
+            iv60 = self._interpolate_iv(dte_points, 60)
+            iv90 = self._interpolate_iv(dte_points, 90)
+
+            details["iv7"] = iv7
+            details["iv30"] = iv30
+            details["iv60"] = iv60
+            details["iv90"] = iv90
+            details["total_oi"] = total_oi
+
+            if not any([iv7, iv30, iv60, iv90]):
+                details["status"] = "empty"
+                details["reason"] = "no_iv_points"
+
+            return IVTermResult(
+                iv7=iv7,
+                iv30=iv30,
+                iv60=iv60,
+                iv90=iv90,
+                total_oi=total_oi,
+            )
     
     def _collect_expirations(
         self, 
