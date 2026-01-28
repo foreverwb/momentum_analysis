@@ -10,6 +10,7 @@ interface CreateTaskModalProps {
 
 export interface CreateTaskData {
   type: TaskType;
+  name: string;
   title: string;
   etfs: string[];
   sector: string | null;
@@ -99,6 +100,7 @@ const TASK_TYPES: { type: TaskType; title: string; description: string; icon: st
 
 export function CreateTaskModal({ isOpen, onClose, onSubmit }: CreateTaskModalProps) {
   const [currentStep, setCurrentStep] = useState<1 | 2 | 3 | 4>(1);
+  const [taskName, setTaskName] = useState<string>('');
   const [taskType, setTaskType] = useState<TaskType>('rotation');
   const [selectedETFs, setSelectedETFs] = useState<string[]>([]);
   const [selectedSector, setSelectedSector] = useState<string | null>(null);
@@ -106,6 +108,7 @@ export function CreateTaskModal({ isOpen, onClose, onSubmit }: CreateTaskModalPr
 
   const resetForm = () => {
     setCurrentStep(1);
+    setTaskName('');
     setTaskType('rotation');
     setSelectedETFs([]);
     setSelectedSector(null);
@@ -130,9 +133,10 @@ export function CreateTaskModal({ isOpen, onClose, onSubmit }: CreateTaskModalPr
   };
 
   const handleSubmit = () => {
-    const taskTitle = generateTaskTitle();
+    const taskTitle = taskName.trim() || generateTaskTitle();
     onSubmit({
       type: taskType,
+      name: taskName.trim(),
       title: taskTitle,
       etfs: selectedETFs,
       sector: selectedSector,
@@ -163,7 +167,7 @@ export function CreateTaskModal({ isOpen, onClose, onSubmit }: CreateTaskModalPr
   const canProceed = () => {
     switch (currentStep) {
       case 1:
-        return true;
+        return taskName.trim().length > 0;
       case 2:
         if (taskType === 'rotation') return selectedETFs.length >= 2;
         if (taskType === 'drilldown') return selectedSector && selectedETFs.length >= 1;
@@ -181,7 +185,7 @@ export function CreateTaskModal({ isOpen, onClose, onSubmit }: CreateTaskModalPr
   const renderStepContent = () => {
     switch (currentStep) {
       case 1:
-        return <StepSelectType taskType={taskType} onSelect={setTaskType} />;
+        return <StepSelectType taskType={taskType} onSelect={setTaskType} taskName={taskName} onNameChange={setTaskName} />;
       case 2:
         return (
           <StepConfigureETFs
@@ -212,7 +216,7 @@ export function CreateTaskModal({ isOpen, onClose, onSubmit }: CreateTaskModalPr
             selectedETFs={selectedETFs}
             selectedSector={selectedSector}
             baseIndex={baseIndex}
-            title={generateTaskTitle()}
+            title={taskName.trim() || generateTaskTitle()}
           />
         );
       default:
@@ -324,12 +328,28 @@ function StepNav({ currentStep }: { currentStep: number }) {
 function StepSelectType({
   taskType,
   onSelect,
+  taskName,
+  onNameChange,
 }: {
   taskType: TaskType;
   onSelect: (type: TaskType) => void;
+  taskName: string;
+  onNameChange: (name: string) => void;
 }) {
   return (
     <div>
+      {/* Task Name Input */}
+      <div className="mb-6">
+        <h3 className="text-base font-semibold mb-2">任务名称</h3>
+        <input
+          type="text"
+          value={taskName}
+          onChange={(e) => onNameChange(e.target.value)}
+          placeholder="请输入任务名称"
+          className="w-full px-4 py-3 text-sm border-2 border-[var(--border-light)] rounded-[var(--radius-md)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors bg-[var(--bg-primary)]"
+        />
+      </div>
+
       <h3 className="text-base font-semibold mb-4">选择任务类型</h3>
       <div className="grid grid-cols-3 gap-4">
         {TASK_TYPES.map((type) => (

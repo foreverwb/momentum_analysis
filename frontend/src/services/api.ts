@@ -276,6 +276,44 @@ export async function healthCheck(): Promise<{
   return fetchApi('/health');
 }
 
+// Refresh ETF Data API
+export async function refreshETFData(symbol: string): Promise<{
+  status: string;
+  symbol: string;
+  message: string;
+  score?: number;
+  rank?: number;
+}> {
+  return fetchApi(`/etfs/symbol/${symbol}/refresh`, {
+    method: 'POST',
+  });
+}
+
+// Refresh Holdings Data API
+export async function refreshHoldingsData(symbol: string): Promise<{
+  status: string;
+  symbol: string;
+  message: string;
+  holdingsCount?: number;
+}> {
+  return fetchApi(`/etfs/symbol/${symbol}/refresh-holdings`, {
+    method: 'POST',
+  });
+}
+
+// Calculate ETF Score API
+export async function calculateETFScore(symbol: string): Promise<{
+  status: string;
+  symbol: string;
+  score: number;
+  rank: number;
+  completeness: number;
+}> {
+  return fetchApi(`/etfs/symbol/${symbol}/calculate`, {
+    method: 'POST',
+  });
+}
+
 // Broker APIs
 export async function getBrokerStatus(): Promise<{
   ibkr: { isConnected: boolean; lastConnectedAt?: string; lastError?: string };

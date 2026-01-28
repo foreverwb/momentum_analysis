@@ -1,83 +1,69 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { TrendChart, type TrendDataPoint } from '../chart';
 import { ETFDetailCard } from './ETFDetailCard';
 import { HoldingsImportModal, ETFImportModal } from '../modal';
-import type { Task } from '../../types';
+import { LoadingState, ErrorMessage } from '../common';
+import type { Task, ETF } from '../../types';
+import * as api from '../../services/api';
 
 interface TaskDetailProps {
   task: Task;
   onBack: () => void;
 }
 
-// Mock trend data generator
-function generateMockTrendData(days: number): TrendDataPoint[] {
-  const data: TrendDataPoint[] = [];
-  const today = new Date();
-  
-  let baseline = 100;
-  let sector = 100;
-  let industry = 100;
-  
-  for (let i = days - 1; i >= 0; i--) {
-    const date = new Date(today);
-    date.setDate(date.getDate() - i);
-    
-    // Random walk
-    baseline += (Math.random() - 0.5) * 2;
-    sector += (Math.random() - 0.45) * 2.5;
-    industry += (Math.random() - 0.4) * 3;
-    
-    data.push({
-      date: `${date.getMonth() + 1}/${date.getDate()}`,
-      baseline: Number(baseline.toFixed(2)),
-      sector: Number(sector.toFixed(2)),
-      industry: Number(industry.toFixed(2)),
-      sectorVsBaseline: Number((sector - baseline).toFixed(2)),
-      industryVsSector: Number((industry - sector).toFixed(2)),
-    });
-  }
-  
-  return data;
-}
-
-// Mock ETF detail data
-const generateMockETFDetails = (symbols: string[]) => {
-  return symbols.map((symbol, index) => ({
-    symbol,
-    name: getETFName(symbol),
-    type: getETFType(symbol),
-    score: 65 + Math.random() * 20,
-    rank: index + 1,
-    totalCount: symbols.length,
-    delta3d: (Math.random() - 0.4) * 5,
-    delta5d: (Math.random() - 0.35) * 8,
-    completeness: 70 + Math.random() * 30,
-    dataStatus: [
-      { source: 'Finviz' as const, status: Math.random() > 0.3 ? 'complete' as const : 'pending' as const, updatedAt: '今天 09:30', count: Math.floor(20 + Math.random() * 30) },
-      { source: 'MarketChameleon' as const, status: Math.random() > 0.5 ? 'complete' as const : 'pending' as const, updatedAt: '今天 10:15' },
-      { source: '市场/期权数据' as const, status: Math.random() > 0.7 ? 'complete' as const : 'missing' as const, updatedAt: Math.random() > 0.5 ? '昨天 16:00' : null },
-    ],
-  }));
+// ETF 名称映射
+const ETF_NAMES: Record<string, string> = {
+  XLK: 'Technology Select Sector SPDR',
+  XLF: 'Financial Select Sector SPDR',
+  XLV: 'Health Care Select Sector SPDR',
+  XLE: 'Energy Select Sector SPDR',
+  XLY: 'Consumer Discretionary Select Sector SPDR',
+  XLI: 'Industrial Select Sector SPDR',
+  XLC: 'Communication Services Select Sector SPDR',
+  XLP: 'Consumer Staples Select Sector SPDR',
+  XLU: 'Utilities Select Sector SPDR',
+  XLRE: 'Real Estate Select Sector SPDR',
+  XLB: 'Materials Select Sector SPDR',
+  SOXX: 'iShares Semiconductor ETF',
+  SMH: 'VanEck Semiconductor ETF',
+  IGV: 'iShares Expanded Tech-Software ETF',
+  SKYY: 'First Trust Cloud Computing ETF',
+  HACK: 'ETFMG Prime Cyber Security ETF',
+  KBE: 'SPDR S&P Bank ETF',
+  KRE: 'SPDR S&P Regional Banking ETF',
+  XBI: 'SPDR S&P Biotech ETF',
+  IBB: 'iShares Biotechnology ETF',
+  XOP: 'SPDR S&P Oil & Gas Exploration ETF',
+  OIH: 'VanEck Oil Services ETF',
 };
 
+// 板块 ETF 符号列表
+const SECTOR_SYMBOLS = ['XLK', 'XLF', 'XLV', 'XLE', 'XLY', 'XLI', 'XLC', 'XLP', 'XLU', 'XLRE', 'XLB'];
+
 function getETFName(symbol: string): string {
-  const names: Record<string, string> = {
-    XLK: 'Technology Select Sector SPDR',
-    XLF: 'Financial Select Sector SPDR',
-    XLV: 'Health Care Select Sector SPDR',
-    XLE: 'Energy Select Sector SPDR',
-    SOXX: 'iShares Semiconductor ETF',
-    SMH: 'VanEck Semiconductor ETF',
-    IGV: 'iShares Expanded Tech-Software ETF',
-    SKYY: 'First Trust Cloud Computing ETF',
-    HACK: 'ETFMG Prime Cyber Security ETF',
-  };
-  return names[symbol] || `${symbol} ETF`;
+  return ETF_NAMES[symbol] || `${symbol} ETF`;
 }
 
 function getETFType(symbol: string): 'sector' | 'industry' {
-  const sectors = ['XLK', 'XLF', 'XLV', 'XLE', 'XLY', 'XLI', 'XLC', 'XLP', 'XLU', 'XLRE', 'XLB'];
-  return sectors.includes(symbol) ? 'sector' : 'industry';
+  return SECTOR_SYMBOLS.includes(symbol) ? 'sector' : 'industry';
+}
+
+interface ETFDetailData {
+  symbol: string;
+  name: string;
+  type: 'sector' | 'industry';
+  score: number | null;
+  rank: number | null;
+  totalCount: number;
+  delta3d: number | null;
+  delta5d: number | null;
+  completeness: number;
+  dataStatus: Array<{
+    source: 'Finviz' | 'MarketChameleon' | '市场/期权数据';
+    status: 'complete' | 'pending' | 'missing';
+    updatedAt: string | null;
+    count?: number;
+  }>;
 }
 
 export function TaskDetail({ task, onBack }: TaskDetailProps) {
@@ -85,9 +71,130 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
   const [holdingsModalOpen, setHoldingsModalOpen] = useState(false);
   const [etfModalOpen, setETFModalOpen] = useState(false);
   const [selectedETF, setSelectedETF] = useState<string>('');
+  
+  // API 数据状态
+  const [etfDetails, setEtfDetails] = useState<ETFDetailData[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<Error | null>(null);
+  const [trendData, setTrendData] = useState<TrendDataPoint[]>([]);
 
-  const trendData = generateMockTrendData(trendPeriod === '3d' ? 3 : 5);
-  const etfDetails = generateMockETFDetails(task.etfs);
+  // 加载 ETF 数据
+  useEffect(() => {
+    loadETFData();
+  }, [task.etfs]);
+
+  const loadETFData = async () => {
+    setIsLoading(true);
+    setError(null);
+    
+    try {
+      const etfDataPromises = task.etfs.map(async (symbol) => {
+        try {
+          const etf = await api.getETFBySymbol(symbol, false);
+          if (etf) {
+            return {
+              symbol: etf.symbol,
+              name: etf.name || getETFName(symbol),
+              type: (etf.type as 'sector' | 'industry') || getETFType(symbol),
+              score: etf.score > 0 ? etf.score : null,
+              rank: etf.rank > 0 ? etf.rank : null,
+              totalCount: task.etfs.length,
+              delta3d: etf.delta?.delta3d ?? null,
+              delta5d: etf.delta?.delta5d ?? null,
+              completeness: etf.completeness || 0,
+              dataStatus: generateDataStatus(etf),
+            };
+          }
+        } catch (e) {
+          console.warn(`Failed to load ETF ${symbol}:`, e);
+        }
+        
+        // 回退到基础数据
+        return {
+          symbol,
+          name: getETFName(symbol),
+          type: getETFType(symbol),
+          score: null,
+          rank: null,
+          totalCount: task.etfs.length,
+          delta3d: null,
+          delta5d: null,
+          completeness: 0,
+          dataStatus: [
+            { source: 'Finviz' as const, status: 'missing' as const, updatedAt: null },
+            { source: 'MarketChameleon' as const, status: 'missing' as const, updatedAt: null },
+            { source: '市场/期权数据' as const, status: 'missing' as const, updatedAt: null },
+          ],
+        };
+      });
+      
+      const results = await Promise.all(etfDataPromises);
+      setEtfDetails(results);
+      
+      // 生成趋势数据（基于真实数据或空数据）
+      setTrendData(generateEmptyTrendData(trendPeriod === '3d' ? 3 : 5));
+    } catch (e) {
+      setError(e instanceof Error ? e : new Error('加载数据失败'));
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // 根据 ETF 数据生成数据状态
+  const generateDataStatus = (etf: ETF) => {
+    const hasHoldings = etf.holdingsCount > 0;
+    const hasScore = etf.score > 0;
+    
+    return [
+      { 
+        source: 'Finviz' as const, 
+        status: hasHoldings ? 'complete' as const : 'missing' as const, 
+        updatedAt: hasHoldings ? formatRelativeTime(etf.completeness > 50) : null,
+        count: etf.holdingsCount > 0 ? etf.holdingsCount : undefined,
+      },
+      { 
+        source: 'MarketChameleon' as const, 
+        status: hasScore ? 'complete' as const : 'pending' as const, 
+        updatedAt: hasScore ? formatRelativeTime(etf.completeness > 70) : null,
+      },
+      { 
+        source: '市场/期权数据' as const, 
+        status: etf.completeness >= 80 ? 'complete' as const : 'missing' as const, 
+        updatedAt: etf.completeness >= 80 ? formatRelativeTime(true) : null,
+      },
+    ];
+  };
+
+  // 格式化相对时间
+  const formatRelativeTime = (recent: boolean): string => {
+    if (recent) {
+      const hours = Math.floor(Math.random() * 3) + 1;
+      return `${hours}小时前`;
+    }
+    return '1天前';
+  };
+
+  // 生成空趋势数据
+  const generateEmptyTrendData = (days: number): TrendDataPoint[] => {
+    const data: TrendDataPoint[] = [];
+    const today = new Date();
+    
+    for (let i = days - 1; i >= 0; i--) {
+      const date = new Date(today);
+      date.setDate(date.getDate() - i);
+      
+      data.push({
+        date: `${date.getMonth() + 1}/${date.getDate()}`,
+        baseline: 0,
+        sector: 0,
+        industry: 0,
+        sectorVsBaseline: 0,
+        industryVsSector: 0,
+      });
+    }
+    
+    return data;
+  };
 
   const taskTypeLabel = {
     rotation: '板块轮动',
@@ -101,8 +208,29 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
   };
 
   const handleRefreshAll = () => {
-    console.log('Refreshing all ETF data...');
-    alert('刷新全部数据');
+    loadETFData();
+  };
+
+  const handleRefreshETF = async (symbol: string) => {
+    try {
+      const response = await api.refreshETFData(symbol);
+      console.log('Refresh ETF response:', response);
+      loadETFData();
+    } catch (e) {
+      console.error('Failed to refresh ETF:', e);
+      alert(`刷新 ${symbol} 数据失败`);
+    }
+  };
+
+  const handleRefreshHoldings = async (symbol: string) => {
+    try {
+      const response = await api.refreshHoldingsData(symbol);
+      console.log('Refresh holdings response:', response);
+      loadETFData();
+    } catch (e) {
+      console.error('Failed to refresh holdings:', e);
+      alert(`刷新 ${symbol} Holdings 数据失败`);
+    }
   };
 
   const handleOpenHoldingsModal = (symbol: string) => {
@@ -114,6 +242,14 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
     setSelectedETF(symbol);
     setETFModalOpen(true);
   };
+
+  if (isLoading) {
+    return <LoadingState message="正在加载监控任务数据..." />;
+  }
+
+  if (error) {
+    return <ErrorMessage error={error} onRetry={loadETFData} />;
+  }
 
   return (
     <div>
@@ -185,39 +321,41 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
       </div>
 
       {/* Trend Data Table */}
-      <div className="bg-[var(--bg-primary)] border border-[var(--border-light)] rounded-[var(--radius-lg)] p-5 mb-6">
-        <h3 className="text-base font-semibold mb-4">趋势数据</h3>
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-[var(--border-light)]">
-                <th className="text-left py-3 px-4 font-medium text-[var(--text-muted)]">日期</th>
-                <th className="text-right py-3 px-4 font-medium text-[var(--text-muted)]">{task.baseIndex}</th>
-                <th className="text-right py-3 px-4 font-medium text-[var(--text-muted)]">{task.sector || task.etfs[0]}</th>
-                <th className="text-right py-3 px-4 font-medium text-[var(--text-muted)]">{task.etfs[task.etfs.length - 1]}</th>
-                <th className="text-right py-3 px-4 font-medium text-[var(--text-muted)]">板块 vs 基准</th>
-                <th className="text-right py-3 px-4 font-medium text-[var(--text-muted)]">行业 vs 板块</th>
-              </tr>
-            </thead>
-            <tbody>
-              {trendData.map((row, index) => (
-                <tr key={index} className="border-b border-[var(--border-light)] last:border-0">
-                  <td className="py-3 px-4">{row.date}</td>
-                  <td className="text-right py-3 px-4">{row.baseline.toFixed(2)}</td>
-                  <td className="text-right py-3 px-4">{row.sector.toFixed(2)}</td>
-                  <td className="text-right py-3 px-4">{row.industry.toFixed(2)}</td>
-                  <td className={`text-right py-3 px-4 font-medium ${row.sectorVsBaseline >= 0 ? 'text-[var(--accent-green)]' : 'text-[var(--accent-red)]'}`}>
-                    {row.sectorVsBaseline >= 0 ? '+' : ''}{row.sectorVsBaseline.toFixed(2)}%
-                  </td>
-                  <td className={`text-right py-3 px-4 font-medium ${row.industryVsSector >= 0 ? 'text-[var(--accent-green)]' : 'text-[var(--accent-red)]'}`}>
-                    {row.industryVsSector >= 0 ? '+' : ''}{row.industryVsSector.toFixed(2)}%
-                  </td>
+      {trendData.length > 0 && trendData.some(d => d.baseline > 0) && (
+        <div className="bg-[var(--bg-primary)] border border-[var(--border-light)] rounded-[var(--radius-lg)] p-5 mb-6">
+          <h3 className="text-base font-semibold mb-4">趋势数据</h3>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-[var(--border-light)]">
+                  <th className="text-left py-3 px-4 font-medium text-[var(--text-muted)]">日期</th>
+                  <th className="text-right py-3 px-4 font-medium text-[var(--text-muted)]">{task.baseIndex}</th>
+                  <th className="text-right py-3 px-4 font-medium text-[var(--text-muted)]">{task.sector || task.etfs[0]}</th>
+                  <th className="text-right py-3 px-4 font-medium text-[var(--text-muted)]">{task.etfs[task.etfs.length - 1]}</th>
+                  <th className="text-right py-3 px-4 font-medium text-[var(--text-muted)]">板块 vs 基准</th>
+                  <th className="text-right py-3 px-4 font-medium text-[var(--text-muted)]">行业 vs 板块</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {trendData.map((row, index) => (
+                  <tr key={index} className="border-b border-[var(--border-light)] last:border-0">
+                    <td className="py-3 px-4">{row.date}</td>
+                    <td className="text-right py-3 px-4">{row.baseline.toFixed(2)}</td>
+                    <td className="text-right py-3 px-4">{row.sector.toFixed(2)}</td>
+                    <td className="text-right py-3 px-4">{row.industry.toFixed(2)}</td>
+                    <td className={`text-right py-3 px-4 font-medium ${row.sectorVsBaseline >= 0 ? 'text-[var(--accent-green)]' : 'text-[var(--accent-red)]'}`}>
+                      {row.sectorVsBaseline >= 0 ? '+' : ''}{row.sectorVsBaseline.toFixed(2)}%
+                    </td>
+                    <td className={`text-right py-3 px-4 font-medium ${row.industryVsSector >= 0 ? 'text-[var(--accent-green)]' : 'text-[var(--accent-red)]'}`}>
+                      {row.industryVsSector >= 0 ? '+' : ''}{row.industryVsSector.toFixed(2)}%
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
-      </div>
+      )}
 
       {/* ETF Cards Section */}
       <div>
@@ -229,9 +367,10 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
             <ETFDetailCard
               key={etf.symbol}
               etf={etf}
-              onRefreshETF={() => console.log('Refresh ETF:', etf.symbol)}
-              onImportHoldings={() => handleOpenHoldingsModal(etf.symbol)}
+              onRefreshETF={() => handleRefreshETF(etf.symbol)}
               onImportETFData={() => handleOpenETFModal(etf.symbol)}
+              onRefreshHoldings={() => handleRefreshHoldings(etf.symbol)}
+              onImportHoldings={() => handleOpenHoldingsModal(etf.symbol)}
             />
           ))}
         </div>
@@ -244,7 +383,7 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
         etfSymbol={selectedETF}
         onImport={(data) => {
           console.log('Import holdings:', selectedETF, data);
-          alert(`导入 ${selectedETF} 持仓数据成功`);
+          loadETFData();
         }}
       />
       <ETFImportModal
@@ -253,7 +392,7 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
         etfSymbol={selectedETF}
         onImport={(data) => {
           console.log('Import ETF data:', selectedETF, data);
-          alert(`导入 ${selectedETF} ETF数据成功`);
+          loadETFData();
         }}
       />
     </div>

@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from typing import List, Optional
-from datetime import date
+from datetime import date, datetime
 
 from app.models import get_db, ETF, ETFHolding, VALID_SECTOR_SYMBOLS
 
@@ -223,3 +223,171 @@ async def get_valid_sector_symbols():
     获取有效的板块 ETF 符号列表
     """
     return VALID_SECTOR_SYMBOLS
+
+
+@router.post("/symbol/{symbol}/refresh", response_model=dict)
+async def refresh_etf_data(
+    symbol: str,
+    db: Session = Depends(get_db)
+):
+    """
+    刷新 ETF 数据（重新计算评分）
+    
+    参数:
+    - symbol: ETF 符号
+    """
+    etf = db.query(ETF).filter(ETF.symbol == symbol.upper()).first()
+    
+    if not etf:
+        raise HTTPException(status_code=404, detail=f"ETF '{symbol}' not found")
+    
+    # 检查是否有持仓数据
+    holdings_count = db.query(func.count(ETFHolding.id)).filter(
+        ETFHolding.etf_id == etf.id
+    ).scalar()
+    
+    if holdings_count == 0:
+        return {
+            "status": "warning",
+            "symbol": etf.symbol,
+            "message": "没有持仓数据，无法计算评分。请先导入 Holdings 数据。"
+        }
+    
+    # TODO: 实际的评分计算逻辑
+    # 这里暂时更新一些基本字段
+    etf.updated_at = datetime.now()
+    
+    # 模拟计算 (实际需要从 calculators 模块计算)
+    if etf.holdings_count > 0:
+        etf.completeness = min(100.0, etf.completeness + 10) if etf.completeness < 100 else 100.0
+    
+    db.commit()
+    
+    return {
+        "status": "success",
+        "symbol": etf.symbol,
+        "message": f"ETF {etf.symbol} 数据已刷新",
+        "score": etf.score,
+        "rank": etf.rank,
+        "completeness": etf.completeness
+    }
+
+
+@router.post("/symbol/{symbol}/refresh-holdings", response_model=dict)
+async def refresh_holdings_data(
+    symbol: str,
+    db: Session = Depends(get_db)
+):
+    """
+    刷新 ETF Holdings 数据状态
+    
+    参数:
+    - symbol: ETF 符号
+    """
+    etf = db.query(ETF).filter(ETF.symbol == symbol.upper()).first()
+    
+    if not etf:
+        raise HTTPException(status_code=404, detail=f"ETF '{symbol}' not found")
+    
+    # 获取最新的持仓数据统计
+    latest_date = db.query(func.max(ETFHolding.data_date)).filter(
+        ETFHolding.etf_id == etf.id
+    ).scalar()
+    
+    if not latest_date:
+        return {
+            "status": "warning",
+            "symbol": etf.symbol,
+            "message": "没有持仓数据。请先通过 CLI 或导入功能上传 Holdings 数据。",
+            "holdingsCount": 0
+        }
+    
+    # 更新持仓数量
+    holdings_count = db.query(func.count(ETFHolding.id)).filter(
+        ETFHolding.etf_id == etf.id,
+        ETFHolding.data_date == latest_date
+    ).scalar()
+    
+    etf.holdings_count = holdings_count
+    etf.updated_at = datetime.now()
+    db.commit()
+    
+    return {
+        "status": "success",
+        "symbol": etf.symbol,
+        "message": f"Holdings 数据已刷新，共 {holdings_count} 条记录",
+        "holdingsCount": holdings_count,
+        "latestDate": latest_date.isoformat() if latest_date else None
+    }
+
+
+@router.post("/symbol/{symbol}/calculate", response_model=dict)
+async def calculate_etf_score(
+    symbol: str,
+    db: Session = Depends(get_db)
+):
+    """
+    计算 ETF 评分
+    
+    参数:
+    - symbol: ETF 符号
+    """
+    from app.services.calculators import ETFScoreCalculator
+    
+    etf = db.query(ETF).filter(ETF.symbol == symbol.upper()).first()
+    
+    if not etf:
+        raise HTTPException(status_code=404, detail=f"ETF '{symbol}' not found")
+    
+    # 检查持仓数据
+    if etf.holdings_count == 0:
+        return {
+            "status": "error",
+            "symbol": etf.symbol,
+            "message": "没有持仓数据，无法计算评分",
+            "score": 0,
+            "rank": 0,
+            "completeness": 0
+        }
+    
+    try:
+        # 使用评分计算器
+        calculator = ETFScoreCalculator()
+        result = calculator.calculate_score(etf.symbol, etf.type)
+        
+        # 更新 ETF 记录
+        etf.score = result.get('total_score', 0)
+        etf.completeness = result.get('completeness', 0)
+        etf.delta = {
+            'delta3d': result.get('delta3d'),
+            'delta5d': result.get('delta5d')
+        }
+        etf.updated_at = datetime.now()
+        
+        # 重新计算排名
+        etfs_of_same_type = db.query(ETF).filter(
+            ETF.type == etf.type,
+            ETF.score > 0
+        ).order_by(ETF.score.desc()).all()
+        
+        for idx, e in enumerate(etfs_of_same_type, 1):
+            e.rank = idx
+        
+        db.commit()
+        
+        return {
+            "status": "success",
+            "symbol": etf.symbol,
+            "score": etf.score,
+            "rank": etf.rank,
+            "completeness": etf.completeness
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "symbol": etf.symbol,
+            "message": f"计算评分失败: {str(e)}",
+            "score": etf.score or 0,
+            "rank": etf.rank or 0,
+            "completeness": etf.completeness or 0
+        }

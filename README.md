@@ -144,3 +144,5 @@ python cli.py list-etfs
 
 # 列出 ETF 持仓
 python cli.py list-holdings XLK
+# 更新 ETF 持仓
+python cli.py update -d 2026-01-28 -t sector -a XLE xle.xlsx

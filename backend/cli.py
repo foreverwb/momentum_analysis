@@ -4,6 +4,7 @@ Momentum Radar 命令行工具
 
 支持的命令:
 - uploads: 上传 ETF Holdings 文件（支持 xlsx、xls、csv 格式）
+- update: 更新 ETF Holdings 数据（与 uploads 相同，更语义化的命令）
 - init: 初始化数据库和默认数据
 
 使用示例:
@@ -12,6 +13,10 @@ Momentum Radar 命令行工具
     
     # 上传行业 ETF holdings（需要指定父板块）
     python cli.py uploads -d 2026-01-25 -t industry -s XLK -a SOXX holdings.csv
+    
+    # 更新数据（日期可选，默认为当天）
+    python cli.py update -t sector -a XLE xle.xlsx
+    python cli.py update -d 2026-01-28 -t sector -a XLE xle.xlsx
     
     # 初始化数据库
     python cli.py init
@@ -196,7 +201,7 @@ def cmd_uploads(args):
     # 验证参数
     etf_type = args.type
     etf_symbol = args.etf_symbol.upper()
-    data_date_str = args.date
+    data_date_str = args.date if args.date else datetime.now().strftime("%Y-%m-%d")
     file_path = args.file
     parent_sector = args.sector.upper() if args.sector else None
     
@@ -490,6 +495,10 @@ def main():
   # 上传行业 ETF holdings（需要指定父板块）
   python cli.py uploads -d 2026-01-25 -t industry -s XLK -a SOXX holdings.xlsx
   
+  # 更新数据（日期可选，默认为当天）
+  python cli.py update -t sector -a XLE xle.xlsx
+  python cli.py update -d 2026-01-28 -t sector -a XLE xle.xlsx
+  
   # 初始化数据库
   python cli.py init
   
@@ -505,7 +514,7 @@ def main():
     
     # uploads 命令
     uploads_parser = subparsers.add_parser('uploads', help='上传 ETF Holdings 文件 (xlsx/xls/csv)')
-    uploads_parser.add_argument('-d', '--date', required=True, help='数据日期 (YYYY-MM-DD)')
+    uploads_parser.add_argument('-d', '--date', required=False, help='数据日期 (YYYY-MM-DD)，默认为当天')
     uploads_parser.add_argument('-t', '--type', required=True, choices=['sector', 'industry'],
                                help='ETF 类型: sector 或 industry')
     uploads_parser.add_argument('-a', '--etf-symbol', required=True, dest='etf_symbol',
@@ -513,6 +522,17 @@ def main():
     uploads_parser.add_argument('-s', '--sector', help='父板块符号 (仅 industry 类型需要)')
     uploads_parser.add_argument('file', help='Holdings 文件路径 (xlsx/xls/csv)')
     uploads_parser.set_defaults(func=cmd_uploads)
+    
+    # update 命令 (uploads 的别名，更语义化)
+    update_parser = subparsers.add_parser('update', help='更新 ETF Holdings 数据 (与 uploads 相同)')
+    update_parser.add_argument('-d', '--date', required=False, help='数据日期 (YYYY-MM-DD)，默认为当天')
+    update_parser.add_argument('-t', '--type', required=True, choices=['sector', 'industry'],
+                              help='ETF 类型: sector 或 industry')
+    update_parser.add_argument('-a', '--etf-symbol', required=True, dest='etf_symbol',
+                              help='ETF 符号 (如 XLK, SOXX)')
+    update_parser.add_argument('-s', '--sector', help='父板块符号 (仅 industry 类型需要)')
+    update_parser.add_argument('file', help='Holdings 文件路径 (xlsx/xls/csv)')
+    update_parser.set_defaults(func=cmd_uploads)
     
     # init 命令
     init_parser = subparsers.add_parser('init', help='初始化数据库和默认数据')

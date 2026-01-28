@@ -51,7 +51,7 @@ class IBKRConnector(BrokerConnector, PriceDataMixin):
         self, 
         host: str = '127.0.0.1', 
         port: int = 4002, 
-        client_id: int = 1,
+        client_id: int = 3,
         timeout: int = 30
     ):
         """
