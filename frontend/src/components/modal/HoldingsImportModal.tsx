@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import * as api from '../../services/api';
 
 interface HoldingsImportDrawerProps {
@@ -10,7 +10,7 @@ interface HoldingsImportDrawerProps {
 
 export interface HoldingsImportData {
   source: 'finviz' | 'marketchameleon';
-  coverage: 'top10' | 'top20' | 'top50' | 'all';
+  coverage: string;
   jsonData: string;
 }
 
@@ -19,11 +19,19 @@ interface HoldingInfo {
   weight: number;
 }
 
-const COVERAGE_OPTIONS = [
+type CoverageType = 'top10' | 'top15' | 'top20' | 'top30' | 'weight60' | 'weight65' | 'weight70' | 'weight75' | 'weight80' | 'weight85';
+
+const COVERAGE_OPTIONS: { value: CoverageType; label: string }[] = [
   { value: 'top10', label: 'Top 10 - 前10大持仓' },
+  { value: 'top15', label: 'Top 15 - 前15大持仓' },
   { value: 'top20', label: 'Top 20 - 前20大持仓' },
-  { value: 'top50', label: 'Top 50 - 前50大持仓' },
-  { value: 'all', label: '全部持仓' },
+  { value: 'top30', label: 'Top 30 - 前30大持仓' },
+  { value: 'weight60', label: 'Weight 60% - 累计权重60%' },
+  { value: 'weight65', label: 'Weight 65% - 累计权重65%' },
+  { value: 'weight70', label: 'Weight 70% - 累计权重70%' },
+  { value: 'weight75', label: 'Weight 75% - 累计权重75%' },
+  { value: 'weight80', label: 'Weight 80% - 累计权重80%' },
+  { value: 'weight85', label: 'Weight 85% - 累计权重85%' },
 ];
 
 // 示例数据
@@ -44,11 +52,12 @@ export function HoldingsImportDrawer({
   onImport,
 }: HoldingsImportDrawerProps) {
   const [source, setSource] = useState<'finviz' | 'marketchameleon'>('finviz');
-  const [coverage, setCoverage] = useState<'top10' | 'top20' | 'top50' | 'all'>('top10');
+  const [coverage, setCoverage] = useState<CoverageType>('top10');
   const [jsonData, setJsonData] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [holdings, setHoldings] = useState<HoldingInfo[]>([]);
   const [showAllHoldings, setShowAllHoldings] = useState(false);
+  const [copySuccess, setCopySuccess] = useState(false);
 
   // 加载 ETF 持仓数据
   useEffect(() => {
@@ -56,6 +65,11 @@ export function HoldingsImportDrawer({
       loadHoldings();
     }
   }, [isOpen, etfSymbol]);
+
+  // 切换覆盖范围时收起展开状态
+  useEffect(() => {
+    setShowAllHoldings(false);
+  }, [coverage]);
 
   const loadHoldings = async () => {
     try {
@@ -68,18 +82,51 @@ export function HoldingsImportDrawer({
   };
 
   // 根据 coverage 过滤持仓
-  const getFilteredHoldings = () => {
-    const limits: Record<string, number> = { top10: 10, top20: 20, top50: 50, all: holdings.length };
-    return holdings.slice(0, limits[coverage]);
-  };
+  const filteredHoldings = useMemo(() => {
+    if (holdings.length === 0) return [];
 
-  const filteredHoldings = getFilteredHoldings();
-  const displayHoldings = showAllHoldings ? filteredHoldings : filteredHoldings.slice(0, 6);
-  const totalWeight = filteredHoldings.reduce((sum, h) => sum + h.weight, 0);
+    // Top N 模式
+    if (coverage.startsWith('top')) {
+      const count = parseInt(coverage.replace('top', ''), 10);
+      return holdings.slice(0, count);
+    }
 
-  const handleCopyTickers = () => {
+    // Weight 模式 - 累计权重达到指定百分比
+    if (coverage.startsWith('weight')) {
+      const targetWeight = parseInt(coverage.replace('weight', ''), 10);
+      let accWeight = 0;
+      const result: HoldingInfo[] = [];
+      
+      for (const h of holdings) {
+        if (accWeight >= targetWeight) break;
+        result.push(h);
+        accWeight += h.weight;
+      }
+      
+      return result;
+    }
+
+    return holdings;
+  }, [holdings, coverage]);
+
+  const totalWeight = useMemo(() => {
+    return filteredHoldings.reduce((sum, h) => sum + h.weight, 0);
+  }, [filteredHoldings]);
+
+  // 默认显示的持仓数量
+  const DEFAULT_DISPLAY_COUNT = 6;
+  const displayHoldings = showAllHoldings ? filteredHoldings : filteredHoldings.slice(0, DEFAULT_DISPLAY_COUNT);
+  const hasMoreHoldings = filteredHoldings.length > DEFAULT_DISPLAY_COUNT;
+
+  const handleCopyTickers = async () => {
     const tickers = filteredHoldings.map(h => h.ticker).join(', ');
-    navigator.clipboard.writeText(tickers);
+    try {
+      await navigator.clipboard.writeText(tickers);
+      setCopySuccess(true);
+      setTimeout(() => setCopySuccess(false), 2000);
+    } catch (e) {
+      console.error('Failed to copy:', e);
+    }
   };
 
   const handleLoadSampleData = () => {
@@ -171,7 +218,7 @@ export function HoldingsImportDrawer({
             <div className="text-sm font-medium mb-3">覆盖范围</div>
             <select
               value={coverage}
-              onChange={(e) => setCoverage(e.target.value as typeof coverage)}
+              onChange={(e) => setCoverage(e.target.value as CoverageType)}
               className="w-full px-4 py-3 bg-[var(--bg-primary)] border border-[var(--border-light)] rounded-[var(--radius-md)] text-sm focus:outline-none focus:border-[var(--accent-blue)]"
             >
               {COVERAGE_OPTIONS.map(opt => (
@@ -187,7 +234,7 @@ export function HoldingsImportDrawer({
             {holdings.length > 0 && (
               <div className="mt-4 p-3 bg-[var(--bg-primary)] rounded-[var(--radius-md)] border border-[var(--border-light)]">
                 <div className="flex items-center justify-between mb-3">
-                  <div className="flex items-center gap-3">
+                  <div className="flex items-center gap-3 flex-wrap">
                     <span className="text-sm">
                       需收集 <span className="font-semibold text-[var(--accent-blue)]">{filteredHoldings.length}</span> 只持仓标的数据
                     </span>
@@ -197,18 +244,40 @@ export function HoldingsImportDrawer({
                   </div>
                   <button
                     onClick={handleCopyTickers}
-                    className="flex items-center gap-1.5 px-2 py-1 text-xs text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)] rounded transition-colors"
+                    className={`
+                      flex items-center gap-1.5 px-2 py-1 text-xs rounded transition-colors flex-shrink-0
+                      ${copySuccess 
+                        ? 'text-green-600 bg-green-50' 
+                        : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)]'
+                      }
+                    `}
                   >
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
-                      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-                    </svg>
-                    复制代码
+                    {copySuccess ? (
+                      <>
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M20 6L9 17l-5-5" />
+                        </svg>
+                        已复制
+                      </>
+                    ) : (
+                      <>
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                          <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                        </svg>
+                        复制代码
+                      </>
+                    )}
                   </button>
                 </div>
 
-                {/* Holdings Pills */}
-                <div className="flex flex-wrap gap-2">
+                {/* Holdings Pills - 可滚动容器 */}
+                <div 
+                  className={`
+                    flex flex-wrap gap-2 
+                    ${showAllHoldings && hasMoreHoldings ? 'max-h-40 overflow-y-auto pr-1' : ''}
+                  `}
+                >
                   {displayHoldings.map((h) => (
                     <span
                       key={h.ticker}
@@ -219,7 +288,8 @@ export function HoldingsImportDrawer({
                   ))}
                 </div>
 
-                {filteredHoldings.length > 6 && (
+                {/* 查看全部/收起 链接 */}
+                {hasMoreHoldings && (
                   <div className="flex items-center gap-3 mt-3 text-sm">
                     <span className="text-[var(--text-muted)]">
                       等 {filteredHoldings.length} 只
@@ -229,7 +299,15 @@ export function HoldingsImportDrawer({
                       className="text-[var(--accent-blue)] hover:underline flex items-center gap-1"
                     >
                       {showAllHoldings ? '收起' : '查看全部'}
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <svg 
+                        width="12" 
+                        height="12" 
+                        viewBox="0 0 24 24" 
+                        fill="none" 
+                        stroke="currentColor" 
+                        strokeWidth="2"
+                        className={`transition-transform ${showAllHoldings ? 'rotate-180' : ''}`}
+                      >
                         <path d="M7 17L17 7M17 7H7M17 7v10" />
                       </svg>
                     </button>
