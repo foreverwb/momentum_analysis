@@ -7,9 +7,10 @@
 - IV 期限结构获取 (IV7/IV30/IV60/IV90)
 - OI 数据和 ΔOI 计算
 - 期权链数据获取
+
+依赖: futu-api (可选 - 未安装时使用 Stub 模式)
 """
 
-from futu import OpenQuoteContext, OptionType, RET_OK
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple, Any, Iterable
 from datetime import datetime, timedelta
@@ -24,6 +25,35 @@ from .base import BrokerConnector
 from app.core.timing import timed
 
 logger = structlog.get_logger(__name__)
+
+# ==================== 依赖检查 ====================
+
+FUTU_AVAILABLE = False
+_OpenQuoteContext = None
+_OptionType = None
+_RET_OK = None
+
+try:
+    from futu import OpenQuoteContext, OptionType, RET_OK
+    FUTU_AVAILABLE = True
+    _OpenQuoteContext = OpenQuoteContext
+    _OptionType = OptionType
+    _RET_OK = RET_OK
+except ImportError:
+    logger.warning(
+        "futu-api 未安装，Futu 连接器将使用 Stub 模式。"
+        "请运行 'pip install futu-api --break-system-packages' 来安装。"
+    )
+    # Create a dummy OptionType for type hints
+    class _DummyOptionType:
+        CALL = "CALL"
+        PUT = "PUT"
+    _OptionType = _DummyOptionType
+
+
+def is_futu_available() -> bool:
+    """检查 futu-api 是否可用"""
+    return FUTU_AVAILABLE
 
 
 @dataclass
@@ -53,7 +83,7 @@ class IVTermResult:
 class OptionContract:
     """期权合约信息"""
     code: str
-    option_type: OptionType
+    option_type: Any  # OptionType or dummy
 
 
 class RateLimiter:
@@ -91,9 +121,81 @@ class RateLimiter:
         self.calls.append(time.time())
 
 
-class FutuConnector(BrokerConnector):
+class FutuConnectorStub(BrokerConnector):
     """
-    富途 API 连接器
+    Futu 连接器的 Stub 实现
+    
+    当 futu-api 未安装时使用此实现
+    所有方法返回适当的错误或默认值
+    """
+    
+    OI_CACHE_FILE = "oi_cache.json"
+    CACHE_LOCK = threading.Lock()
+    
+    def __init__(
+        self, 
+        host: str = '127.0.0.1', 
+        port: int = 11111, 
+        market: str = 'US'
+    ):
+        self.host = os.getenv("FUTU_HOST", host)
+        self.port = int(os.getenv("FUTU_PORT", str(port)))
+        self.market = os.getenv("FUTU_MARKET", market)
+        self.quote_ctx = None
+        self._connected = False
+        self._stub_reason = "futu-api 未安装"
+        
+        # 速率限制器
+        self.chain_limiter = RateLimiter(max_calls=10, period_seconds=30)
+        self.snapshot_limiter = RateLimiter(max_calls=60, period_seconds=30)
+    
+    def connect(self) -> bool:
+        logger.error(f"Futu 连接失败: {self._stub_reason}")
+        return False
+    
+    def disconnect(self) -> None:
+        pass
+    
+    def is_connected(self) -> bool:
+        return False
+    
+    def get_stub_reason(self) -> str:
+        return self._stub_reason
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+    
+    def get_price_data(self, symbol: str, duration: str = '1 Y') -> Optional[Any]:
+        logger.warning("Futu connector 主要用于期权数据，建议使用 IBKR 获取价格数据")
+        return None
+    
+    def get_current_price(self, symbol: str) -> Optional[float]:
+        return None
+    
+    def fetch_iv_terms(
+        self, 
+        symbols: Iterable[str], 
+        max_days: int = 120,
+        max_retries: int = 2
+    ) -> Dict[str, IVTermResult]:
+        """返回空的 IV 结果"""
+        logger.warning(f"无法获取 IV 数据: {self._stub_reason}")
+        return {symbol: IVTermResult() for symbol in symbols}
+    
+    def batch_compute_delta_oi(
+        self, 
+        symbol_to_oi: Dict[str, Optional[int]]
+    ) -> Dict[str, Tuple[Optional[int], Optional[int]]]:
+        """返回空的 ΔOI 结果"""
+        return {symbol: (None, None) for symbol in symbol_to_oi}
+
+
+class FutuConnectorReal(BrokerConnector):
+    """
+    富途 API 连接器 (真实实现)
     
     整合自:
     - futu_iv.py: IV 期限结构计算
@@ -135,7 +237,7 @@ class FutuConnector(BrokerConnector):
         self.port = int(os.getenv("FUTU_PORT", str(port)))
         self.market = os.getenv("FUTU_MARKET", market)
         
-        self.quote_ctx: Optional[OpenQuoteContext] = None
+        self.quote_ctx: Optional[Any] = None
         self._connected = False
         
         # 速率限制器
@@ -154,7 +256,7 @@ class FutuConnector(BrokerConnector):
             bool: 连接成功返回 True
         """
         try:
-            self.quote_ctx = OpenQuoteContext(host=self.host, port=self.port)
+            self.quote_ctx = _OpenQuoteContext(host=self.host, port=self.port)
             self._connected = True
             logger.info(f"✅ 已连接到 Futu: {self.host}:{self.port} (市场: {self.market})")
             return True
@@ -208,7 +310,7 @@ class FutuConnector(BrokerConnector):
             code = self._format_code(symbol)
             ret, data = self.quote_ctx.get_market_snapshot([code])
             
-            if ret == RET_OK and hasattr(data, 'to_dict'):
+            if ret == _RET_OK and hasattr(data, 'to_dict'):
                 records = data.to_dict('records')
                 if records:
                     return float(records[0].get('last_price', 0))
@@ -279,206 +381,127 @@ class FutuConnector(BrokerConnector):
         max_days: int,
         max_retries: int
     ) -> IVTermResult:
-        """带重试的单标的 IV 获取"""
-        last_error = None
-        
+        """获取单个标的的 IV 期限结构（带重试）"""
         for attempt in range(max_retries + 1):
             try:
                 return self._fetch_symbol_iv_terms(symbol, max_days)
-            except Exception as exc:
-                last_error = exc
+            except Exception as e:
                 if attempt < max_retries:
-                    sleep_seconds = min(30.0, 2 ** attempt)
-                    logger.warning(f"{symbol}: 重试 ({attempt + 1}/{max_retries}), 等待 {sleep_seconds}s")
-                    time.sleep(sleep_seconds)
+                    logger.warning(f"重试 {symbol} IV 获取 (尝试 {attempt + 1}/{max_retries}): {e}")
+                    time.sleep(1)
                 else:
                     raise
-        
-        raise RuntimeError(f"{symbol}: IV fetch failed: {last_error}")
+        return IVTermResult()
     
-    def _fetch_symbol_iv_terms(self, symbol: str, max_days: int = 120) -> IVTermResult:
+    def _fetch_symbol_iv_terms(self, symbol: str, max_days: int) -> IVTermResult:
         """获取单个标的的 IV 期限结构"""
-        with timed(
-            logger,
-            "futu_iv_fetch",
-            broker="futu",
-            op="iv_terms",
-            symbol=symbol,
-        ) as details:
-            code = self._format_code(symbol)
-            today = datetime.now().date()
-            end_date = today + timedelta(days=max_days)
-
-            # 收集到期日和期权合约
-            expirations = self._collect_expirations(code, today, end_date)
-
-            if not expirations:
-                details["status"] = "empty"
-                details["reason"] = "no_expirations"
-                details["expirations"] = 0
-                return IVTermResult()
-
-            contracts_count = sum(len(contracts) for contracts in expirations.values())
-            details["expirations"] = len(expirations)
-            details["contracts"] = contracts_count
-
-            # 获取快照数据
-            snapshot_map = self._fetch_snapshot_map(expirations)
-            details["snapshots"] = len(snapshot_map)
-
-            # 构建 DTE 点
-            dte_points = self._build_dte_points(today, expirations, snapshot_map)
-            details["points"] = len(dte_points)
-
-            # 计算总 OI
-            total_oi = self._sum_open_interest(snapshot_map)
-
-            # 插值计算各期限 IV
-            iv7 = self._interpolate_iv(dte_points, 7)
-            iv30 = self._interpolate_iv(dte_points, 30)
-            iv60 = self._interpolate_iv(dte_points, 60)
-            iv90 = self._interpolate_iv(dte_points, 90)
-
-            details["iv7"] = iv7
-            details["iv30"] = iv30
-            details["iv60"] = iv60
-            details["iv90"] = iv90
-            details["total_oi"] = total_oi
-
-            if not any([iv7, iv30, iv60, iv90]):
-                details["status"] = "empty"
-                details["reason"] = "no_iv_points"
-
-            return IVTermResult(
-                iv7=iv7,
-                iv30=iv30,
-                iv60=iv60,
-                iv90=iv90,
-                total_oi=total_oi,
-            )
-    
-    def _collect_expirations(
-        self, 
-        code: str, 
-        start_date: datetime.date, 
-        end_date: datetime.date
-    ) -> Dict[str, List[OptionContract]]:
-        """收集期权到期日"""
-        expirations: Dict[str, List[OptionContract]] = defaultdict(list)
-        window_days = 30
-        window_start = start_date
+        code = self._format_code(symbol)
         
-        while window_start <= end_date:
-            window_end = min(window_start + timedelta(days=window_days), end_date)
-            
-            for option_type in [OptionType.CALL, OptionType.PUT]:
-                self.chain_limiter.acquire()
-                
-                try:
-                    ret, data = self._get_option_chain_safe(
-                        code=code,
-                        start_date=window_start.strftime("%Y-%m-%d"),
-                        end_date=window_end.strftime("%Y-%m-%d"),
-                        option_type=option_type
-                    )
-                    
-                    if ret == RET_OK:
-                        records = self._dataframe_to_records(data)
-                        for record in records:
-                            expiry = self._get_expiry_date(record)
-                            option_code = self._get_option_code(record)
-                            if expiry and option_code:
-                                expirations[expiry].append(
-                                    OptionContract(option_code, option_type)
-                                )
-                    else:
-                        logger.warning(f"⚠ get_option_chain 失败: {data}")
-                        
-                except Exception as e:
-                    logger.warning(f"⚠ get_option_chain 异常: {e}")
-            
-            window_start = window_end + timedelta(days=1)
+        # 获取期权链
+        self.chain_limiter.acquire()
+        ret, data = self.quote_ctx.get_option_chain(code, index_option_type=0)
         
-        return expirations
-    
-    def _get_option_chain_safe(
-        self,
-        code: str,
-        start_date: str,
-        end_date: str,
-        option_type: OptionType
-    ) -> Tuple[int, Any]:
-        """安全调用 get_option_chain（兼容不同版本参数）"""
-        variants = [
-            {"start": start_date, "end": end_date},
-            {"begin_time": start_date, "end_time": end_date},
-            {"start_time": start_date, "end_time": end_date},
-            {"start_date": start_date, "end_date": end_date},
-        ]
+        if ret != _RET_OK:
+            logger.warning(f"获取 {symbol} 期权链失败")
+            return IVTermResult()
         
-        for variant in variants:
-            try:
-                kwargs = {"option_type": option_type, **variant}
-                ret, data = self.quote_ctx.get_option_chain(code, **kwargs)
-                return ret, data
-            except TypeError:
+        if data is None or (hasattr(data, 'empty') and data.empty):
+            return IVTermResult()
+        
+        records = self._dataframe_to_records(data)
+        if not records:
+            return IVTermResult()
+        
+        # 按到期日分组合约
+        today = datetime.now().date()
+        expiry_to_contracts: Dict[str, List[OptionContract]] = defaultdict(list)
+        
+        for record in records:
+            expiry_str = self._get_expiry_date(record)
+            if not expiry_str:
                 continue
+            
+            expiry_date = self._parse_date(expiry_str)
+            if not expiry_date:
+                continue
+            
+            dte = (expiry_date - today).days
+            if dte < 0 or dte > max_days:
+                continue
+            
+            option_code = self._get_option_code(record)
+            if not option_code:
+                continue
+            
+            option_type = record.get('option_type', _OptionType.CALL)
+            expiry_to_contracts[expiry_str].append(
+                OptionContract(code=option_code, option_type=option_type)
+            )
         
-        # 尝试无日期参数
-        try:
-            ret, data = self.quote_ctx.get_option_chain(code, option_type=option_type)
-            return ret, data
-        except Exception as e:
-            return -1, str(e)
-    
-    def _fetch_snapshot_map(
-        self, 
-        expirations: Dict[str, List[OptionContract]]
-    ) -> Dict[str, Dict]:
-        """获取期权快照数据"""
-        codes = []
-        for contracts in expirations.values():
-            codes.extend(contract.code for contract in contracts)
+        if not expiry_to_contracts:
+            return IVTermResult()
         
+        # 获取期权快照
+        all_codes = []
+        for contracts in expiry_to_contracts.values():
+            all_codes.extend([c.code for c in contracts])
+        
+        if not all_codes:
+            return IVTermResult()
+        
+        # 分批获取快照
         snapshot_map: Dict[str, Dict] = {}
-        chunk_size = 400  # Futu API 限制
+        batch_size = 100
         
-        for i in range(0, len(codes), chunk_size):
-            batch = codes[i:i + chunk_size]
+        for i in range(0, len(all_codes), batch_size):
+            batch = all_codes[i:i + batch_size]
             self.snapshot_limiter.acquire()
+            ret, snap_data = self.quote_ctx.get_market_snapshot(batch)
             
-            ret, data = self.quote_ctx.get_market_snapshot(batch)
-            
-            if ret == RET_OK:
-                records = self._dataframe_to_records(data)
-                for rec in records:
-                    code = rec.get('code') or rec.get('option_code')
+            if ret == _RET_OK and snap_data is not None:
+                for record in self._dataframe_to_records(snap_data):
+                    code = record.get('code')
                     if code:
-                        snapshot_map[code] = rec
-            else:
-                logger.warning(f"⚠ 快照获取失败: {data}")
+                        snapshot_map[code] = record
         
-        return snapshot_map
+        # 计算各到期日的 ATM IV
+        points = self._build_iv_points(expiry_to_contracts, snapshot_map, today)
+        
+        # 插值计算 IV7/30/60/90
+        iv7 = self._interpolate_iv(points, 7)
+        iv30 = self._interpolate_iv(points, 30)
+        iv60 = self._interpolate_iv(points, 60)
+        iv90 = self._interpolate_iv(points, 90)
+        
+        # 计算总 OI
+        total_oi = self._sum_open_interest(snapshot_map)
+        
+        return IVTermResult(
+            iv7=iv7,
+            iv30=iv30,
+            iv60=iv60,
+            iv90=iv90,
+            total_oi=total_oi
+        )
     
-    def _build_dte_points(
+    def _build_iv_points(
         self,
-        today: datetime.date,
-        expirations: Dict[str, List[OptionContract]],
-        snapshot_map: Dict[str, Dict]
+        expiry_to_contracts: Dict[str, List[OptionContract]],
+        snapshot_map: Dict[str, Dict],
+        today: Any
     ) -> List[Tuple[int, float]]:
-        """构建 DTE -> IV 点"""
+        """构建 IV 曲线点"""
         points = []
         
-        for expiry, contracts in expirations.items():
-            exp_date = self._parse_date(expiry)
-            if not exp_date:
+        for expiry_str, contracts in expiry_to_contracts.items():
+            expiry_date = self._parse_date(expiry_str)
+            if not expiry_date:
                 continue
             
-            dte = (exp_date - today).days
+            dte = (expiry_date - today).days
             if dte <= 0:
                 continue
             
-            # 选择 ATM Call 的 IV (delta 最接近 0.5)
             chosen_iv = self._pick_atm_iv(contracts, snapshot_map)
             if chosen_iv is not None:
                 points.append((dte, chosen_iv))
@@ -496,7 +519,7 @@ class FutuConnector(BrokerConnector):
         best_diff = None
         
         for contract in contracts:
-            if contract.option_type != OptionType.CALL:
+            if contract.option_type != _OptionType.CALL:
                 continue
             
             snapshot = snapshot_map.get(contract.code)
@@ -698,7 +721,7 @@ class FutuConnector(BrokerConnector):
         return iv
     
     @staticmethod
-    def _parse_date(value: str) -> Optional[datetime.date]:
+    def _parse_date(value: str) -> Optional[Any]:
         """解析日期字符串"""
         for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
             try:
@@ -713,6 +736,15 @@ class FutuConnector(BrokerConnector):
         if value is None:
             return "N/A"
         return f"{value:.2f}%"
+
+
+# ==================== 工厂函数和类型别名 ====================
+
+# 根据依赖可用性选择实现
+if FUTU_AVAILABLE:
+    FutuConnector = FutuConnectorReal
+else:
+    FutuConnector = FutuConnectorStub
 
 
 def estimate_iv_fetch_time(
@@ -740,12 +772,11 @@ def estimate_iv_fetch_time(
     return max(chain_batches, snapshot_batches) * 30.0
 
 
-# 便捷函数
 def create_futu_connector(
     host: str = '127.0.0.1',
     port: int = 11111,
     market: str = 'US'
-) -> FutuConnector:
+) -> BrokerConnector:
     """
     创建 Futu 连接器的工厂函数
     
@@ -755,6 +786,6 @@ def create_futu_connector(
         market: 市场代码
     
     Returns:
-        FutuConnector 实例
+        FutuConnector 实例 (真实或 Stub)
     """
     return FutuConnector(host=host, port=port, market=market)
