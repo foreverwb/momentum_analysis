@@ -21,7 +21,9 @@ def _get_renderer():
     log_format = os.getenv("LOG_FORMAT", "console").lower()
     if log_format == "json":
         return structlog.processors.JSONRenderer()
-    return structlog.dev.ConsoleRenderer()
+    return structlog.processors.KeyValueRenderer(
+        key_order=["T", "level", "logger", "event"]
+    )
 
 
 def _get_pre_chain() -> List[structlog.types.Processor]:
@@ -29,7 +31,7 @@ def _get_pre_chain() -> List[structlog.types.Processor]:
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_logger_name,
         structlog.stdlib.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso", utc=True, key="ts"),
+        structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S", utc=True, key="T"),
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
         structlog.processors.UnicodeDecoder(),
@@ -63,17 +65,22 @@ def configure_logging() -> None:
         for handler in root_logger.handlers:
             handler.setFormatter(formatter)
 
-    for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    for logger_name in ("uvicorn", "uvicorn.error"):
         lib_logger = logging.getLogger(logger_name)
         lib_logger.handlers.clear()
         lib_logger.propagate = True
+
+    access_logger = logging.getLogger("uvicorn.access")
+    access_logger.handlers.clear()
+    access_logger.propagate = False
+    access_logger.disabled = True
 
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,
             structlog.stdlib.add_logger_name,
             structlog.stdlib.add_log_level,
-            structlog.processors.TimeStamper(fmt="iso", utc=True, key="ts"),
+            structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S", utc=True, key="T"),
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
             structlog.processors.UnicodeDecoder(),
