@@ -62,7 +62,7 @@ function HoldingsTable({ holdings, maxDisplay, etfSymbol }: { holdings: Holding[
           <div className="p-3 bg-slate-100">
             <button
               onClick={() => setIsExpanded(!isExpanded)}
-              className="w-full py-2 px-4 bg-white border rounded-lg text-sm font-medium flex items-center justify-center gap-2 hover:bg-slate-50 transition-colors"
+              className="w-full py-2 px-4 bg-white border rounded-sm text-sm font-medium flex items-center justify-center gap-2 hover:bg-slate-50 transition-colors"
             >
               <span>{isExpanded ? '收起' : `展开全部 (${holdings.length - maxDisplay} 更多)`}</span>
               <svg
@@ -294,7 +294,7 @@ export function ETFCard({ etf, onViewHoldings, onRefresh }: ETFCardProps) {
             </div>
           </div>
           {/* 数据状态提示 */}
-          <div className="mt-4 p-3 bg-amber-50 border border-amber-200 rounded-lg">
+          <div className="mt-4 p-3 bg-amber-50 border border-amber-200 rounded-sm">
             <div className="flex items-center gap-2 text-amber-700 text-sm">
               <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <circle cx="12" cy="12" r="10"></circle>

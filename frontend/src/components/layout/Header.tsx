@@ -52,7 +52,7 @@ export function Header({ activeSection, onNavigate }: HeaderProps) {
             key={item.id}
             onClick={() => handleNavClick(item.id)}
             className={`
-              px-4 py-2 rounded-lg text-sm font-medium transition-all
+              px-4 py-2 rounded-sm text-sm font-medium transition-all
               ${activeSection === item.id
                 ? 'bg-gradient-to-r from-blue-600 to-purple-600 text-white shadow-md'
                 : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'

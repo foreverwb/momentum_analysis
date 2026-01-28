@@ -280,7 +280,7 @@ function StepNav({ currentStep }: { currentStep: number }) {
         <React.Fragment key={step.num}>
           <div
             className={`
-              flex items-center gap-2 px-4 py-2 rounded-lg transition-colors
+              flex items-center gap-2 px-4 py-2 rounded-sm transition-colors
               ${currentStep === step.num ? 'bg-blue-50' : ''}
               ${currentStep > step.num ? 'opacity-70' : ''}
             `}

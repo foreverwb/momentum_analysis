@@ -87,7 +87,7 @@ export function ETFOverview({ type }: ETFOverviewProps) {
             <button
               onClick={() => setViewMode('card')}
               className={`
-                px-4 py-2 rounded-lg text-sm font-medium transition-all
+                px-4 py-2 rounded-sm text-sm font-medium transition-all
                 ${viewMode === 'card'
                   ? 'bg-gradient-to-r from-blue-600 to-purple-600 text-white shadow-md'
                   : 'text-slate-600 hover:text-slate-900'
@@ -99,7 +99,7 @@ export function ETFOverview({ type }: ETFOverviewProps) {
             <button
               onClick={() => setViewMode('table')}
               className={`
-                px-4 py-2 rounded-lg text-sm font-medium transition-all
+                px-4 py-2 rounded-sm text-sm font-medium transition-all
                 ${viewMode === 'table'
                   ? 'bg-gradient-to-r from-blue-600 to-purple-600 text-white shadow-md'
                   : 'text-slate-600 hover:text-slate-900'
