@@ -179,6 +179,7 @@ class FutuConnectorStub(BrokerConnector):
         self, 
         symbols: Iterable[str], 
         max_days: int = 120,
+        window_days: int = 30,
         max_retries: int = 2
     ) -> Dict[str, IVTermResult]:
         """返回空的 IV 结果"""
@@ -325,6 +326,7 @@ class FutuConnectorReal(BrokerConnector):
         self, 
         symbols: Iterable[str], 
         max_days: int = 120,
+        window_days: int = 30,
         max_retries: int = 2
     ) -> Dict[str, IVTermResult]:
         """
@@ -335,13 +337,16 @@ class FutuConnectorReal(BrokerConnector):
         Args:
             symbols: 股票代码列表
             max_days: 最大到期天数
+            window_days: 期权链查询窗口天数
             max_retries: 失败重试次数
         
         Returns:
             {symbol: IVTermResult} 字典
         """
         if not self.is_connected():
-            self.connect()
+            if not self.connect():
+                logger.error("Futu 未连接，无法获取 IV 数据")
+                return {symbol: IVTermResult() for symbol in symbols}
         
         results: Dict[str, IVTermResult] = {}
         symbols_list = list(symbols)
@@ -353,6 +358,7 @@ class FutuConnectorReal(BrokerConnector):
                 result = self._fetch_symbol_iv_terms_with_retry(
                     symbol=symbol,
                     max_days=max_days,
+                    window_days=window_days,
                     max_retries=max_retries
                 )
                 results[symbol] = result
@@ -363,107 +369,66 @@ class FutuConnectorReal(BrokerConnector):
                     f"IV7={self._fmt_iv(result.iv7)} "
                     f"IV30={self._fmt_iv(result.iv30)} "
                     f"IV60={self._fmt_iv(result.iv60)} "
-                    f"IV90={self._fmt_iv(result.iv90)}"
+                    f"IV90={self._fmt_iv(result.iv90)}",
+                    total_oi=result.total_oi,
+                    total_oi_display=str(result.total_oi) if result.total_oi is not None else "N/A",
                 )
             except Exception as exc:
                 logger.error(f"✗ {symbol}: IV 计算失败: {exc}")
                 results[symbol] = IVTermResult()
         
-        elapsed = time.time() - start_ts
-        success = sum(1 for v in results.values() if v.is_valid())
-        logger.info(f"✓ {success}/{total} successful in {elapsed/60:.1f}m")
-        
+        # 仅保留逐标的日志，避免额外汇总输出干扰。
         return results
     
     def _fetch_symbol_iv_terms_with_retry(
         self,
         symbol: str,
         max_days: int,
+        window_days: int,
         max_retries: int
     ) -> IVTermResult:
         """获取单个标的的 IV 期限结构（带重试）"""
         for attempt in range(max_retries + 1):
             try:
-                return self._fetch_symbol_iv_terms(symbol, max_days)
+                return self._fetch_symbol_iv_terms(symbol, max_days, window_days)
             except Exception as e:
                 if attempt < max_retries:
                     logger.warning(f"重试 {symbol} IV 获取 (尝试 {attempt + 1}/{max_retries}): {e}")
-                    time.sleep(1)
+                    sleep_seconds = min(30.0, 2 ** attempt)
+                    time.sleep(sleep_seconds)
                 else:
                     raise
         return IVTermResult()
     
-    def _fetch_symbol_iv_terms(self, symbol: str, max_days: int) -> IVTermResult:
+    def _fetch_symbol_iv_terms(self, symbol: str, max_days: int, window_days: int) -> IVTermResult:
         """获取单个标的的 IV 期限结构"""
+        if not self.quote_ctx:
+            logger.error("Futu 未连接，无法获取 IV")
+            return IVTermResult()
         code = self._format_code(symbol)
-        
-        # 获取期权链
-        self.chain_limiter.acquire()
-        ret, data = self.quote_ctx.get_option_chain(code, index_option_type=0)
-        
-        if ret != _RET_OK:
-            logger.warning(f"获取 {symbol} 期权链失败")
-            return IVTermResult()
-        
-        if data is None or (hasattr(data, 'empty') and data.empty):
-            return IVTermResult()
-        
-        records = self._dataframe_to_records(data)
-        if not records:
-            return IVTermResult()
-        
-        # 按到期日分组合约
+
         today = datetime.now().date()
+        end_date = today + timedelta(days=max_days)
         expiry_to_contracts: Dict[str, List[OptionContract]] = defaultdict(list)
-        
-        for record in records:
-            expiry_str = self._get_expiry_date(record)
-            if not expiry_str:
-                continue
-            
-            expiry_date = self._parse_date(expiry_str)
-            if not expiry_date:
-                continue
-            
-            dte = (expiry_date - today).days
-            if dte < 0 or dte > max_days:
-                continue
-            
-            option_code = self._get_option_code(record)
-            if not option_code:
-                continue
-            
-            option_type = record.get('option_type', _OptionType.CALL)
-            expiry_to_contracts[expiry_str].append(
-                OptionContract(code=option_code, option_type=option_type)
-            )
-        
+
+        self._collect_expirations(
+            symbol=symbol,
+            code=code,
+            expirations=expiry_to_contracts,
+            start_date=today,
+            end_date=end_date,
+            window_days=window_days,
+            option_types=[_OptionType.CALL, _OptionType.PUT]
+        )
+
         if not expiry_to_contracts:
+            logger.warning(f"{symbol}: 无可用期权到期日")
             return IVTermResult()
-        
-        # 获取期权快照
-        all_codes = []
-        for contracts in expiry_to_contracts.values():
-            all_codes.extend([c.code for c in contracts])
-        
-        if not all_codes:
+
+        snapshot_map = self._fetch_snapshot_map(expiry_to_contracts)
+        if not snapshot_map:
             return IVTermResult()
-        
-        # 分批获取快照
-        snapshot_map: Dict[str, Dict] = {}
-        batch_size = 100
-        
-        for i in range(0, len(all_codes), batch_size):
-            batch = all_codes[i:i + batch_size]
-            self.snapshot_limiter.acquire()
-            ret, snap_data = self.quote_ctx.get_market_snapshot(batch)
-            
-            if ret == _RET_OK and snap_data is not None:
-                for record in self._dataframe_to_records(snap_data):
-                    code = record.get('code')
-                    if code:
-                        snapshot_map[code] = record
-        
+
         # 计算各到期日的 ATM IV
         points = self._build_iv_points(expiry_to_contracts, snapshot_map, today)
         
@@ -483,6 +448,127 @@ class FutuConnectorReal(BrokerConnector):
             iv90=iv90,
             total_oi=total_oi
         )
+
+    def _collect_expirations(
+        self,
+        symbol: str,
+        code: str,
+        expirations: Dict[str, List[OptionContract]],
+        start_date: datetime.date,
+        end_date: datetime.date,
+        window_days: int,
+        option_types: List[Any]
+    ) -> None:
+        window_days = max(1, int(window_days))
+        window_start = start_date
+        while window_start <= end_date:
+            window_end = min(window_start + timedelta(days=window_days), end_date)
+            for option_type in option_types:
+                ret, data = self._fetch_option_chain_with_retry(
+                    code=code,
+                    start_date=window_start.strftime("%Y-%m-%d"),
+                    end_date=window_end.strftime("%Y-%m-%d"),
+                    option_type=option_type
+                )
+                if ret != _RET_OK:
+                    logger.warning(f"获取 {symbol} 期权链失败: {data}")
+                    continue
+
+                records = self._dataframe_to_records(data)
+                for record in records:
+                    expiry = self._get_expiry_date(record)
+                    option_code = self._get_option_code(record)
+                    if expiry and option_code:
+                        expirations[expiry].append(OptionContract(option_code, option_type))
+            window_start = window_end + timedelta(days=1)
+
+    def _get_option_chain_window(
+        self,
+        code: str,
+        start_date: str,
+        end_date: str,
+        option_type: Any
+    ) -> Tuple[int, Any]:
+        variants = [
+            {"begin_time": start_date, "end_time": end_date},
+            {"start_time": start_date, "end_time": end_date},
+            {"start_date": start_date, "end_date": end_date},
+            {"start": start_date, "end": end_date},
+        ]
+        positional_variants = [
+            (start_date, end_date),
+            (),
+        ]
+        last_error = None
+        for variant in variants:
+            try:
+                kwargs = {"option_type": option_type, **variant}
+                return self.quote_ctx.get_option_chain(code, **kwargs)
+            except TypeError as exc:
+                last_error = exc
+                continue
+        for args in positional_variants:
+            try:
+                kwargs = {"option_type": option_type}
+                return self.quote_ctx.get_option_chain(code, *args, **kwargs)
+            except TypeError as exc:
+                last_error = exc
+                continue
+        raise TypeError(f"get_option_chain 参数不兼容: {last_error}")
+
+    def _fetch_option_chain_with_retry(
+        self,
+        code: str,
+        start_date: str,
+        end_date: str,
+        option_type: Any,
+        max_retries: int = 2
+    ) -> Tuple[int, Any]:
+        last_data = None
+        for attempt in range(max_retries + 1):
+            self.chain_limiter.acquire()
+            ret, data = self._get_option_chain_window(
+                code=code,
+                start_date=start_date,
+                end_date=end_date,
+                option_type=option_type
+            )
+            last_data = data
+            if ret == _RET_OK:
+                return ret, data
+            if isinstance(data, str) and "频率太高" in data and attempt < max_retries:
+                time.sleep(30.0)
+                continue
+            return ret, data
+        return ret, last_data
+
+    def _fetch_snapshot_map(
+        self,
+        expirations: Dict[str, List[OptionContract]]
+    ) -> Dict[str, Dict]:
+        codes = []
+        for option_codes in expirations.values():
+            codes.extend(contract.code for contract in option_codes)
+
+        if not codes:
+            return {}
+        codes = list(dict.fromkeys(codes))
+
+        snapshot_map: Dict[str, Dict] = {}
+        chunk_size = 400
+        for idx in range(0, len(codes), chunk_size):
+            batch = codes[idx:idx + chunk_size]
+            self.snapshot_limiter.acquire()
+            ret, data = self.quote_ctx.get_market_snapshot(batch)
+            if ret != _RET_OK:
+                logger.warning(f"期权快照失败: {data}")
+                continue
+            records = self._dataframe_to_records(data)
+            for rec in records:
+                code = rec.get("code") or rec.get("option_code")
+                if code:
+                    snapshot_map[code] = rec
+        return snapshot_map
     
     def _build_iv_points(
         self,
@@ -735,7 +821,7 @@ class FutuConnectorReal(BrokerConnector):
         """格式化 IV 值用于显示"""
         if value is None:
             return "N/A"
-        return f"{value:.2f}%"
+        return f"{value:.2f}"
 
 
 # ==================== 工厂函数和类型别名 ====================

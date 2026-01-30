@@ -17,6 +17,10 @@ import numpy as np
 from typing import Optional, Dict, List, Any
 from datetime import datetime
 from time import perf_counter
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
+import threading
+import time
 
 from .base import BrokerConnector, PriceDataMixin
 from app.core.timing import timed
@@ -27,10 +31,43 @@ logger = structlog.get_logger(__name__)
 # ==================== 依赖检查 ====================
 
 IB_INSYNC_AVAILABLE = False
+NEST_ASYNCIO_AVAILABLE = False
 _IB = None
 _Stock = None
 _Index = None
 _util = None
+
+def _is_uvloop() -> bool:
+    try:
+        loop = asyncio.get_running_loop()
+        if loop.__class__.__module__.startswith("uvloop"):
+            return True
+    except RuntimeError:
+        pass
+    try:
+        policy = asyncio.get_event_loop_policy()
+        return policy.__class__.__module__.startswith("uvloop")
+    except Exception:
+        return False
+
+
+# 尝试导入 nest_asyncio 解决嵌套事件循环问题
+try:
+    import nest_asyncio
+    if _is_uvloop():
+        logger.info("检测到 uvloop，跳过 nest_asyncio.apply (uvloop 不支持 patch)")
+    else:
+        try:
+            nest_asyncio.apply()
+            NEST_ASYNCIO_AVAILABLE = True
+            logger.info("nest_asyncio 已应用，支持嵌套事件循环")
+        except Exception as e:
+            logger.warning(f"nest_asyncio apply 失败，将继续不启用嵌套事件循环: {e}")
+except ImportError:
+    logger.warning(
+        "nest_asyncio 未安装，在 FastAPI 环境中可能遇到事件循环冲突。"
+        "请运行 'pip install nest_asyncio --break-system-packages' 来安装。"
+    )
 
 try:
     from ib_insync import IB, Stock, Index, util
@@ -166,8 +203,42 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
         self.port = port
         self.client_id = client_id
         self.timeout = timeout
-        self.ib = _IB()
+        self.ib = None
         self._connected = False
+        # Run ib_insync calls on a dedicated thread to avoid event loop conflicts.
+        self._worker_thread_id = None
+        self._worker_loop = None
+        self._executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="ibkr-worker",
+            initializer=self._init_worker_loop,
+        )
+
+    def _init_worker_loop(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._worker_loop = loop
+
+    def _run_in_worker(self, func, *args, **kwargs):
+        if self._worker_thread_id == threading.get_ident():
+            return func(*args, **kwargs)
+        future = self._executor.submit(self._run_with_thread_id, func, *args, **kwargs)
+        return future.result()
+
+    def _run_with_thread_id(self, func, *args, **kwargs):
+        if self._worker_thread_id is None:
+            self._worker_thread_id = threading.get_ident()
+        return func(*args, **kwargs)
+    
+    def _init_ib(self):
+        """初始化 IB 实例"""
+        if self.ib is not None:
+            try:
+                if self.ib.isConnected():
+                    self.ib.disconnect()
+            except:
+                pass
+        self.ib = _IB()
     
     # ==================== 连接管理 ====================
     
@@ -178,6 +249,17 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
         Returns:
             bool: 连接成功返回 True
         """
+        return self._run_in_worker(self._connect_impl)
+
+    def _connect_impl(self) -> bool:
+        # 如果已连接，先断开
+        if self._connected and self.ib and self.ib.isConnected():
+            logger.info("IBKR 已连接，跳过重复连接")
+            return True
+        
+        # 重新初始化 IB 实例以避免事件循环问题
+        self._init_ib()
+        
         try:
             with timed(
                 logger,
@@ -196,14 +278,34 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
                 )
                 self.ib.reqMarketDataType(3)  # 使用延迟数据 (3=Delayed)
                 self._connected = True
+                logger.info(f"✅ IBKR 连接成功: {self.host}:{self.port}")
             return True
-        except Exception:
+        except RuntimeError as e:
+            if "event loop" in str(e).lower():
+                if _is_uvloop():
+                    logger.error(
+                        f"IBKR 事件循环冲突: {e}. "
+                        "检测到 uvloop，nest_asyncio 与 uvloop 不兼容。"
+                        "建议使用 `uvicorn --loop asyncio` 或改用 ib_insync 的异步 API。"
+                    )
+                else:
+                    logger.error(
+                        f"IBKR 事件循环冲突: {e}. "
+                        "请确保已安装 nest_asyncio: pip install nest_asyncio --break-system-packages"
+                    )
+            self._connected = False
+            return False
+        except Exception as e:
+            logger.error(f"IBKR 连接失败: {e}")
             self._connected = False
             return False
     
     def disconnect(self) -> None:
         """断开 IBKR 连接"""
-        if self.ib.isConnected():
+        self._run_in_worker(self._disconnect_impl)
+
+    def _disconnect_impl(self) -> None:
+        if self.ib and self.ib.isConnected():
             try:
                 with timed(
                     logger,
@@ -216,12 +318,17 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
                 ):
                     self.ib.disconnect()
                     self._connected = False
-            except Exception:
+                    logger.info("IBKR 已断开连接")
+            except Exception as e:
+                logger.warning(f"IBKR 断开连接时出错: {e}")
                 self._connected = False
     
     def is_connected(self) -> bool:
         """检查连接状态"""
-        return self._connected and self.ib.isConnected()
+        return self._run_in_worker(self._is_connected_impl)
+
+    def _is_connected_impl(self) -> bool:
+        return self._connected and self.ib is not None and self.ib.isConnected()
     
     def __enter__(self):
         """Context manager 支持"""
@@ -247,6 +354,9 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
         Returns:
             DataFrame with columns: [date, {symbol}]
         """
+        return self._run_in_worker(self._get_price_data_impl, symbol, duration)
+
+    def _get_price_data_impl(self, symbol: str, duration: str = '1 Y') -> Optional[pd.DataFrame]:
         if not self.is_connected():
             logger.warning(
                 "ibkr_hist_close",
@@ -307,6 +417,9 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
         Returns:
             DataFrame with columns: [date, open, high, low, close, volume]
         """
+        return self._run_in_worker(self._get_ohlcv_data_impl, symbol, duration)
+
+    def _get_ohlcv_data_impl(self, symbol: str, duration: str = '1 Y') -> Optional[pd.DataFrame]:
         if not self.is_connected():
             logger.warning(
                 "ibkr_hist_ohlcv",
@@ -365,6 +478,9 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
         Returns:
             当前价格 (float)，获取失败返回 None
         """
+        return self._run_in_worker(self._get_current_price_impl, symbol)
+
+    def _get_current_price_impl(self, symbol: str) -> Optional[float]:
         if not self.is_connected():
             logger.error("IBKR 未连接")
             return None
@@ -631,18 +747,38 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
             DataFrame 按 RelMom 降序排列
         """
         results = []
-        
-        for symbol in symbols:
+        total = len(symbols)
+        success = 0
+        start_ts = time.time()
+
+        for idx, symbol in enumerate(symbols, start=1):
             result = self.analyze_sector_vs_spy(symbol, benchmark)
             if result:
                 results.append(result)
-            self.ib.sleep(0.5)  # 避免请求过快
+                success += 1
+                relmom = result.get("RelMom")
+                rs20 = result.get("RS_20D")
+                rs63 = result.get("RS_63D")
+                relmom_str = f"{relmom:.4f}" if relmom is not None else "N/A"
+                rs20_str = f"{rs20:.4f}" if rs20 is not None else "N/A"
+                rs63_str = f"{rs63:.4f}" if rs63 is not None else "N/A"
+                logger.info(
+                    f"✓ [{idx}/{total}] {symbol}: "
+                    f"RelMom={relmom_str} RS20={rs20_str} RS63={rs63_str}"
+                )
+            else:
+                logger.warning(f"✗ [{idx}/{total}] {symbol}: RelMom=N/A")
+            time.sleep(0.5)  # 避免请求过快
         
         if not results:
+            elapsed = (time.time() - start_ts) / 60.0
+            logger.info(f"✓ {success}/{total} relmom successful in {elapsed:.1f}m")
             return pd.DataFrame()
         
         df = pd.DataFrame(results)
         df = df.sort_values('RelMom', ascending=False)
+        elapsed = (time.time() - start_ts) / 60.0
+        logger.info(f"✓ {success}/{total} relmom successful in {elapsed:.1f}m")
         return df
     
     # ==================== VIX 数据 ====================
@@ -654,6 +790,9 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
         Returns:
             VIX 值 (float)
         """
+        return self._run_in_worker(self._get_vix_impl)
+
+    def _get_vix_impl(self) -> Optional[float]:
         if not self.is_connected():
             logger.warning(
                 "ibkr_vix",
@@ -758,7 +897,7 @@ else:
 def create_ibkr_connector(
     host: str = '127.0.0.1',
     port: int = 4002,
-    client_id: int = 1
+    client_id: int = 3
 ) -> BrokerConnector:
     """
     创建 IBKR 连接器的工厂函数

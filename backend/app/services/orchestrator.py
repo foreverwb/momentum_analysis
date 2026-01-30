@@ -623,6 +623,7 @@ class DataOrchestrator:
                 calculate_breadth_metrics,
                 get_summary_statistics
             )
+            from app.models import get_db, ETF
             
             # 解析数据
             parsed = parse_finviz_json(data)
@@ -635,6 +636,23 @@ class DataOrchestrator:
             
             # 获取统计摘要
             stats = get_summary_statistics(parsed)
+            
+            # 更新 ETF 的 coverage_ranges
+            db = next(get_db())
+            try:
+                etf = db.query(ETF).filter(ETF.symbol == etf_symbol.upper()).first()
+                if etf:
+                    existing_ranges = getattr(etf, 'coverage_ranges', None) or []
+                    if coverage not in existing_ranges:
+                        existing_ranges.append(coverage)
+                        etf.coverage_ranges = existing_ranges
+                        db.commit()
+                        logger.info(f"已更新 {etf_symbol} 的 coverage_ranges: {existing_ranges}")
+            except Exception as e:
+                logger.warning(f"更新 coverage_ranges 失败 (可能数据库列不存在): {e}")
+                db.rollback()
+            finally:
+                db.close()
             
             result = {
                 'etf_symbol': etf_symbol,

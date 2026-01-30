@@ -277,13 +277,26 @@ export async function healthCheck(): Promise<{
 }
 
 // Refresh ETF Data API
-export async function refreshETFData(symbol: string): Promise<{
+export interface RefreshETFDataResponse {
   status: string;
   symbol: string;
   message: string;
   score?: number;
   rank?: number;
-}> {
+  completeness?: number;
+  thresholds_pass?: boolean;
+  thresholds?: Record<string, boolean>;
+  breakdown?: {
+    rel_mom?: { score: number; data?: Record<string, unknown> };
+    trend_quality?: { score: number; data?: Record<string, unknown> };
+    breadth?: { score: number; data?: Record<string, unknown> };
+    options_confirm?: { score: number; data?: Record<string, unknown> };
+  };
+  data_sources?: Record<string, boolean>;
+  warnings?: string[];
+}
+
+export async function refreshETFData(symbol: string): Promise<RefreshETFDataResponse> {
   return fetchApi(`/etfs/symbol/${symbol}/refresh`, {
     method: 'POST',
   });
@@ -364,5 +377,50 @@ export async function disconnectFutu(): Promise<{
 }> {
   return fetchApi('/broker/futu/disconnect', {
     method: 'POST',
+  });
+}
+
+// Finviz Data Import API
+export interface FinvizImportResponse {
+  status: string;
+  etf_symbol: string;
+  coverage: string;
+  records_imported: number;
+  breadth_metrics: Record<string, unknown>;
+  validation: Record<string, unknown>;
+  statistics?: Record<string, unknown>;
+}
+
+export async function importFinvizData(
+  etfSymbol: string,
+  coverage: string,
+  data: Array<Record<string, unknown>>
+): Promise<FinvizImportResponse> {
+  return fetchApi('/import/finviz', {
+    method: 'POST',
+    body: JSON.stringify({
+      etf_symbol: etfSymbol,
+      coverage: coverage,
+      data: data,
+    }),
+  });
+}
+
+// MarketChameleon Data Import API
+export interface MCImportResponse {
+  status: string;
+  records_imported: number;
+  heat_distribution: Record<string, number>;
+  data?: Array<Record<string, unknown>>;
+}
+
+export async function importMCData(
+  data: Array<Record<string, unknown>>
+): Promise<MCImportResponse> {
+  return fetchApi('/import/marketchameleon', {
+    method: 'POST',
+    body: JSON.stringify({
+      data: data,
+    }),
   });
 }

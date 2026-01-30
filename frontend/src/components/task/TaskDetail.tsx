@@ -58,13 +58,14 @@ interface ETFDetailData {
   delta3d: number | null;
   delta5d: number | null;
   completeness: number;
-  holdings: Holding[];
+  holdings: Array<Holding & { dataStatus?: 'complete' | 'pending' | 'missing' }>;
   dataStatus: Array<{
-    source: 'Finviz' | 'MarketChameleon' | '市场/期权数据';
-    status: 'complete' | 'pending' | 'missing';
+    source: 'Finviz' | 'MarketChameleon' | '市场数据' | '期权数据' | 'IBKR' | 'Futu';
+    status: 'complete' | 'pending' | 'missing' | 'loading';
     updatedAt: string | null;
     count?: number;
   }>;
+  coverageRanges: string[];
 }
 
 export function TaskDetail({ task, onBack }: TaskDetailProps) {
@@ -106,6 +107,7 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
               completeness: etf.completeness || 0,
               holdings: etf.holdings || [],
               dataStatus: generateDataStatus(etf),
+              coverageRanges: etf.coverageRanges || [],
             };
           }
         } catch (e) {
@@ -127,8 +129,10 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
           dataStatus: [
             { source: 'Finviz' as const, status: 'missing' as const, updatedAt: null },
             { source: 'MarketChameleon' as const, status: 'missing' as const, updatedAt: null },
-            { source: '市场/期权数据' as const, status: 'missing' as const, updatedAt: null },
+            { source: '市场数据' as const, status: 'missing' as const, updatedAt: null },
+            { source: '期权数据' as const, status: 'missing' as const, updatedAt: null },
           ],
+          coverageRanges: [],
         };
       });
       
@@ -163,7 +167,12 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
         updatedAt: hasScore ? formatRelativeTime(etf.completeness > 70) : null,
       },
       { 
-        source: '市场/期权数据' as const, 
+        source: '市场数据' as const, 
+        status: etf.completeness >= 60 ? 'complete' as const : 'missing' as const, 
+        updatedAt: etf.completeness >= 60 ? formatRelativeTime(true) : null,
+      },
+      { 
+        source: '期权数据' as const, 
         status: etf.completeness >= 80 ? 'complete' as const : 'missing' as const, 
         updatedAt: etf.completeness >= 80 ? formatRelativeTime(true) : null,
       },
@@ -216,10 +225,14 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
     try {
       const response = await api.refreshETFData(symbol);
       console.log('Refresh ETF response:', response);
-      loadETFData();
+      // 延迟加载数据，让用户看到结果
+      setTimeout(() => {
+        loadETFData();
+      }, 1500);
+      return response;
     } catch (e) {
       console.error('Failed to refresh ETF:', e);
-      alert(`刷新 ${symbol} 数据失败`);
+      throw e;
     }
   };
 
@@ -360,17 +373,30 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-base font-semibold">监控ETF ({task.etfs.length})</h3>
         </div>
-        <div className="grid grid-cols-3 gap-5">
-          {etfDetails.map((etf) => (
-            <ETFDetailCard
-              key={etf.symbol}
-              etf={etf}
-              coverageRanges={coverageRangesByETF[etf.symbol] || []}
-              onRefreshETF={() => handleRefreshETF(etf.symbol)}
-              onRefreshHoldings={() => handleRefreshHoldings(etf.symbol)}
-              onImportHoldings={() => handleOpenHoldingsModal(etf.symbol)}
-            />
-          ))}
+        <div className="grid grid-cols-2 gap-5">
+          {etfDetails.map((etf) => {
+            // 合并后端返回的 coverageRanges 和本地状态
+            const backendRanges = etf.coverageRanges || [];
+            const localRanges = coverageRangesByETF[etf.symbol] || [];
+            const mergedRanges = [...new Set([...backendRanges, ...localRanges])];
+            
+            return (
+              <ETFDetailCard
+                key={etf.symbol}
+                etf={etf}
+                coverageRanges={mergedRanges}
+                onRefreshETF={async () => {
+                  return await handleRefreshETF(etf.symbol);
+                }}
+                onRefreshHoldings={() => handleRefreshHoldings(etf.symbol)}
+                onImportHoldings={() => handleOpenHoldingsModal(etf.symbol)}
+                onViewStockDetail={(ticker) => {
+                  console.log('View stock detail:', ticker);
+                  // TODO: Navigate to stock detail page
+                }}
+              />
+            );
+          })}
         </div>
       </div>
 
@@ -379,16 +405,33 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
         isOpen={holdingsModalOpen}
         onClose={() => setHoldingsModalOpen(false)}
         etfSymbol={selectedETF}
-        onImport={(data) => {
+        onImport={async (data) => {
           console.log('Import holdings:', selectedETF, data);
-          if (selectedETF) {
-            setCoverageRangesByETF((prev) => {
-              const existing = new Set(prev[selectedETF] || []);
-              existing.add(data.coverage);
-              return { ...prev, [selectedETF]: Array.from(existing) };
-            });
+          if (selectedETF && data.jsonData) {
+            try {
+              const parsedData = JSON.parse(data.jsonData);
+              
+              // 调用后端 API 导入数据
+              if (data.source === 'finviz') {
+                await api.importFinvizData(selectedETF, data.coverage, parsedData);
+              } else {
+                await api.importMCData(parsedData);
+              }
+              
+              // 更新本地状态（作为备份）
+              setCoverageRangesByETF((prev) => {
+                const existing = new Set(prev[selectedETF] || []);
+                existing.add(data.coverage);
+                return { ...prev, [selectedETF]: Array.from(existing) };
+              });
+              
+              // 刷新数据
+              loadETFData();
+            } catch (e) {
+              console.error('Import failed:', e);
+              alert('导入失败，请检查数据格式');
+            }
           }
-          loadETFData();
         }}
       />
       <ETFImportModal

@@ -62,7 +62,7 @@ class IBKRConfigRequest(BaseModel):
     """IBKR 配置请求"""
     host: str = Field("127.0.0.1", description="TWS/Gateway 主机地址")
     port: int = Field(4002, description="端口号 (TWS: 7497, Gateway: 4002)")
-    client_id: int = Field(1, description="客户端 ID")
+    client_id: int = Field(3, description="客户端 ID")
     timeout: int = Field(30, description="连接超时（秒）")
 
 
@@ -156,7 +156,7 @@ async def connect_ibkr(request: Optional[IBKRConfigRequest] = None):
         # 使用默认值或请求参数
         host = request.host if request else '127.0.0.1'
         port = request.port if request else 4002
-        client_id = request.client_id if request else 1
+        client_id = request.client_id if request else 3
         
         success = await orchestrator.connect_ibkr(
             host=host,

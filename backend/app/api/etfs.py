@@ -29,7 +29,8 @@ def format_etf_response(etf: ETF, include_holdings: bool = False) -> dict:
         "rank": etf.rank or 0,
         "delta": etf.delta or {"delta3d": None, "delta5d": None},
         "completeness": etf.completeness or 0.0,
-        "holdingsCount": etf.holdings_count or 0
+        "holdingsCount": etf.holdings_count or 0,
+        "coverageRanges": getattr(etf, 'coverage_ranges', None) or []
     }
     
     if etf.type == "industry" and etf.parent_sector:
