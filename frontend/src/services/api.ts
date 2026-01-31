@@ -424,3 +424,122 @@ export async function importMCData(
     }),
   });
 }
+
+// Task Refresh APIs
+export interface RefreshTaskAllETFsResponse {
+  status: string;
+  task_id: number;
+  total: number;
+  completed: number;
+  failed: number;
+  results: Array<{
+    symbol: string;
+    status: string;
+    score?: number;
+    completeness?: number;
+    message: string;
+    data_sources?: Record<string, boolean>;
+  }>;
+  message: string;
+}
+
+export async function refreshTaskAllETFs(taskId: number): Promise<RefreshTaskAllETFsResponse> {
+  return fetchApi(`/tasks/${taskId}/refresh-all-etfs`, {
+    method: 'POST',
+  });
+}
+
+// WebSocket Progress Stream
+export interface RefreshProgressMessage {
+  event: 'progress' | 'completed' | 'error';
+  etf_symbol?: string;
+  stage?: string;
+  progress_percentage?: number;
+  message?: string;
+  completed_count?: number;
+  total_count?: number;
+  current_etf?: string;
+  error?: string | null;
+  timestamp?: string;
+}
+
+export function connectToRefreshStream(
+  taskId: number,
+  onMessage: (message: RefreshProgressMessage) => void,
+  onError?: (error: Event) => void,
+  onClose?: () => void
+): WebSocket {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = `${protocol}//${window.location.host}/api/tasks/ws/${taskId}/refresh-stream`;
+
+  const ws = new WebSocket(wsUrl);
+
+  ws.onmessage = (event) => {
+    try {
+      const message = JSON.parse(event.data) as RefreshProgressMessage;
+      onMessage(message);
+    } catch (error) {
+      console.error('Failed to parse WebSocket message:', error);
+    }
+  };
+
+  ws.onerror = (event) => {
+    console.error('WebSocket error:', event);
+    if (onError) {
+      onError(event);
+    }
+  };
+
+  ws.onclose = () => {
+    console.log('WebSocket closed');
+    if (onClose) {
+      onClose();
+    }
+  };
+
+  return ws;
+}
+
+// Holdings Refresh API
+export interface RefreshHoldingsByCoverageResponse {
+  status: string;
+  symbol: string;
+  coverage: string;
+  stocks_count: number;
+  total_weight: number;
+  completeness: {
+    coverage: string;
+    total_stocks: number;
+    complete_count: number;
+    pending_count: number;
+    missing_count: number;
+    average_completeness: number;
+  };
+  updated_stocks: Array<{
+    ticker: string;
+    weight: number;
+    price?: number;
+    change_1d?: number;
+    data_sources?: string[];
+    data_status?: 'complete' | 'pending' | 'missing';
+    completeness?: number;
+    iv30?: number;
+    updated_at?: string;
+  }>;
+  updated_at: string;
+  message: string;
+}
+
+export async function refreshHoldingsByCoverage(
+  symbol: string,
+  coverageType: 'top' | 'weight',
+  coverageValue: number
+): Promise<RefreshHoldingsByCoverageResponse> {
+  return fetchApi(`/etfs/symbol/${symbol}/refresh-holdings-by-coverage`, {
+    method: 'POST',
+    body: JSON.stringify({
+      coverage_type: coverageType,
+      coverage_value: coverageValue,
+    }),
+  });
+}

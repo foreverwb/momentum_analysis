@@ -11,6 +11,9 @@ interface HoldingSummary {
   ticker: string;
   weight: number;
   dataStatus?: 'complete' | 'pending' | 'missing';
+  completeness?: number;  // 0-100 percentage
+  dataSources?: Record<string, boolean>;  // { finviz, market_chameleon, market_data, options_data }
+  updatedAt?: string;  // timestamp
 }
 
 interface RefreshProgress {
@@ -53,8 +56,8 @@ interface ETFDetailCardProps {
   };
   coverageRanges?: string[];
   onRefreshETF: () => Promise<RefreshResult | void>;
-  onRefreshHoldings: () => void;
-  onImportHoldings: () => void;
+  onRefreshHoldings: (coverageId: string) => void;
+  onImportHoldings?: (coverageId?: string) => void;
   onViewStockDetail?: (ticker: string) => void;
 }
 
@@ -139,6 +142,58 @@ const refreshStageMessages: Record<RefreshProgress['stage'], string> = {
   error: '刷新失败',
 };
 
+// 评分维度卡片组件
+interface ScoreDimensionCardProps {
+  label: string;
+  weight: string;
+  score: number | undefined;
+  color: string;
+  data?: Record<string, unknown>;
+}
+
+function ScoreDimensionCard({
+  label,
+  weight,
+  score,
+  color,
+  data,
+}: ScoreDimensionCardProps) {
+  const [showDetails, setShowDetails] = React.useState(false);
+
+  return (
+    <div
+      className="bg-[var(--bg-secondary)] rounded-[var(--radius-md)] p-3 cursor-pointer hover:bg-[var(--bg-tertiary)] transition-colors"
+      onClick={() => data && setShowDetails(!showDetails)}
+      title={data ? '点击查看详细数据' : ''}
+    >
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-[11px] text-[var(--text-muted)]">{label}</span>
+        <span className="text-[10px] text-[var(--text-muted)]">{weight}</span>
+      </div>
+      <div className="text-2xl font-bold" style={{ color }}>
+        {score !== undefined ? Math.round(score) : '--'}
+      </div>
+
+      {/* Expandable details */}
+      {showDetails && data && (
+        <div className="mt-2 pt-2 border-t border-[var(--border-light)] text-[10px] text-[var(--text-muted)] space-y-1">
+          {Object.entries(data).slice(0, 5).map(([key, value]) => (
+            <div key={key} className="flex justify-between gap-2">
+              <span className="flex-shrink-0">{key}:</span>
+              <span className="font-mono text-right flex-shrink-0">
+                {typeof value === 'number' ? value.toFixed(2) : String(value)}
+              </span>
+            </div>
+          ))}
+          {Object.keys(data).length > 5 && (
+            <div className="text-[9px] italic">...及其他 {Object.keys(data).length - 5} 项</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 const formatWeight = (value: number): string => {
   if (value >= 10) {
     return value.toFixed(1);
@@ -182,6 +237,18 @@ export function ETFDetailCard({
   });
   const [lastRefreshResult, setLastRefreshResult] = useState<RefreshResult | null>(null);
   const [showRefreshDetails, setShowRefreshDetails] = useState(false);
+
+  // Holdings refresh state
+  const [holdingsRefreshState, setHoldingsRefreshState] = useState<{
+    isLoading: boolean;
+    progress: number;
+    message: string;
+    error?: string;
+  }>({
+    isLoading: false,
+    progress: 0,
+    message: '',
+  });
 
   const sortedHoldings = useMemo(() => {
     const holdings = etf.holdings || [];
@@ -288,6 +355,49 @@ export function ETFDetailCard({
     }
   }, [isRefreshing, onRefreshETF, simulateProgress]);
 
+  const handleRefreshHoldings = useCallback(async () => {
+    if (holdingsRefreshState.isLoading) return;
+
+    setHoldingsRefreshState({
+      isLoading: true,
+      progress: 10,
+      message: '正在刷新持仓股票数据...',
+    });
+
+    try {
+      const activeOptionData = activeOption;
+      const coverageType = activeOptionData.type; // 'top' or 'weight'
+      const coverageValue = activeOptionData.value;
+
+      // Call onRefreshHoldings callback which should handle the API call
+      // The parent component should implement refreshHoldingsByCoverage API call
+      await onRefreshHoldings(activeCoverage);
+
+      setHoldingsRefreshState({
+        isLoading: false,
+        progress: 100,
+        message: `已刷新 ${activeHoldings.length} 只股票数据`,
+      });
+
+      // Clear message after 3 seconds
+      setTimeout(() => {
+        setHoldingsRefreshState({ isLoading: false, progress: 0, message: '' });
+      }, 3000);
+    } catch (error) {
+      setHoldingsRefreshState({
+        isLoading: false,
+        progress: 100,
+        message: error instanceof Error ? error.message : '刷新失败',
+        error: error instanceof Error ? error.message : '未知错误',
+      });
+
+      // Clear error message after 5 seconds
+      setTimeout(() => {
+        setHoldingsRefreshState({ isLoading: false, progress: 0, message: '' });
+      }, 5000);
+    }
+  }, [holdingsRefreshState.isLoading, activeCoverage, activeOption, activeHoldings.length, onRefreshHoldings]);
+
   const getCoverageTabStyle = (option: CoverageOption, isActive: boolean) => {
     const baseStyle = 'px-3 py-1.5 text-xs font-medium rounded-full border-2 transition-all cursor-pointer flex items-center gap-1.5';
     
@@ -332,38 +442,12 @@ export function ETFDetailCard({
             </div>
             <div className="text-[13px] text-[var(--text-muted)] mt-1">{etf.name}</div>
           </div>
-          <div className="flex flex-col items-end gap-3">
-            <button
-              onClick={handleRefreshETF}
-              disabled={isRefreshing}
-              className={`px-3.5 py-1.5 text-xs font-medium rounded-[var(--radius-sm)] text-white transition-all flex items-center gap-1.5 ${
-                isRefreshing ? 'opacity-70 cursor-not-allowed' : 'hover:opacity-90'
-              }`}
-              style={{ background: 'var(--accent-green)' }}
-            >
-              <svg 
-                width="12" 
-                height="12" 
-                viewBox="0 0 24 24" 
-                fill="none" 
-                stroke="currentColor" 
-                strokeWidth="2"
-                className={isRefreshing ? 'animate-spin' : ''}
-              >
-                <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
-                <path d="M3 3v5h5" />
-                <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
-                <path d="M16 16h5v5" />
-              </svg>
-              {isRefreshing ? '刷新中...' : '刷新 ETF 数据'}
-            </button>
-            <div className="text-right">
-              <div className="text-2xl font-bold leading-none">
-                {etf.score !== null ? etf.score.toFixed(1) : '--'}
-              </div>
-              <div className="text-[12px] text-[var(--text-muted)] mt-1">
-                #{etf.rank !== null ? etf.rank : '-'} / {etf.totalCount}
-              </div>
+          <div className="text-right">
+            <div className="text-2xl font-bold leading-none">
+              {etf.score !== null ? etf.score.toFixed(1) : '--'}
+            </div>
+            <div className="text-[12px] text-[var(--text-muted)] mt-1">
+              #{etf.rank !== null ? etf.rank : '-'} / {etf.totalCount}
             </div>
           </div>
         </div>
@@ -410,19 +494,58 @@ export function ETFDetailCard({
             </div>
           </div>
         </div>
+
+        {/* Dimension Scores Grid */}
+        <div className="grid grid-cols-4 gap-3 mt-4 pb-4">
+          {/* 相对动量 (45%) */}
+          <ScoreDimensionCard
+            label="相对动量"
+            weight="45%"
+            score={lastRefreshResult?.breakdown?.rel_mom?.score}
+            color="var(--accent-green)"
+            data={lastRefreshResult?.breakdown?.rel_mom?.data}
+          />
+
+          {/* 趋势质量 (25%) */}
+          <ScoreDimensionCard
+            label="趋势质量"
+            weight="25%"
+            score={lastRefreshResult?.breakdown?.trend_quality?.score}
+            color="var(--accent-blue)"
+            data={lastRefreshResult?.breakdown?.trend_quality?.data}
+          />
+
+          {/* 广度/参与度 (20%) */}
+          <ScoreDimensionCard
+            label="广度/参与度"
+            weight="20%"
+            score={lastRefreshResult?.breakdown?.breadth?.score}
+            color="var(--accent-amber)"
+            data={lastRefreshResult?.breakdown?.breadth?.data}
+          />
+
+          {/* 期权确认 (10%) */}
+          <ScoreDimensionCard
+            label="期权确认"
+            weight="10%"
+            score={lastRefreshResult?.breakdown?.options_confirm?.score}
+            color="var(--accent-purple)"
+            data={lastRefreshResult?.breakdown?.options_confirm?.data}
+          />
+        </div>
       </div>
 
       {/* Refresh Progress Section */}
       {showRefreshDetails && (
         <div className="mx-5 mt-4 mb-0">
-          <div 
+          <div
             className="border rounded-[var(--radius-md)] overflow-hidden transition-all"
-            style={{ 
-              borderColor: refreshProgress.stage === 'error' ? 'rgba(239, 68, 68, 0.3)' 
-                : refreshProgress.stage === 'done' ? 'rgba(34, 197, 94, 0.3)' 
+            style={{
+              borderColor: refreshProgress.stage === 'error' ? 'rgba(239, 68, 68, 0.3)'
+                : refreshProgress.stage === 'done' ? 'rgba(34, 197, 94, 0.3)'
                 : 'rgba(59, 130, 246, 0.3)',
-              background: refreshProgress.stage === 'error' ? 'rgba(239, 68, 68, 0.05)' 
-                : refreshProgress.stage === 'done' ? 'rgba(34, 197, 94, 0.05)' 
+              background: refreshProgress.stage === 'error' ? 'rgba(239, 68, 68, 0.05)'
+                : refreshProgress.stage === 'done' ? 'rgba(34, 197, 94, 0.05)'
                 : 'rgba(59, 130, 246, 0.05)',
             }}
           >
@@ -443,10 +566,10 @@ export function ETFDetailCard({
                     <path d="M3 3v5h5" />
                   </svg>
                 )}
-                <span className="text-xs font-medium" style={{ 
-                  color: refreshProgress.stage === 'error' ? 'var(--accent-red)' 
-                    : refreshProgress.stage === 'done' ? 'var(--accent-green)' 
-                    : 'var(--accent-blue)' 
+                <span className="text-xs font-medium" style={{
+                  color: refreshProgress.stage === 'error' ? 'var(--accent-red)'
+                    : refreshProgress.stage === 'done' ? 'var(--accent-green)'
+                    : 'var(--accent-blue)'
                 }}>
                   {refreshProgress.message}
                 </span>
@@ -454,7 +577,7 @@ export function ETFDetailCard({
               <div className="flex items-center gap-2">
                 <span className="text-[10px] text-[var(--text-muted)]">{refreshProgress.progress}%</span>
                 {(refreshProgress.stage === 'done' || refreshProgress.stage === 'error') && (
-                  <button 
+                  <button
                     onClick={() => setShowRefreshDetails(false)}
                     className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
                   >
@@ -465,15 +588,15 @@ export function ETFDetailCard({
                 )}
               </div>
             </div>
-            
+
             {/* Progress Bar */}
             <div className="h-1 bg-[var(--bg-secondary)]">
-              <div 
+              <div
                 className="h-full transition-all duration-300"
-                style={{ 
+                style={{
                   width: `${refreshProgress.progress}%`,
-                  background: refreshProgress.stage === 'error' ? 'var(--accent-red)' 
-                    : refreshProgress.stage === 'done' ? 'var(--accent-green)' 
+                  background: refreshProgress.stage === 'error' ? 'var(--accent-red)'
+                    : refreshProgress.stage === 'done' ? 'var(--accent-green)'
                     : 'var(--accent-blue)',
                 }}
               />
@@ -485,7 +608,7 @@ export function ETFDetailCard({
                 {lastRefreshResult.data_sources && (
                   <div className="flex flex-wrap gap-2 mb-2">
                     {Object.entries(lastRefreshResult.data_sources).map(([source, available]) => (
-                      <span 
+                      <span
                         key={source}
                         className="px-2 py-0.5 rounded text-[10px] font-medium"
                         style={{
@@ -510,54 +633,17 @@ export function ETFDetailCard({
         </div>
       )}
 
-      {/* Data Status List */}
-      <div className="p-5 pt-4">
-        <div className="flex items-center gap-2 text-[13px] text-[var(--text-muted)] mb-2.5">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <path d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4"/>
-          </svg>
-          数据状态
-        </div>
-        <div className="border border-[var(--border-light)] rounded-[var(--radius-md)] overflow-hidden">
-          {etf.dataStatus.map((status, index) => {
-            const config = statusConfig[status.status];
-            return (
-              <div
-                key={index}
-                className="flex items-center justify-between text-xs px-3 py-2.5 border-b border-[var(--border-light)] last:border-0"
-              >
-                <div className="flex items-center gap-2">
-                  <span className="w-1.5 h-1.5 rounded-full" style={{ background: config.textColor }} />
-                  <span className="text-[var(--text-primary)] min-w-[110px]">{status.source}</span>
-                  <span
-                    className="text-[10px] px-1.5 py-0.5 rounded font-medium inline-flex items-center gap-1"
-                    style={{ background: config.bgColor, color: config.textColor }}
-                  >
-                    {config.icon}
-                    {config.label}
-                  </span>
-                </div>
-                <span className="text-[var(--text-muted)]">
-                  {status.updatedAt ? status.updatedAt : '--'}
-                  {status.count !== undefined && ` · ${status.count}条`}
-                </span>
-              </div>
-            );
-          })}
-        </div>
-      </div>
-
       {/* Coverage Tabs - Enhanced Version */}
       {showCoverageSection && (
-        <div className="px-5 pb-5">
-          <div className="pt-4 border-t border-[var(--border-light)]">
+        <div className="px-5 py-5">
+          <div className="pt-0 border-t border-[var(--border-light)]">
             <div className="flex items-center gap-2 text-[13px] text-[var(--text-muted)] mb-3">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <path strokeLinecap="round" strokeLinejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/>
               </svg>
               已导入的覆盖范围（点击切换查看详情）
             </div>
-            
+
             {/* Coverage Tab Buttons */}
             <div className="flex items-center gap-2 flex-wrap mb-3">
               {availableCoverageOptions.map((option) => {
@@ -568,7 +654,7 @@ export function ETFDetailCard({
                     onClick={() => setActiveCoverage(option.id)}
                     className={getCoverageTabStyle(option, isActive)}
                   >
-                    <span 
+                    <span
                       className="w-2 h-2 rounded-full"
                       style={{ background: 'var(--accent-green)' }}
                     />
@@ -583,15 +669,15 @@ export function ETFDetailCard({
               className="border border-[var(--border-light)] rounded-[var(--radius-md)] overflow-hidden"
             >
               {/* Panel Header */}
-              <div 
+              <div
                 className="px-4 py-3 border-b border-[var(--border-light)]"
                 style={{ background: 'linear-gradient(135deg, #fef3c7, #fce7f3)' }}
               >
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
-                    <span 
+                    <span
                       className="px-2.5 py-1 rounded-full text-[11px] font-semibold"
-                      style={{ 
+                      style={{
                         background: 'rgba(255,255,255,0.8)',
                         color: activeOption.id.startsWith('top') ? '#b45309' : '#6d28d9',
                       }}
@@ -629,11 +715,35 @@ export function ETFDetailCard({
                     累计权重 <span className="font-semibold text-[var(--text-primary)]">{formatWeight(coverageSum)}%</span>
                   </span>
                 </div>
-                
+
                 {activeHoldings.length > 0 ? (
                   <div className="flex flex-wrap gap-2">
                     {activeHoldings.map((holding) => {
                       const statusColor = holdingStatusConfig[holding.dataStatus || 'complete'].color;
+                      const completeness = holding.completeness || 0;
+                      const dataSources = holding.dataSources || {};
+
+                      // Data source labels in Chinese
+                      const dataSourceLabels: Record<string, string> = {
+                        finviz: 'Finviz 数据',
+                        market_chameleon: 'MarketChameleon 数据',
+                        market_data: '市场数据 (IBKR)',
+                        options_data: '期权数据 (Futu)',
+                      };
+
+                      // Build tooltip content
+                      const tooltipLines = [];
+                      tooltipLines.push(`完备度: ${Math.round(completeness)}%`);
+
+                      Object.entries(dataSourceLabels).forEach(([key, label]) => {
+                        const available = dataSources[key];
+                        const icon = available ? '✓' : '✗';
+                        const status = available ? '可用' : '缺失';
+                        tooltipLines.push(`${icon} ${label}: ${status}`);
+                      });
+
+                      const tooltipText = tooltipLines.join('\n');
+
                       return (
                         <div
                           key={holding.ticker}
@@ -641,13 +751,54 @@ export function ETFDetailCard({
                           className={`px-2.5 py-1.5 text-xs rounded-lg border border-[var(--border-light)] bg-white flex items-center gap-2 transition-all ${
                             onViewStockDetail ? 'cursor-pointer hover:border-[var(--accent-blue)] hover:shadow-sm' : ''
                           }`}
+                          title={tooltipText}
                         >
-                          <span 
-                            className="w-1.5 h-1.5 rounded-full" 
-                            style={{ background: statusColor }}
-                          />
-                          <span className="font-semibold text-[var(--text-primary)]">{holding.ticker}</span>
-                          <span className="text-[var(--text-muted)]">{formatWeight(holding.weight)}%</span>
+                          {/* Status indicator with completeness ring */}
+                          <div className="relative w-3 h-3 flex-shrink-0">
+                            <div
+                              className="w-1.5 h-1.5 rounded-full absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2"
+                              style={{ background: statusColor }}
+                            />
+                            {/* Completeness ring */}
+                            {completeness < 100 && (
+                              <svg className="absolute inset-0" viewBox="0 0 12 12">
+                                <circle
+                                  cx="6"
+                                  cy="6"
+                                  r="5"
+                                  fill="none"
+                                  stroke={
+                                    completeness >= 80
+                                      ? 'var(--accent-green)'
+                                      : completeness >= 50
+                                      ? 'var(--accent-amber)'
+                                      : 'var(--accent-red)'
+                                  }
+                                  strokeWidth="1"
+                                  opacity="0.3"
+                                />
+                              </svg>
+                            )}
+                          </div>
+
+                          <span className="font-semibold text-[var(--text-primary)]">
+                            {holding.ticker}
+                          </span>
+                          <span className="text-[var(--text-muted)]">
+                            {formatWeight(holding.weight)}%
+                          </span>
+
+                          {/* Show completeness percentage for non-complete items */}
+                          {holding.dataStatus === 'pending' && (
+                            <span className="text-[10px] text-[var(--accent-amber)] font-medium ml-auto">
+                              {Math.round(completeness)}%
+                            </span>
+                          )}
+                          {holding.dataStatus === 'missing' && (
+                            <span className="text-[10px] text-[var(--accent-red)] font-medium ml-auto">
+                              {Math.round(completeness)}%
+                            </span>
+                          )}
                         </div>
                       );
                     })}
@@ -661,7 +812,7 @@ export function ETFDetailCard({
                 {/* View All Link */}
                 {activeHoldings.length > 0 && onViewStockDetail && (
                   <div className="mt-3 pt-3 border-t border-[var(--border-light)]">
-                    <button 
+                    <button
                       className="text-xs text-[var(--accent-blue)] hover:underline flex items-center gap-1"
                       onClick={() => {
                         // Navigate to stock details page
@@ -677,25 +828,73 @@ export function ETFDetailCard({
               </div>
             </div>
           </div>
+          {/* Data Status List */}
+      <div className="pt-4">
+        <div className="flex items-center gap-2 text-[13px] text-[var(--text-muted)] mb-2.5">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4"/>
+          </svg>
+          数据状态
+        </div>
+        <div className="border border-[var(--border-light)] rounded-[var(--radius-md)] overflow-hidden">
+          {etf.dataStatus.map((status, index) => {
+            const config = statusConfig[status.status];
+            return (
+              <div
+                key={index}
+                className="flex items-center justify-between text-xs px-3 py-2.5 border-b border-[var(--border-light)] last:border-0"
+              >
+                <div className="flex items-center gap-2">
+                  <span className="w-1.5 h-1.5 rounded-full" style={{ background: config.textColor }} />
+                  <span className="text-[var(--text-primary)] min-w-[110px]">{status.source}</span>
+                  <span
+                    className="text-[10px] px-1.5 py-0.5 rounded font-medium inline-flex items-center gap-1"
+                    style={{ background: config.bgColor, color: config.textColor }}
+                  >
+                    {config.icon}
+                    {config.label}
+                  </span>
+                </div>
+                <span className="text-[var(--text-muted)]">
+                  {status.updatedAt ? status.updatedAt : '--'}
+                  {status.count !== undefined && ` · ${status.count}条`}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
         </div>
       )}
-
       {/* Action Buttons - Footer */}
       <div className="flex gap-3 px-5 py-4 border-t border-[var(--border-light)] bg-[var(--bg-secondary)]">
-        <button
+        {/* <button
           onClick={handleRefreshETF}
-          className="flex-1 py-2.5 text-xs font-medium rounded-[var(--radius-md)] cursor-pointer text-center bg-[var(--bg-primary)] border border-[var(--border-light)] text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] hover:border-[var(--border-medium)] transition-colors flex items-center justify-center gap-1.5"
+          disabled={isRefreshing}
+          className={`flex-1 py-2.5 text-xs font-medium rounded-[var(--radius-md)] cursor-pointer text-center bg-[var(--bg-primary)] border border-[var(--border-light)] text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] hover:border-[var(--border-medium)] transition-colors flex items-center justify-center gap-1.5 ${
+            isRefreshing ? 'opacity-60 cursor-not-allowed' : ''
+          }`}
         >
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
-            <path d="M3 3v5h5" />
-            <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
-            <path d="M16 16h5v5" />
-          </svg>
-          刷新数据
-        </button>
+          {isRefreshing ? '刷新中...' : 'Refresh Holdings '}
+        </button> */}
+        {/* Refresh Holdings Button */}
+        
+          <button
+            onClick={() => handleRefreshHoldings()}
+            disabled={activeHoldings.length > 0}
+            className={`flex-1 py-2.5 text-xs font-medium rounded-[var(--radius-md)] border transition-colors flex items-center justify-center gap-1.5 ${
+              holdingsRefreshState.isLoading ? 'opacity-60 cursor-not-allowed' : ''
+            }`}
+            style={{
+              background: 'rgba(59, 130, 246, 0.08)',
+              borderColor: 'rgba(59, 130, 246, 0.3)',
+              color: 'var(--accent-blue)',
+            }}
+          >
+            {holdingsRefreshState.isLoading ? '刷新中...' : `刷新 ${activeOption.label} Holdings 数据`}
+          </button>
         <button
-          onClick={onImportHoldings}
+          onClick={() => onImportHoldings?.(activeCoverage)}
           className="flex-1 py-2.5 text-xs font-medium rounded-[var(--radius-md)] cursor-pointer text-center border transition-colors flex items-center justify-center gap-1.5"
           style={{
             background: 'rgba(245, 158, 11, 0.1)',
@@ -703,23 +902,8 @@ export function ETFDetailCard({
             color: 'var(--accent-amber)',
           }}
         >
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/>
-          </svg>
-          导入 Holdings 数据
+          Export Holdings
         </button>
-        {onViewStockDetail && (
-          <button
-            onClick={() => onViewStockDetail(etf.symbol)}
-            className="py-2.5 px-4 text-xs font-medium rounded-[var(--radius-md)] cursor-pointer text-center transition-colors flex items-center justify-center gap-1.5 text-[var(--accent-blue)] hover:bg-[var(--bg-tertiary)]"
-          >
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/>
-            </svg>
-            查看个股详情
-          </button>
-        )}
       </div>
     </div>
   );

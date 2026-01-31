@@ -12,6 +12,15 @@ import structlog
 _CONFIGURED = False
 
 
+class _UvicornNoiseFilter(logging.Filter):
+    """Filter out routine uvicorn info/debug logs while keeping warnings/errors."""
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: D401 - short and clear
+        if record.name.startswith("uvicorn"):
+            return record.levelno >= logging.WARNING
+        return True
+
+
 def _get_log_level() -> int:
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     return logging._nameToLevel.get(level_name, logging.INFO)
@@ -47,6 +56,7 @@ def configure_logging() -> None:
     level = _get_log_level()
     pre_chain = _get_pre_chain()
     renderer = _get_renderer()
+    noise_filter = _UvicornNoiseFilter()
 
     formatter = structlog.stdlib.ProcessorFormatter(
         processor=renderer,
@@ -60,14 +70,17 @@ def configure_logging() -> None:
         handler = logging.StreamHandler(sys.stdout)
         handler.setLevel(level)
         handler.setFormatter(formatter)
+        handler.addFilter(noise_filter)
         root_logger.addHandler(handler)
     else:
         for handler in root_logger.handlers:
             handler.setFormatter(formatter)
+            handler.addFilter(noise_filter)
 
     for logger_name in ("uvicorn", "uvicorn.error"):
         lib_logger = logging.getLogger(logger_name)
         lib_logger.handlers.clear()
+        lib_logger.setLevel(logging.WARNING)
         lib_logger.propagate = True
 
     access_logger = logging.getLogger("uvicorn.access")

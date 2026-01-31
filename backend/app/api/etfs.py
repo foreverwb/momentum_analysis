@@ -20,6 +20,34 @@ router = APIRouter()
 
 def format_etf_response(etf: ETF, include_holdings: bool = False) -> dict:
     """格式化 ETF 响应数据"""
+
+    # 从持仓数据动态计算 coverageRanges
+    coverage_ranges = []
+    if etf.holdings:
+        # 获取最新日期的持仓
+        latest_date = max(h.data_date for h in etf.holdings) if etf.holdings else None
+        if latest_date:
+            holdings_for_date = [h for h in etf.holdings if h.data_date == latest_date]
+
+            # 检查是否有足够的持仓数据来确定覆盖范围
+            if holdings_for_date:
+                total_holdings = len(holdings_for_date)
+                total_weight = sum(h.weight for h in holdings_for_date)
+
+                # 检查可能的 Top 覆盖范围
+                for top_n in [10, 15, 20, 30]:
+                    if total_holdings >= top_n:
+                        coverage_ranges.append(f'top{top_n}')
+
+                # 检查可能的 Weight 覆盖范围
+                for weight_pct in [60, 65, 70, 75, 80, 85]:
+                    accumulated_weight = 0
+                    for h in sorted(holdings_for_date, key=lambda x: x.weight, reverse=True):
+                        accumulated_weight += h.weight
+                        if accumulated_weight >= weight_pct:
+                            coverage_ranges.append(f'weight{weight_pct}')
+                            break
+
     result = {
         "id": etf.id,
         "symbol": etf.symbol,
@@ -30,12 +58,12 @@ def format_etf_response(etf: ETF, include_holdings: bool = False) -> dict:
         "delta": etf.delta or {"delta3d": None, "delta5d": None},
         "completeness": etf.completeness or 0.0,
         "holdingsCount": etf.holdings_count or 0,
-        "coverageRanges": getattr(etf, 'coverage_ranges', None) or []
+        "coverageRanges": list(set(coverage_ranges))  # 去除重复
     }
-    
+
     if etf.type == "industry" and etf.parent_sector:
         result["parentSector"] = etf.parent_sector
-    
+
     if include_holdings and etf.holdings:
         # 只返回最新日期的持仓
         latest_date = max(h.data_date for h in etf.holdings) if etf.holdings else None
@@ -44,7 +72,7 @@ def format_etf_response(etf: ETF, include_holdings: bool = False) -> dict:
                 {"ticker": h.ticker, "weight": h.weight}
                 for h in etf.holdings if h.data_date == latest_date
             ]
-    
+
     return result
 
 
@@ -861,4 +889,240 @@ async def get_refresh_requirements():
             "3. 刷新单个 ETF: POST /api/etfs/symbol/{symbol}/refresh",
             "4. 批量刷新: POST /api/etfs/batch-refresh?etf_type=sector"
         ]
+    }
+
+
+@router.post("/symbol/{symbol}/refresh-holdings-by-coverage")
+async def refresh_holdings_by_coverage(
+    symbol: str,
+    coverage_type: str,
+    coverage_value: int,
+    db: Session = Depends(get_db)
+):
+    """
+    基于覆盖范围刷新 ETF 持仓股票数据
+
+    参数:
+    - symbol: ETF 符号
+    - coverage_type: 覆盖范围类型 ("top" 或 "weight")
+    - coverage_value: 覆盖范围值 (如果 type=top 则为数字如 10、15；如果 type=weight 则为百分比如 60、70)
+
+    返回:
+    {
+      "status": "success|error",
+      "symbol": "XLK",
+      "coverage": "top10",
+      "stocks_count": 10,
+      "total_weight": 42.5,
+      "completeness": {
+        "coverage": "top10",
+        "total_stocks": 10,
+        "complete_count": 8,
+        "pending_count": 2,
+        "missing_count": 0,
+        "average_completeness": 85.5
+      },
+      "updated_stocks": [
+        {
+          "ticker": "MSFT",
+          "weight": 5.2,
+          "price": 420.50,
+          "change_1d": 1.2,
+          "data_sources": ["ibkr"],
+          "data_status": "complete",
+          "completeness": 95.0,
+          "updated_at": "2026-01-30T10:00:00Z"
+        }
+      ],
+      "updated_at": "2026-01-30T10:00:00Z",
+      "message": "已刷新 10 只持仓股票数据"
+    }
+    """
+    from app.services.calculators.data_completeness import DataCompletenessCalculator
+
+    etf = db.query(ETF).filter(ETF.symbol == symbol.upper()).first()
+
+    if not etf:
+        raise HTTPException(status_code=404, detail=f"ETF '{symbol}' not found")
+
+    # 获取最新的持仓数据
+    from sqlalchemy import func
+    latest_date = db.query(func.max(ETFHolding.data_date)).filter(
+        ETFHolding.etf_symbol == symbol.upper()
+    ).scalar()
+
+    if not latest_date:
+        raise HTTPException(status_code=404, detail=f"No holdings data found for {symbol}")
+
+    # 获取持仓列表，按权重排序
+    holdings_query = db.query(ETFHolding).filter(
+        ETFHolding.etf_symbol == symbol.upper(),
+        ETFHolding.data_date == latest_date
+    ).order_by(ETFHolding.weight.desc())
+
+    all_holdings = holdings_query.all()
+
+    # 根据覆盖范围过滤
+    filtered_holdings = []
+
+    if coverage_type.lower() == "top":
+        # Top N: 取前 N 只
+        filtered_holdings = all_holdings[:coverage_value]
+    elif coverage_type.lower() == "weight":
+        # Weight X%: 取权重累积到 X% 的股票
+        accumulated_weight = 0
+        for holding in all_holdings:
+            filtered_holdings.append(holding)
+            accumulated_weight += holding.weight
+            if accumulated_weight >= coverage_value:
+                break
+    else:
+        raise HTTPException(status_code=400, detail=f"Invalid coverage_type: {coverage_type}")
+
+    # 并发获取股票数据
+    from app.services.orchestrator import get_orchestrator
+    orchestrator = get_orchestrator()
+
+    updated_stocks = []
+    stock_semaphore = asyncio.Semaphore(5)  # 限制并发数为 5
+
+    async def fetch_stock_data(holding: ETFHolding):
+        async with stock_semaphore:
+            try:
+                # 从 IBKR 获取价格数据
+                price_data = None
+                change_1d = None
+                volume_data = None
+                data_sources = []
+
+                if orchestrator._ibkr and orchestrator._ibkr.is_connected:
+                    try:
+                        # 获取股票的日线数据
+                        stock_df = orchestrator._ibkr.get_ohlcv_data(holding.ticker, '1 D')
+                        if stock_df is not None and not stock_df.empty:
+                            latest_row = stock_df.iloc[-1]
+                            price_data = float(latest_row.get('close', 0))
+                            volume_data = float(latest_row.get('volume', 0))
+                            data_sources.append('ibkr')
+
+                            # 计算 1 日涨跌幅
+                            if len(stock_df) >= 2:
+                                prev_close = float(stock_df.iloc[-2].get('close', 0))
+                                if prev_close > 0:
+                                    change_1d = ((price_data - prev_close) / prev_close) * 100
+                    except Exception as e:
+                        logger.warning(f"Failed to get price data for {holding.ticker}: {e}")
+
+                # 从 Futu 获取 IV 数据（可选）
+                iv30 = None
+                if orchestrator._futu and orchestrator._futu.is_connected:
+                    try:
+                        iv_results = orchestrator._futu.fetch_iv_terms([holding.ticker], max_days=120)
+                        if holding.ticker in iv_results:
+                            iv_data = iv_results[holding.ticker]
+                            if iv_data.is_valid():
+                                iv30 = iv_data.iv30
+                                data_sources.append('futu')
+                    except Exception as e:
+                        logger.warning(f"Failed to get IV data for {holding.ticker}: {e}")
+
+                # 构建持仓数据字典用于完整度评估
+                holding_data = {
+                    'price_data': price_data,
+                    'volume': volume_data,
+                    'change_1d': change_1d,
+                    'iv30': iv30,
+                    'data_sources': data_sources,
+                    'updated_at': datetime.utcnow().isoformat()
+                }
+
+                return {
+                    "ticker": holding.ticker,
+                    "weight": holding.weight,
+                    "price": price_data,
+                    "change_1d": change_1d,
+                    "data_sources": data_sources,
+                    "iv30": iv30,
+                    "holding_data": holding_data,
+                    "updated_at": datetime.utcnow().isoformat()
+                }
+
+            except Exception as e:
+                logger.error(f"Error fetching data for {holding.ticker}: {e}")
+                return {
+                    "ticker": holding.ticker,
+                    "weight": holding.weight,
+                    "price": None,
+                    "change_1d": None,
+                    "data_sources": [],
+                    "iv30": None,
+                    "holding_data": {
+                        'price_data': None,
+                        'volume': None,
+                        'change_1d': None,
+                        'iv30': None,
+                        'data_sources': [],
+                        'updated_at': datetime.utcnow().isoformat()
+                    },
+                    "updated_at": datetime.utcnow().isoformat()
+                }
+
+    # 并发获取所有股票数据
+    tasks = [fetch_stock_data(h) for h in filtered_holdings]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # 计算数据完整度
+    completeness_calculator = DataCompletenessCalculator(db)
+
+    for result in results:
+        if isinstance(result, dict):
+            holding_data = result.pop('holding_data', {})
+
+            # 计算单只持仓的完整度
+            completeness_status = completeness_calculator.calculate_holding_data_completeness(
+                result['ticker'],
+                holding_data
+            )
+
+            # 添加完整度信息到结果
+            result['data_status'] = completeness_status.status
+            result['completeness'] = completeness_status.completeness_score
+
+            updated_stocks.append(result)
+
+    # 评估覆盖范围的整体完整度
+    holdings_with_data = [
+        {
+            'ticker': stock['ticker'],
+            'weight': stock['weight'],
+            'price_data': stock['price'],
+            'volume': None,  # 不需要用于完整度评估
+            'change_1d': stock['change_1d'],
+            'iv30': stock.get('iv30'),
+            'data_sources': stock['data_sources'],
+            'updated_at': stock['updated_at']
+        }
+        for stock in updated_stocks
+    ]
+
+    coverage_completeness = completeness_calculator.assess_coverage_range_completeness(
+        symbol.upper(),
+        coverage_type.lower(),
+        coverage_value,
+        holdings_with_data
+    )
+
+    coverage_label = f"{coverage_type.lower()}{coverage_value}"
+    total_weight = sum(h.weight for h in filtered_holdings)
+
+    return {
+        "status": "success",
+        "symbol": symbol.upper(),
+        "coverage": coverage_label,
+        "stocks_count": len(filtered_holdings),
+        "total_weight": round(total_weight, 2),
+        "completeness": coverage_completeness.to_dict(),
+        "updated_stocks": updated_stocks,
+        "updated_at": datetime.utcnow().isoformat(),
+        "message": f"已刷新 {len(filtered_holdings)} 只持仓股票数据，平均完备度 {round(coverage_completeness.average_completeness, 1)}%"
     }

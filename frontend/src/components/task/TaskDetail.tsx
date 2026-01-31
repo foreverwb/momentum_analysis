@@ -73,13 +73,23 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
   const [holdingsModalOpen, setHoldingsModalOpen] = useState(false);
   const [etfModalOpen, setETFModalOpen] = useState(false);
   const [selectedETF, setSelectedETF] = useState<string>('');
+  const [selectedCoverage, setSelectedCoverage] = useState<string | undefined>();
   const [coverageRangesByETF, setCoverageRangesByETF] = useState<Record<string, string[]>>({});
-  
+
   // API 数据状态
   const [etfDetails, setEtfDetails] = useState<ETFDetailData[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
   const [trendData, setTrendData] = useState<TrendDataPoint[]>([]);
+
+  // WebSocket 刷新全部状态
+  const [isRefreshingAll, setIsRefreshingAll] = useState(false);
+  const [refreshProgress, setRefreshProgress] = useState({
+    completed: 0,
+    total: 0,
+    currentETF: '',
+    message: '',
+  });
 
   // 加载 ETF 数据
   useEffect(() => {
@@ -217,8 +227,55 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
   };
 
 
-  const handleRefreshAll = () => {
-    loadETFData();
+  const handleRefreshAll = async () => {
+    setIsRefreshingAll(true);
+    setRefreshProgress({ completed: 0, total: task.etfs.length, currentETF: '', message: '准备刷新...' });
+
+    // 导入 WebSocket 连接函数
+    const { connectToRefreshStream, RefreshProgressMessage } = await import('../../services/api');
+
+    // 建立 WebSocket 连接
+    const ws = connectToRefreshStream(
+      task.id,
+      (message) => {
+        // 处理进度消息
+        if (message.event === 'progress') {
+          setRefreshProgress({
+            completed: message.completed_count || 0,
+            total: message.total_count || task.etfs.length,
+            currentETF: message.etf_symbol || '',
+            message: message.message || '',
+          });
+        } else if (message.event === 'completed') {
+          setRefreshProgress({
+            completed: message.total_count || task.etfs.length,
+            total: message.total_count || task.etfs.length,
+            currentETF: '',
+            message: '刷新完成！',
+          });
+
+          // 延迟后重新加载数据
+          setTimeout(() => {
+            loadETFData();
+            setIsRefreshingAll(false);
+          }, 1000);
+        } else if (message.event === 'error') {
+          console.error('Refresh error:', message.message);
+          alert(`刷新失败: ${message.message}`);
+          setIsRefreshingAll(false);
+          ws.close();
+        }
+      },
+      (error) => {
+        console.error('WebSocket error:', error);
+        alert('WebSocket 连接错误');
+        setIsRefreshingAll(false);
+      },
+      () => {
+        console.log('WebSocket closed');
+        setIsRefreshingAll(false);
+      }
+    );
   };
 
   const handleRefreshETF = async (symbol: string) => {
@@ -236,19 +293,37 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
     }
   };
 
-  const handleRefreshHoldings = async (symbol: string) => {
+  const handleRefreshHoldings = async (symbol: string, coverageId: string) => {
     try {
-      const response = await api.refreshHoldingsData(symbol);
+      // 解析 coverageId (如 "top10", "weight70")
+      const isTop = coverageId.startsWith('top');
+      const coverageType = isTop ? 'top' : 'weight';
+      const valueStr = coverageId.replace('top', '').replace('weight', '');
+      const coverageValue = parseInt(valueStr, 10);
+
+      if (isNaN(coverageValue)) {
+        alert('无效的覆盖范围值');
+        return;
+      }
+
+      const response = await api.refreshHoldingsByCoverage(symbol, coverageType, coverageValue);
       console.log('Refresh holdings response:', response);
-      loadETFData();
+
+      alert(`成功刷新 ${symbol} 的 ${coverageId} Holdings 数据！`);
+
+      // 延迟后重新加载数据
+      setTimeout(() => {
+        loadETFData();
+      }, 500);
     } catch (e) {
       console.error('Failed to refresh holdings:', e);
-      alert(`刷新 ${symbol} Holdings 数据失败`);
+      alert(`刷新 ${symbol} Holdings 数据失败: ${e instanceof Error ? e.message : '未知错误'}`);
     }
   };
 
-  const handleOpenHoldingsModal = (symbol: string) => {
+  const handleOpenHoldingsModal = (symbol: string, coverageId?: string) => {
     setSelectedETF(symbol);
+    setSelectedCoverage(coverageId);
     setHoldingsModalOpen(true);
   };
 
@@ -303,9 +378,20 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
         <div className="flex items-center gap-3">
           <button
             onClick={handleRefreshAll}
-            className="px-4 py-2 text-sm font-medium rounded-[var(--radius-sm)] bg-[var(--accent-blue)] text-white hover:bg-blue-600 transition-colors flex items-center gap-2"
+            disabled={isRefreshingAll}
+            className="px-4 py-2 text-sm font-medium rounded-[var(--radius-sm)] bg-[var(--accent-blue)] text-white hover:bg-blue-600 transition-colors flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            刷新全部
+            {isRefreshingAll ? (
+              <>
+                <svg className="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                刷新中 ({refreshProgress.completed}/{refreshProgress.total})
+              </>
+            ) : (
+              'Refresh ETF'
+            )}
           </button>
           <button
             onClick={handleOpenETFImport}
@@ -318,6 +404,38 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
           </button>
         </div>
       </div>
+
+      {/* Refresh Progress Display */}
+      {isRefreshingAll && (
+        <div className="mb-6 bg-[var(--bg-primary)] border border-[var(--border-light)] rounded-[var(--radius-lg)] p-5">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-base font-semibold">刷新进度</h3>
+            <span className="text-sm text-[var(--text-muted)]">
+              {refreshProgress.completed} / {refreshProgress.total} ETF
+            </span>
+          </div>
+
+          <div className="mb-2">
+            <div className="w-full bg-[var(--bg-secondary)] rounded-full h-2 overflow-hidden">
+              <div
+                className="h-full bg-gradient-to-r from-[var(--accent-blue)] to-[var(--accent-purple)] transition-all duration-300"
+                style={{
+                  width: `${refreshProgress.total > 0 ? (refreshProgress.completed / refreshProgress.total) * 100 : 0}%`,
+                }}
+              />
+            </div>
+          </div>
+
+          <div className="text-sm text-[var(--text-muted)]">
+            {refreshProgress.currentETF && (
+              <p>当前: <span className="font-medium text-[var(--text-primary)]">{refreshProgress.currentETF}</span></p>
+            )}
+            {refreshProgress.message && (
+              <p className="mt-1">{refreshProgress.message}</p>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Trend Chart Section */}
       <div className="mb-6">
@@ -373,7 +491,7 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-base font-semibold">监控ETF ({task.etfs.length})</h3>
         </div>
-        <div className="grid grid-cols-2 gap-5">
+        <div className="grid grid-cols-3 gap-5">
           {etfDetails.map((etf) => {
             // 合并后端返回的 coverageRanges 和本地状态
             const backendRanges = etf.coverageRanges || [];
@@ -388,8 +506,8 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
                 onRefreshETF={async () => {
                   return await handleRefreshETF(etf.symbol);
                 }}
-                onRefreshHoldings={() => handleRefreshHoldings(etf.symbol)}
-                onImportHoldings={() => handleOpenHoldingsModal(etf.symbol)}
+                onRefreshHoldings={(coverageId: string) => handleRefreshHoldings(etf.symbol, coverageId)}
+                onImportHoldings={(coverageId?: string) => handleOpenHoldingsModal(etf.symbol, coverageId)}
                 onViewStockDetail={(ticker) => {
                   console.log('View stock detail:', ticker);
                   // TODO: Navigate to stock detail page

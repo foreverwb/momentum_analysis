@@ -126,19 +126,33 @@ from .regime_gate import (
     get_quick_regime,
 )
 
+# 数据完整度计算器
+from .data_completeness import (
+    DataCompletenessCalculator,
+    HoldingDataStatus,
+    CoverageRangeCompleteness,
+    DataSourceStatus,
+)
+
 __all__ += [
     # ETF 评分
     'ETFScoreCalculator',
     'create_etf_calculator',
     'SECTOR_ETFS',
     'INDUSTRY_ETFS',
-    
+
     # 个股评分
     'StockScoreCalculator',
     'create_stock_calculator',
-    
+
     # Regime Gate
     'RegimeGateCalculator',
     'create_regime_calculator',
     'get_quick_regime',
+
+    # 数据完整度
+    'DataCompletenessCalculator',
+    'HoldingDataStatus',
+    'CoverageRangeCompleteness',
+    'DataSourceStatus',
 ]
