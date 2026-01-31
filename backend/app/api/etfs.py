@@ -618,6 +618,8 @@ async def refresh_etf_data(
     db.commit()
     
     # ==================== 5. 返回结果 ====================
+    normalized_sources = {key: bool(value) for key, value in data_sources.items()}
+
     return {
         "status": "success",
         "symbol": etf.symbol,
@@ -633,7 +635,7 @@ async def refresh_etf_data(
             "breadth": score_result['breadth'],
             "options_confirm": score_result['options_confirm']
         },
-        "data_sources": data_sources,
+        "data_sources": normalized_sources,
         "warnings": warnings if warnings else None
     }
 

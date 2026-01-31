@@ -205,26 +205,26 @@ function getTrendLevelColor(level: string): string {
 export function CoreTerminal() {
   const [selectedSector, setSelectedSector] = useState<string>('XLK');
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const [snapshot, setSnapshot] = useState<{
-    timestamp?: string;
-    broker_status?: Record<string, unknown>;
+  const [marketStatus, setMarketStatus] = useState<{
+    spy?: { price?: number; vs200ma?: string; trend?: string };
+    vix?: number;
   } | null>(null);
-  const [snapshotError, setSnapshotError] = useState<string | null>(null);
+  const [marketStatusError, setMarketStatusError] = useState<string | null>(null);
 
   const currentSectorDetail = sectorDetails[selectedSector] || sectorDetails['XLK'];
 
   const handleRefresh = async () => {
     setIsRefreshing(true);
-    setSnapshotError(null);
+    setMarketStatusError(null);
     try {
-      const response = await api.getMarketSnapshot();
-      setSnapshot({
-        timestamp: response.timestamp,
-        broker_status: response.broker_status,
+      const response = await api.getMarketRegime();
+      setMarketStatus({
+        spy: response.spy,
+        vix: response.vix,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : '刷新失败';
-      setSnapshotError(message);
+      setMarketStatusError(message);
     } finally {
       setIsRefreshing(false);
     }
@@ -248,20 +248,20 @@ export function CoreTerminal() {
         </button>
       </div>
 
-      {/* Snapshot Quick Status */}
+      {/* Market Quick Status */}
       <div className="mb-6 rounded-xl border border-slate-200 bg-white p-4 text-sm text-slate-700">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <div className="text-xs uppercase text-slate-400">后端快照</div>
+            <div className="text-xs uppercase text-slate-400">市场快照</div>
             <div className="font-semibold">
-              {snapshot?.timestamp ? new Date(snapshot.timestamp).toLocaleString() : '尚未刷新'}
+              {marketStatus?.spy?.price ? `SPY $${marketStatus.spy.price}` : '尚未刷新'}
             </div>
           </div>
           <div className="flex flex-wrap gap-3 text-xs text-slate-500">
-            <span>IBKR: {String((snapshot?.broker_status as { ibkr?: { is_connected?: boolean } })?.ibkr?.is_connected ?? '未知')}</span>
-            <span>Futu: {String((snapshot?.broker_status as { futu?: { is_connected?: boolean } })?.futu?.is_connected ?? '未知')}</span>
+            <span>VIX: {marketStatus?.vix ?? '--'}</span>
+            <span>vs 200MA: {marketStatus?.spy?.vs200ma ?? '--'}</span>
           </div>
-          {snapshotError && <div className="text-xs text-red-500">{snapshotError}</div>}
+          {marketStatusError && <div className="text-xs text-red-500">{marketStatusError}</div>}
         </div>
       </div>
 
