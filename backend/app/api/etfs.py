@@ -4,11 +4,15 @@ ETF API 端点
 集成 IBKR/Futu API 获取实时数据并计算评分
 """
 
+import asyncio
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from typing import List, Optional
 from datetime import date, datetime
+from pydantic import BaseModel
 
 from app.models import (
     get_db, ETF, ETFHolding, VALID_SECTOR_SYMBOLS,
@@ -16,6 +20,14 @@ from app.models import (
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+class HoldingsCoverageRequest(BaseModel):
+    coverage_type: str
+    coverage_value: int
+    sources: Optional[List[str]] = None
+    concurrent: Optional[bool] = None
 
 
 def format_etf_response(etf: ETF, include_holdings: bool = False) -> dict:
@@ -895,8 +907,7 @@ async def get_refresh_requirements():
 @router.post("/symbol/{symbol}/refresh-holdings-by-coverage")
 async def refresh_holdings_by_coverage(
     symbol: str,
-    coverage_type: str,
-    coverage_value: int,
+    request: HoldingsCoverageRequest,
     db: Session = Depends(get_db)
 ):
     """
@@ -945,6 +956,9 @@ async def refresh_holdings_by_coverage(
     if not etf:
         raise HTTPException(status_code=404, detail=f"ETF '{symbol}' not found")
 
+    coverage_type = request.coverage_type
+    coverage_value = request.coverage_value
+
     # 获取最新的持仓数据
     from sqlalchemy import func
     latest_date = db.query(func.max(ETFHolding.data_date)).filter(
@@ -983,6 +997,19 @@ async def refresh_holdings_by_coverage(
     from app.services.orchestrator import get_orchestrator
     orchestrator = get_orchestrator()
 
+    broker_status = orchestrator.get_broker_status()
+    if not broker_status.get("ibkr", {}).get("is_connected", False):
+        try:
+            await orchestrator.connect_ibkr()
+        except Exception as e:
+            logger.warning(f"IBKR connect failed: {e}")
+
+    if not broker_status.get("futu", {}).get("is_connected", False):
+        try:
+            await orchestrator.connect_futu()
+        except Exception as e:
+            logger.warning(f"Futu connect failed: {e}")
+
     updated_stocks = []
     stock_semaphore = asyncio.Semaphore(5)  # 限制并发数为 5
 
@@ -995,10 +1022,10 @@ async def refresh_holdings_by_coverage(
                 volume_data = None
                 data_sources = []
 
-                if orchestrator._ibkr and orchestrator._ibkr.is_connected:
+                if orchestrator._ibkr and orchestrator._ibkr.is_connected():
                     try:
                         # 获取股票的日线数据
-                        stock_df = orchestrator._ibkr.get_ohlcv_data(holding.ticker, '1 D')
+                        stock_df = orchestrator._ibkr.get_ohlcv_data(holding.ticker, '5 D')
                         if stock_df is not None and not stock_df.empty:
                             latest_row = stock_df.iloc[-1]
                             price_data = float(latest_row.get('close', 0))
@@ -1015,7 +1042,7 @@ async def refresh_holdings_by_coverage(
 
                 # 从 Futu 获取 IV 数据（可选）
                 iv30 = None
-                if orchestrator._futu and orchestrator._futu.is_connected:
+                if orchestrator._futu and orchestrator._futu.is_connected():
                     try:
                         iv_results = orchestrator._futu.fetch_iv_terms([holding.ticker], max_days=120)
                         if holding.ticker in iv_results:

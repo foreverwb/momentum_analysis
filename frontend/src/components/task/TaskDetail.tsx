@@ -235,92 +235,29 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
     setShowRefreshModal(true);
     setRefreshComplete(false);
     setRefreshError(false);
-    setRefreshProgress({ completed: 0, total: task.etfs.length, currentETF: '', message: '准备刷新...' });
+    setRefreshProgress({ completed: 0, total: task.etfs.length, currentETF: '', message: '已发送刷新请求...' });
 
-    // 导入 WebSocket 连接函数
-    const { connectToRefreshStream } = await import('../../services/api');
-
-    // 建立 WebSocket 连接
-    const ws = connectToRefreshStream(
-      task.id,
-      (message) => {
-        // 处理进度消息
-        if (message.event === 'progress') {
-          setRefreshProgress({
-            completed: message.completed_count || 0,
-            total: message.total_count || task.etfs.length,
-            currentETF: message.etf_symbol || '',
-            message: message.message || '',
-          });
-        } else if (message.event === 'completed') {
-          setRefreshProgress({
-            completed: message.total_count || task.etfs.length,
-            total: message.total_count || task.etfs.length,
-            currentETF: '',
-            message: '刷新完成！',
-          });
-          setRefreshComplete(true);
-
-          // 延迟后重新加载数据和关闭模态框
-          setTimeout(() => {
-            loadETFData();
-            setIsRefreshingAll(false);
-            setTimeout(() => {
-              setShowRefreshModal(false);
-            }, 1500);
-          }, 800);
-        } else if (message.event === 'error') {
-          console.error('Refresh error:', message.message);
-          setRefreshError(true);
-          setRefreshProgress({
-            completed: refreshProgress.completed,
-            total: refreshProgress.total,
-            currentETF: '',
-            message: `刷新失败: ${message.message}`,
-          });
-          setIsRefreshingAll(false);
-          ws.close();
-
-          setTimeout(() => {
-            setShowRefreshModal(false);
-          }, 2000);
-        }
-      },
-      (error) => {
-        console.error('WebSocket error:', error);
-        setRefreshError(true);
-        setRefreshProgress({
-          completed: refreshProgress.completed,
-          total: refreshProgress.total,
-          currentETF: '',
-          message: 'WebSocket 连接错误',
-        });
-        setIsRefreshingAll(false);
-        setTimeout(() => {
-          setShowRefreshModal(false);
-        }, 2000);
-      },
-      () => {
-        console.log('WebSocket closed');
-        if (!refreshComplete && !refreshError) {
-          setIsRefreshingAll(false);
-        }
-      }
-    );
-  };
-
-  const handleRefreshETF = async (symbol: string) => {
     try {
-      const response = await api.refreshETFData(symbol);
-      console.log('Refresh ETF response:', response);
-      // 延迟加载数据，让用户看到结果
+      const resp = await api.refreshTaskAllETFs(task.id);
+      setRefreshProgress({
+        completed: resp.completed ?? task.etfs.length,
+        total: resp.total ?? task.etfs.length,
+        currentETF: '',
+        message: resp.message || '刷新完成！',
+      });
+      setRefreshComplete(true);
+
       setTimeout(() => {
         loadETFData();
-      }, 1500);
-      return response;
+        setShowRefreshModal(false);
+      }, 1200);
     } catch (e) {
-      console.error('Failed to refresh ETF:', e);
-      throw e;
+      const msg = e instanceof Error ? e.message : '刷新失败';
+      setRefreshError(true);
+      setRefreshProgress({ completed: 0, total: task.etfs.length, currentETF: '', message: msg });
+      setTimeout(() => setShowRefreshModal(false), 2000);
+    } finally {
+      setIsRefreshingAll(false);
     }
   };
 
@@ -516,9 +453,6 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
                 key={etf.symbol}
                 etf={etf}
                 coverageRanges={mergedRanges}
-                onRefreshETF={async () => {
-                  return await handleRefreshETF(etf.symbol);
-                }}
                 onRefreshHoldings={(coverageId: string) => handleRefreshHoldings(etf.symbol, coverageId)}
                 onImportHoldings={(coverageId?: string) => handleOpenHoldingsModal(etf.symbol, coverageId)}
                 onViewStockDetail={(ticker) => {

@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import * as api from '../services/api';
 
 // ============ 类型定义 ============
 interface MarketRegime {
@@ -204,12 +205,29 @@ function getTrendLevelColor(level: string): string {
 export function CoreTerminal() {
   const [selectedSector, setSelectedSector] = useState<string>('XLK');
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [snapshot, setSnapshot] = useState<{
+    timestamp?: string;
+    broker_status?: Record<string, unknown>;
+  } | null>(null);
+  const [snapshotError, setSnapshotError] = useState<string | null>(null);
 
   const currentSectorDetail = sectorDetails[selectedSector] || sectorDetails['XLK'];
 
-  const handleRefresh = () => {
+  const handleRefresh = async () => {
     setIsRefreshing(true);
-    setTimeout(() => setIsRefreshing(false), 2000);
+    setSnapshotError(null);
+    try {
+      const response = await api.getMarketSnapshot();
+      setSnapshot({
+        timestamp: response.timestamp,
+        broker_status: response.broker_status,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '刷新失败';
+      setSnapshotError(message);
+    } finally {
+      setIsRefreshing(false);
+    }
   };
 
   return (
@@ -228,6 +246,23 @@ export function CoreTerminal() {
           <RefreshIcon className={isRefreshing ? 'animate-spin' : ''} />
           刷新数据
         </button>
+      </div>
+
+      {/* Snapshot Quick Status */}
+      <div className="mb-6 rounded-xl border border-slate-200 bg-white p-4 text-sm text-slate-700">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="text-xs uppercase text-slate-400">后端快照</div>
+            <div className="font-semibold">
+              {snapshot?.timestamp ? new Date(snapshot.timestamp).toLocaleString() : '尚未刷新'}
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-3 text-xs text-slate-500">
+            <span>IBKR: {String((snapshot?.broker_status as { ibkr?: { is_connected?: boolean } })?.ibkr?.is_connected ?? '未知')}</span>
+            <span>Futu: {String((snapshot?.broker_status as { futu?: { is_connected?: boolean } })?.futu?.is_connected ?? '未知')}</span>
+          </div>
+          {snapshotError && <div className="text-xs text-red-500">{snapshotError}</div>}
+        </div>
       </div>
 
       {/* Regime Gate 状态卡 - 渐变背景大卡片 */}

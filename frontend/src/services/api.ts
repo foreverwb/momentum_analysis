@@ -237,11 +237,11 @@ export async function getMarketRegime(): Promise<{
 
 export async function getMarketSnapshot(): Promise<{
   timestamp: string;
-  brokerStatus: Record<string, unknown>;
+  broker_status: Record<string, unknown>;
   regime: Record<string, unknown>;
   spy?: Record<string, unknown>;
   vix?: number;
-  sectorEtfRankings: Array<Record<string, unknown>>;
+  sector_etf_rankings: Array<Record<string, unknown>>;
 }> {
   return fetchApi('/market/snapshot');
 }
@@ -276,32 +276,6 @@ export async function healthCheck(): Promise<{
   return fetchApi('/health');
 }
 
-// Refresh ETF Data API
-export interface RefreshETFDataResponse {
-  status: string;
-  symbol: string;
-  message: string;
-  score?: number;
-  rank?: number;
-  completeness?: number;
-  thresholds_pass?: boolean;
-  thresholds?: Record<string, boolean>;
-  breakdown?: {
-    rel_mom?: { score: number; data?: Record<string, unknown> };
-    trend_quality?: { score: number; data?: Record<string, unknown> };
-    breadth?: { score: number; data?: Record<string, unknown> };
-    options_confirm?: { score: number; data?: Record<string, unknown> };
-  };
-  data_sources?: Record<string, boolean>;
-  warnings?: string[];
-}
-
-export async function refreshETFData(symbol: string): Promise<RefreshETFDataResponse> {
-  return fetchApi(`/etfs/symbol/${symbol}/refresh`, {
-    method: 'POST',
-  });
-}
-
 // Refresh Holdings Data API
 export async function refreshHoldingsData(symbol: string): Promise<{
   status: string;
@@ -310,19 +284,6 @@ export async function refreshHoldingsData(symbol: string): Promise<{
   holdingsCount?: number;
 }> {
   return fetchApi(`/etfs/symbol/${symbol}/refresh-holdings`, {
-    method: 'POST',
-  });
-}
-
-// Calculate ETF Score API
-export async function calculateETFScore(symbol: string): Promise<{
-  status: string;
-  symbol: string;
-  score: number;
-  rank: number;
-  completeness: number;
-}> {
-  return fetchApi(`/etfs/symbol/${symbol}/calculate`, {
     method: 'POST',
   });
 }
@@ -447,57 +408,6 @@ export async function refreshTaskAllETFs(taskId: number): Promise<RefreshTaskAll
   return fetchApi(`/tasks/${taskId}/refresh-all-etfs`, {
     method: 'POST',
   });
-}
-
-// WebSocket Progress Stream
-export interface RefreshProgressMessage {
-  event: 'progress' | 'completed' | 'error';
-  etf_symbol?: string;
-  stage?: string;
-  progress_percentage?: number;
-  message?: string;
-  completed_count?: number;
-  total_count?: number;
-  current_etf?: string;
-  error?: string | null;
-  timestamp?: string;
-}
-
-export function connectToRefreshStream(
-  taskId: number,
-  onMessage: (message: RefreshProgressMessage) => void,
-  onError?: (error: Event) => void,
-  onClose?: () => void
-): WebSocket {
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl = `${protocol}//${window.location.host}/api/tasks/ws/${taskId}/refresh-stream`;
-
-  const ws = new WebSocket(wsUrl);
-
-  ws.onmessage = (event) => {
-    try {
-      const message = JSON.parse(event.data) as RefreshProgressMessage;
-      onMessage(message);
-    } catch (error) {
-      console.error('Failed to parse WebSocket message:', error);
-    }
-  };
-
-  ws.onerror = (event) => {
-    console.error('WebSocket error:', event);
-    if (onError) {
-      onError(event);
-    }
-  };
-
-  ws.onclose = () => {
-    console.log('WebSocket closed');
-    if (onClose) {
-      onClose();
-    }
-  };
-
-  return ws;
 }
 
 // Holdings Refresh API
