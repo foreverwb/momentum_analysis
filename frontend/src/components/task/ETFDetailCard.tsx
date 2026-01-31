@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState, useCallback } from 'react';
+import { RefreshProgressModal } from '../modal';
 
 interface DataStatus {
   source: 'Finviz' | 'MarketChameleon' | '市场数据' | '期权数据' | 'IBKR' | 'Futu';
@@ -238,6 +239,18 @@ export function ETFDetailCard({
   const [lastRefreshResult, setLastRefreshResult] = useState<RefreshResult | null>(null);
   const [showRefreshDetails, setShowRefreshDetails] = useState(false);
 
+  // Unified refresh modal state for both ETF and Holdings refresh
+  const [showRefreshModal, setShowRefreshModal] = useState(false);
+  const [refreshModalTitle, setRefreshModalTitle] = useState('');
+  const [refreshModalProgress, setRefreshModalProgress] = useState({
+    completed: 0,
+    total: 100,
+    currentItem: '',
+    message: '',
+  });
+  const [refreshModalError, setRefreshModalError] = useState(false);
+  const [refreshModalComplete, setRefreshModalComplete] = useState(false);
+
   // Holdings refresh state
   const [holdingsRefreshState, setHoldingsRefreshState] = useState<{
     isLoading: boolean;
@@ -294,66 +307,90 @@ export function ETFDetailCard({
   const delta3d = formatDelta(etf.delta3d);
   const delta5d = formatDelta(etf.delta5d);
 
-  // 模拟刷新进度
-  const simulateProgress = useCallback(async () => {
-    const stages: Array<{ stage: RefreshProgress['stage']; duration: number; progress: number }> = [
-      { stage: 'connecting', duration: 500, progress: 10 },
-      { stage: 'fetching_price', duration: 2000, progress: 30 },
-      { stage: 'calculating_relmom', duration: 1500, progress: 50 },
-      { stage: 'calculating_trend', duration: 1000, progress: 70 },
-      { stage: 'fetching_iv', duration: 1500, progress: 85 },
-      { stage: 'saving', duration: 500, progress: 95 },
-    ];
-
-    for (const { stage, duration, progress } of stages) {
-      setRefreshProgress({
-        stage,
-        message: refreshStageMessages[stage],
-        progress,
-      });
-      await new Promise((resolve) => setTimeout(resolve, duration));
-    }
-  }, []);
 
   const handleRefreshETF = useCallback(async () => {
     if (isRefreshing) return;
 
     setIsRefreshing(true);
-    setShowRefreshDetails(true);
+    setShowRefreshModal(true);
+    setRefreshModalTitle(`正在刷新 ${etf.symbol} 数据`);
+    setRefreshModalProgress({ completed: 0, total: 100, currentItem: '', message: '准备刷新数据...' });
+    setRefreshModalError(false);
+    setRefreshModalComplete(false);
     setLastRefreshResult(null);
-    setRefreshProgress({ stage: 'connecting', message: refreshStageMessages['connecting'], progress: 5 });
 
     try {
+      // 更新进度模拟
+      const stages = [
+        { stage: 'connecting', progress: 10 },
+        { stage: 'fetching_price', progress: 30 },
+        { stage: 'calculating_relmom', progress: 50 },
+        { stage: 'calculating_trend', progress: 70 },
+        { stage: 'fetching_iv', progress: 85 },
+        { stage: 'saving', progress: 95 },
+      ];
+
+      // 启动进度模拟
+      const progressPromise = (async () => {
+        for (const { stage, progress } of stages) {
+          setRefreshModalProgress({
+            completed: progress,
+            total: 100,
+            currentItem: etf.symbol,
+            message: refreshStageMessages[stage as RefreshProgress['stage']],
+          });
+          await new Promise((resolve) => setTimeout(resolve, 1500 / stages.length));
+        }
+      })();
+
       // 并行运行进度模拟和实际API调用
-      const [, result] = await Promise.all([
-        simulateProgress(),
-        onRefreshETF(),
-      ]);
+      const result = await onRefreshETF();
+      await progressPromise;
 
       if (result) {
         setLastRefreshResult(result);
         if (result.status === 'success') {
-          setRefreshProgress({ stage: 'done', message: refreshStageMessages['done'], progress: 100 });
-        } else {
-          setRefreshProgress({ 
-            stage: 'error', 
-            message: result.message || refreshStageMessages['error'], 
-            progress: 100 
+          setRefreshModalProgress({
+            completed: 100,
+            total: 100,
+            currentItem: '',
+            message: '刷新完成！',
           });
+          setRefreshModalComplete(true);
+        } else {
+          setRefreshModalProgress({
+            completed: 100,
+            total: 100,
+            currentItem: '',
+            message: result.message || '刷新失败',
+          });
+          setRefreshModalError(true);
         }
       } else {
-        setRefreshProgress({ stage: 'done', message: refreshStageMessages['done'], progress: 100 });
+        setRefreshModalProgress({
+          completed: 100,
+          total: 100,
+          currentItem: '',
+          message: '刷新完成！',
+        });
+        setRefreshModalComplete(true);
       }
     } catch (error) {
-      setRefreshProgress({ 
-        stage: 'error', 
-        message: error instanceof Error ? error.message : '刷新失败', 
-        progress: 100 
+      setRefreshModalProgress({
+        completed: 100,
+        total: 100,
+        currentItem: '',
+        message: error instanceof Error ? error.message : '刷新失败',
       });
+      setRefreshModalError(true);
     } finally {
       setIsRefreshing(false);
+      // 延迟关闭模态框
+      setTimeout(() => {
+        setShowRefreshModal(false);
+      }, 2000);
     }
-  }, [isRefreshing, onRefreshETF, simulateProgress]);
+  }, [isRefreshing, onRefreshETF, etf.symbol]);
 
   const handleRefreshHoldings = useCallback(async () => {
     if (holdingsRefreshState.isLoading) return;
@@ -364,14 +401,53 @@ export function ETFDetailCard({
       message: '正在刷新持仓股票数据...',
     });
 
-    try {
-      const activeOptionData = activeOption;
-      const coverageType = activeOptionData.type; // 'top' or 'weight'
-      const coverageValue = activeOptionData.value;
+    // 同时显示模态框进度
+    setShowRefreshModal(true);
+    setRefreshModalTitle(`正在刷新 ${etf.symbol} ${activeOption.label} Holdings`);
+    setRefreshModalProgress({
+      completed: 0,
+      total: 100,
+      currentItem: activeOption.label,
+      message: '准备刷新持仓数据...',
+    });
+    setRefreshModalError(false);
+    setRefreshModalComplete(false);
 
-      // Call onRefreshHoldings callback which should handle the API call
-      // The parent component should implement refreshHoldingsByCoverage API call
+    try {
+      // 模拟分阶段进度
+      const stages = [
+        { progress: 20, message: '正在获取持仓数据...' },
+        { progress: 40, message: '正在处理数据源 Finviz...' },
+        { progress: 60, message: '正在处理数据源 MarketChameleon...' },
+        { progress: 80, message: '正在处理数据源 市场数据...' },
+        { progress: 95, message: '正在保存数据...' },
+      ];
+
+      // 启动进度模拟
+      const progressPromise = (async () => {
+        for (const { progress, message } of stages) {
+          setRefreshModalProgress({
+            completed: progress,
+            total: 100,
+            currentItem: activeOption.label,
+            message,
+          });
+          await new Promise((resolve) => setTimeout(resolve, 1500 / stages.length));
+        }
+      })();
+
+      // 并行运行进度模拟和实际API调用
       await onRefreshHoldings(activeCoverage);
+      await progressPromise;
+
+      // 完成状态
+      setRefreshModalProgress({
+        completed: 100,
+        total: 100,
+        currentItem: '',
+        message: `已刷新 ${activeHoldings.length} 只股票数据`,
+      });
+      setRefreshModalComplete(true);
 
       setHoldingsRefreshState({
         isLoading: false,
@@ -379,24 +455,37 @@ export function ETFDetailCard({
         message: `已刷新 ${activeHoldings.length} 只股票数据`,
       });
 
-      // Clear message after 3 seconds
+      // 延迟关闭模态框
       setTimeout(() => {
+        setShowRefreshModal(false);
+        // 清空本地状态
         setHoldingsRefreshState({ isLoading: false, progress: 0, message: '' });
-      }, 3000);
+      }, 2000);
     } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : '刷新失败';
+
+      setRefreshModalProgress({
+        completed: 100,
+        total: 100,
+        currentItem: '',
+        message: errorMsg,
+      });
+      setRefreshModalError(true);
+
       setHoldingsRefreshState({
         isLoading: false,
         progress: 100,
-        message: error instanceof Error ? error.message : '刷新失败',
-        error: error instanceof Error ? error.message : '未知错误',
+        message: errorMsg,
+        error: errorMsg,
       });
 
-      // Clear error message after 5 seconds
+      // 延迟关闭模态框
       setTimeout(() => {
+        setShowRefreshModal(false);
         setHoldingsRefreshState({ isLoading: false, progress: 0, message: '' });
-      }, 5000);
+      }, 2000);
     }
-  }, [holdingsRefreshState.isLoading, activeCoverage, activeOption, activeHoldings.length, onRefreshHoldings]);
+  }, [holdingsRefreshState.isLoading, activeCoverage, activeOption, activeHoldings.length, onRefreshHoldings, etf.symbol]);
 
   const getCoverageTabStyle = (option: CoverageOption, isActive: boolean) => {
     const baseStyle = 'px-3 py-1.5 text-xs font-medium rounded-full border-2 transition-all cursor-pointer flex items-center gap-1.5';
@@ -868,20 +957,9 @@ export function ETFDetailCard({
       )}
       {/* Action Buttons - Footer */}
       <div className="flex gap-3 px-5 py-4 border-t border-[var(--border-light)] bg-[var(--bg-secondary)]">
-        {/* <button
-          onClick={handleRefreshETF}
-          disabled={isRefreshing}
-          className={`flex-1 py-2.5 text-xs font-medium rounded-[var(--radius-md)] cursor-pointer text-center bg-[var(--bg-primary)] border border-[var(--border-light)] text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] hover:border-[var(--border-medium)] transition-colors flex items-center justify-center gap-1.5 ${
-            isRefreshing ? 'opacity-60 cursor-not-allowed' : ''
-          }`}
-        >
-          {isRefreshing ? '刷新中...' : 'Refresh Holdings '}
-        </button> */}
-        {/* Refresh Holdings Button */}
-        
           <button
             onClick={() => handleRefreshHoldings()}
-            disabled={activeHoldings.length > 0}
+            disabled={activeHoldings.length > 0 || holdingsRefreshState.isLoading}
             className={`flex-1 py-2.5 text-xs font-medium rounded-[var(--radius-md)] border transition-colors flex items-center justify-center gap-1.5 ${
               holdingsRefreshState.isLoading ? 'opacity-60 cursor-not-allowed' : ''
             }`}
@@ -891,7 +969,17 @@ export function ETFDetailCard({
               color: 'var(--accent-blue)',
             }}
           >
-            {holdingsRefreshState.isLoading ? '刷新中...' : `刷新 ${activeOption.label} Holdings 数据`}
+            {holdingsRefreshState.isLoading ? (
+              <>
+                <svg className="animate-spin h-3 w-3" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                Refreshing...
+              </>
+            ) : (
+              `Refresh ${activeOption.label} Holdings`
+            )}
           </button>
         <button
           onClick={() => onImportHoldings?.(activeCoverage)}
@@ -905,6 +993,18 @@ export function ETFDetailCard({
           Export Holdings
         </button>
       </div>
+
+      {/* Unified Refresh Progress Modal */}
+      <RefreshProgressModal
+        isOpen={showRefreshModal}
+        title={refreshModalTitle}
+        currentItem={refreshModalProgress.currentItem}
+        message={refreshModalProgress.message}
+        completed={refreshModalProgress.completed}
+        total={refreshModalProgress.total}
+        isError={refreshModalError}
+        isComplete={refreshModalComplete}
+      />
     </div>
   );
 }

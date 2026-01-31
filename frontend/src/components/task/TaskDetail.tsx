@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { TrendChart, type TrendDataPoint } from '../chart';
 import { ETFDetailCard } from './ETFDetailCard';
-import { HoldingsImportModal, ETFImportModal } from '../modal';
+import { HoldingsImportModal, ETFImportModal, RefreshProgressModal } from '../modal';
 import { LoadingState, ErrorMessage } from '../common';
 import type { Task, ETF, Holding } from '../../types';
 import * as api from '../../services/api';
@@ -84,12 +84,15 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
 
   // WebSocket 刷新全部状态
   const [isRefreshingAll, setIsRefreshingAll] = useState(false);
+  const [showRefreshModal, setShowRefreshModal] = useState(false);
   const [refreshProgress, setRefreshProgress] = useState({
     completed: 0,
     total: 0,
     currentETF: '',
     message: '',
   });
+  const [refreshError, setRefreshError] = useState(false);
+  const [refreshComplete, setRefreshComplete] = useState(false);
 
   // 加载 ETF 数据
   useEffect(() => {
@@ -229,10 +232,13 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
 
   const handleRefreshAll = async () => {
     setIsRefreshingAll(true);
+    setShowRefreshModal(true);
+    setRefreshComplete(false);
+    setRefreshError(false);
     setRefreshProgress({ completed: 0, total: task.etfs.length, currentETF: '', message: '准备刷新...' });
 
     // 导入 WebSocket 连接函数
-    const { connectToRefreshStream, RefreshProgressMessage } = await import('../../services/api');
+    const { connectToRefreshStream } = await import('../../services/api');
 
     // 建立 WebSocket 连接
     const ws = connectToRefreshStream(
@@ -253,27 +259,52 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
             currentETF: '',
             message: '刷新完成！',
           });
+          setRefreshComplete(true);
 
-          // 延迟后重新加载数据
+          // 延迟后重新加载数据和关闭模态框
           setTimeout(() => {
             loadETFData();
             setIsRefreshingAll(false);
-          }, 1000);
+            setTimeout(() => {
+              setShowRefreshModal(false);
+            }, 1500);
+          }, 800);
         } else if (message.event === 'error') {
           console.error('Refresh error:', message.message);
-          alert(`刷新失败: ${message.message}`);
+          setRefreshError(true);
+          setRefreshProgress({
+            completed: refreshProgress.completed,
+            total: refreshProgress.total,
+            currentETF: '',
+            message: `刷新失败: ${message.message}`,
+          });
           setIsRefreshingAll(false);
           ws.close();
+
+          setTimeout(() => {
+            setShowRefreshModal(false);
+          }, 2000);
         }
       },
       (error) => {
         console.error('WebSocket error:', error);
-        alert('WebSocket 连接错误');
+        setRefreshError(true);
+        setRefreshProgress({
+          completed: refreshProgress.completed,
+          total: refreshProgress.total,
+          currentETF: '',
+          message: 'WebSocket 连接错误',
+        });
         setIsRefreshingAll(false);
+        setTimeout(() => {
+          setShowRefreshModal(false);
+        }, 2000);
       },
       () => {
         console.log('WebSocket closed');
-        setIsRefreshingAll(false);
+        if (!refreshComplete && !refreshError) {
+          setIsRefreshingAll(false);
+        }
       }
     );
   };
@@ -387,55 +418,32 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
                   <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
                   <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                 </svg>
-                刷新中 ({refreshProgress.completed}/{refreshProgress.total})
+                Refreshing...
               </>
             ) : (
-              'Refresh ETF'
+              'Refresh ETFs'
             )}
           </button>
           <button
             onClick={handleOpenETFImport}
             className="px-4 py-2 text-sm font-medium rounded-[var(--radius-sm)] bg-[var(--bg-secondary)] border border-[var(--border-light)] text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] transition-colors flex items-center gap-2"
           >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M12 5v14M5 12l7-7 7 7" />
-            </svg>
-            导入 ETF 数据
+            Export ETFs
           </button>
         </div>
       </div>
 
-      {/* Refresh Progress Display */}
-      {isRefreshingAll && (
-        <div className="mb-6 bg-[var(--bg-primary)] border border-[var(--border-light)] rounded-[var(--radius-lg)] p-5">
-          <div className="flex items-center justify-between mb-3">
-            <h3 className="text-base font-semibold">刷新进度</h3>
-            <span className="text-sm text-[var(--text-muted)]">
-              {refreshProgress.completed} / {refreshProgress.total} ETF
-            </span>
-          </div>
-
-          <div className="mb-2">
-            <div className="w-full bg-[var(--bg-secondary)] rounded-full h-2 overflow-hidden">
-              <div
-                className="h-full bg-gradient-to-r from-[var(--accent-blue)] to-[var(--accent-purple)] transition-all duration-300"
-                style={{
-                  width: `${refreshProgress.total > 0 ? (refreshProgress.completed / refreshProgress.total) * 100 : 0}%`,
-                }}
-              />
-            </div>
-          </div>
-
-          <div className="text-sm text-[var(--text-muted)]">
-            {refreshProgress.currentETF && (
-              <p>当前: <span className="font-medium text-[var(--text-primary)]">{refreshProgress.currentETF}</span></p>
-            )}
-            {refreshProgress.message && (
-              <p className="mt-1">{refreshProgress.message}</p>
-            )}
-          </div>
-        </div>
-      )}
+      {/* Refresh Progress Modal */}
+      <RefreshProgressModal
+        isOpen={showRefreshModal}
+        title="正在刷新 ETF 数据"
+        currentItem={refreshProgress.currentETF}
+        message={refreshProgress.message}
+        completed={refreshProgress.completed}
+        total={refreshProgress.total}
+        isError={refreshError}
+        isComplete={refreshComplete}
+      />
 
       {/* Trend Chart Section */}
       <div className="mb-6">
