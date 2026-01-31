@@ -333,22 +333,27 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
       const coverageValue = parseInt(valueStr, 10);
 
       if (isNaN(coverageValue)) {
-        alert('无效的覆盖范围值');
-        return;
+        console.error('无效的覆盖范围值');
+        throw new Error('无效的覆盖范围值');
       }
 
+      console.log(`开始刷新 ${symbol} 的 ${coverageId} Holdings 数据...`);
+
+      // 调用API刷新Holdings数据
+      // 后端应该支持多数据源的并发获取：Finviz, MarketChameleon, 市场数据(IBKR), 期权数据(Futu)等
       const response = await api.refreshHoldingsByCoverage(symbol, coverageType, coverageValue);
-      console.log('Refresh holdings response:', response);
 
-      alert(`成功刷新 ${symbol} 的 ${coverageId} Holdings 数据！`);
+      console.log('Holdings refresh response:', response);
 
-      // 延迟后重新加载数据
+      // 延迟后重新加载数据，以显示更新结果
       setTimeout(() => {
         loadETFData();
-      }, 500);
+      }, 1000);
+
+      return response;
     } catch (e) {
       console.error('Failed to refresh holdings:', e);
-      alert(`刷新 ${symbol} Holdings 数据失败: ${e instanceof Error ? e.message : '未知错误'}`);
+      throw e;
     }
   };
 

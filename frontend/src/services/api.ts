@@ -540,6 +540,48 @@ export async function refreshHoldingsByCoverage(
     body: JSON.stringify({
       coverage_type: coverageType,
       coverage_value: coverageValue,
+      // 支持多数据源并发处理
+      sources: ['finviz', 'marketchameleon', 'market_data', 'options_data'],
+      concurrent: true, // 启用并发处理
+    }),
+  });
+}
+
+// 多数据源并发刷新接口 (高级用法)
+export interface MultiSourceRefreshResponse extends RefreshHoldingsByCoverageResponse {
+  data_sources_status?: Array<{
+    source: 'finviz' | 'marketchameleon' | 'market_data' | 'options_data';
+    status: 'pending' | 'processing' | 'completed' | 'failed';
+    records_count?: number;
+    error?: string;
+    elapsed_time?: number;
+  }>;
+  concurrent_processing?: {
+    enabled: boolean;
+    total_sources: number;
+    completed_sources: number;
+    start_time?: string;
+    end_time?: string;
+  };
+}
+
+/**
+ * 并发刷新多个数据源的Holdings数据
+ * 后端会同时处理多个数据源，提高效率
+ */
+export async function refreshHoldingsConcurrent(
+  symbol: string,
+  coverageType: 'top' | 'weight',
+  coverageValue: number,
+  sources?: string[]
+): Promise<MultiSourceRefreshResponse> {
+  return fetchApi(`/etfs/symbol/${symbol}/refresh-holdings-concurrent`, {
+    method: 'POST',
+    body: JSON.stringify({
+      coverage_type: coverageType,
+      coverage_value: coverageValue,
+      sources: sources || ['finviz', 'marketchameleon', 'market_data', 'options_data'],
+      concurrent: true,
     }),
   });
 }
