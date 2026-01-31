@@ -47,7 +47,7 @@ class HoldingDataStatus:
             'ticker': self.ticker,
             'completeness_score': round(self.completeness_score, 2),
             'status': self.status,
-            'data_sources': self.data_sources,
+            'data_sources': {key: bool(value) for key, value in self.data_sources.items()},
             'missing_sources': self.missing_sources,
             'last_updated': self.last_updated
         }
