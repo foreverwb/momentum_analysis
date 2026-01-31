@@ -9,10 +9,10 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime
 import asyncio
-import json
 
-from app.models import get_db, Task, ETF
+from app.models import get_db, Task
 from app.schemas import TaskCreate
+from app.api.etfs import refresh_etf_data
 
 router = APIRouter()
 
@@ -158,52 +158,25 @@ async def refresh_all_etfs(task_id: int, db: Session = Depends(get_db)):
             "message": "任务中没有 ETF"
         }
 
-    # 导入 orchestrator
-    from app.services.orchestrator import get_orchestrator
-    orchestrator = get_orchestrator()
-
     results = []
     failed_count = 0
 
-    # 使用信号量限制并发数（ETF 级别：5 个同时刷新）
-    semaphore = asyncio.Semaphore(5)
-
-    async def refresh_with_semaphore(symbol: str):
-        async with semaphore:
-            try:
-                # 调用真实的刷新函数
-                result = await refresh_etf_data(symbol, db)
-                return result
-            except Exception as e:
-                return {
-                    "symbol": symbol,
-                    "status": "error",
-                    "score": None,
-                    "completeness": None,
-                    "message": f"刷新失败: {str(e)}",
-                    "data_sources": {}
-                }
-
-    # 并发刷新所有 ETF
-    tasks = [refresh_with_semaphore(symbol) for symbol in task.etfs]
-    refresh_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    for idx, result in enumerate(refresh_results):
-        if isinstance(result, Exception):
-            symbol = task.etfs[idx]
+    for symbol in task.etfs:
+        try:
+            result = await refresh_etf_data(symbol, db)
+            results.append(result)
+            if result.get("status") != "success":
+                failed_count += 1
+        except Exception as e:
+            failed_count += 1
             results.append({
                 "symbol": symbol,
                 "status": "error",
                 "score": None,
                 "completeness": None,
-                "message": f"异常: {str(result)}",
+                "message": f"刷新失败: {str(e)}",
                 "data_sources": {}
             })
-            failed_count += 1
-        elif isinstance(result, dict):
-            results.append(result)
-            if result.get('status') != 'success':
-                failed_count += 1
 
     return {
         "status": "success" if failed_count == 0 else "partial_success",
@@ -350,4 +323,3 @@ async def websocket_refresh_stream(websocket: WebSocket, task_id: int, db: Sessi
             "timestamp": datetime.utcnow().isoformat()
         })
         await websocket.close()
-

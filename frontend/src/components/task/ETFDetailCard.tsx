@@ -17,12 +17,6 @@ interface HoldingSummary {
   updatedAt?: string;  // timestamp
 }
 
-interface RefreshProgress {
-  stage: 'idle' | 'connecting' | 'fetching_price' | 'calculating_relmom' | 'calculating_trend' | 'fetching_iv' | 'saving' | 'done' | 'error';
-  message: string;
-  progress: number;
-}
-
 interface RefreshResult {
   status: string;
   symbol: string;
@@ -56,8 +50,7 @@ interface ETFDetailCardProps {
     dataStatus: DataStatus[];
   };
   coverageRanges?: string[];
-  onRefreshETF: () => Promise<RefreshResult | void>;
-  onRefreshHoldings: (coverageId: string) => void;
+  onRefreshHoldings: (coverageId: string) => Promise<unknown>;
   onImportHoldings?: (coverageId?: string) => void;
   onViewStockDetail?: (ticker: string) => void;
 }
@@ -129,18 +122,6 @@ const holdingStatusConfig = {
   complete: { color: 'var(--accent-green)' },
   pending: { color: 'var(--accent-amber)' },
   missing: { color: 'var(--text-muted)' },
-};
-
-const refreshStageMessages: Record<RefreshProgress['stage'], string> = {
-  idle: '',
-  connecting: '正在连接 IBKR...',
-  fetching_price: '正在获取价格数据...',
-  calculating_relmom: '正在计算相对动量 (RelMom)...',
-  calculating_trend: '正在计算趋势质量...',
-  fetching_iv: '正在获取 IV 期限结构...',
-  saving: '正在保存数据...',
-  done: '刷新完成',
-  error: '刷新失败',
 };
 
 // 评分维度卡片组件
@@ -224,20 +205,12 @@ const getCoverageHoldings = (holdings: HoldingSummary[], option: CoverageOption)
 export function ETFDetailCard({
   etf,
   coverageRanges = [],
-  onRefreshETF,
   onRefreshHoldings,
   onImportHoldings,
   onViewStockDetail,
 }: ETFDetailCardProps) {
   const [activeCoverage, setActiveCoverage] = useState<CoverageOption['id']>('top10');
-  const [isRefreshing, setIsRefreshing] = useState(false);
-  const [refreshProgress, setRefreshProgress] = useState<RefreshProgress>({
-    stage: 'idle',
-    message: '',
-    progress: 0,
-  });
-  const [lastRefreshResult, setLastRefreshResult] = useState<RefreshResult | null>(null);
-  const [showRefreshDetails, setShowRefreshDetails] = useState(false);
+  const [lastRefreshResult] = useState<RefreshResult | null>(null);
 
   // Unified refresh modal state for both ETF and Holdings refresh
   const [showRefreshModal, setShowRefreshModal] = useState(false);
@@ -307,91 +280,6 @@ export function ETFDetailCard({
   const delta3d = formatDelta(etf.delta3d);
   const delta5d = formatDelta(etf.delta5d);
 
-
-  const handleRefreshETF = useCallback(async () => {
-    if (isRefreshing) return;
-
-    setIsRefreshing(true);
-    setShowRefreshModal(true);
-    setRefreshModalTitle(`正在刷新 ${etf.symbol} 数据`);
-    setRefreshModalProgress({ completed: 0, total: 100, currentItem: '', message: '准备刷新数据...' });
-    setRefreshModalError(false);
-    setRefreshModalComplete(false);
-    setLastRefreshResult(null);
-
-    try {
-      // 更新进度模拟
-      const stages = [
-        { stage: 'connecting', progress: 10 },
-        { stage: 'fetching_price', progress: 30 },
-        { stage: 'calculating_relmom', progress: 50 },
-        { stage: 'calculating_trend', progress: 70 },
-        { stage: 'fetching_iv', progress: 85 },
-        { stage: 'saving', progress: 95 },
-      ];
-
-      // 启动进度模拟
-      const progressPromise = (async () => {
-        for (const { stage, progress } of stages) {
-          setRefreshModalProgress({
-            completed: progress,
-            total: 100,
-            currentItem: etf.symbol,
-            message: refreshStageMessages[stage as RefreshProgress['stage']],
-          });
-          await new Promise((resolve) => setTimeout(resolve, 1500 / stages.length));
-        }
-      })();
-
-      // 并行运行进度模拟和实际API调用
-      const result = await onRefreshETF();
-      await progressPromise;
-
-      if (result) {
-        setLastRefreshResult(result);
-        if (result.status === 'success') {
-          setRefreshModalProgress({
-            completed: 100,
-            total: 100,
-            currentItem: '',
-            message: '刷新完成！',
-          });
-          setRefreshModalComplete(true);
-        } else {
-          setRefreshModalProgress({
-            completed: 100,
-            total: 100,
-            currentItem: '',
-            message: result.message || '刷新失败',
-          });
-          setRefreshModalError(true);
-        }
-      } else {
-        setRefreshModalProgress({
-          completed: 100,
-          total: 100,
-          currentItem: '',
-          message: '刷新完成！',
-        });
-        setRefreshModalComplete(true);
-      }
-    } catch (error) {
-      setRefreshModalProgress({
-        completed: 100,
-        total: 100,
-        currentItem: '',
-        message: error instanceof Error ? error.message : '刷新失败',
-      });
-      setRefreshModalError(true);
-    } finally {
-      setIsRefreshing(false);
-      // 延迟关闭模态框
-      setTimeout(() => {
-        setShowRefreshModal(false);
-      }, 2000);
-    }
-  }, [isRefreshing, onRefreshETF, etf.symbol]);
-
   const handleRefreshHoldings = useCallback(async () => {
     // 防止重复点击
     if (holdingsRefreshState.isLoading) return;
@@ -400,7 +288,7 @@ export function ETFDetailCard({
     setHoldingsRefreshState({
       isLoading: true,
       progress: 0,
-      message: '准备刷新持仓数据...',
+      message: '已发送请求，等待后端返回...',
     });
 
     // 立即显示模态框 - 这是关键
@@ -408,93 +296,29 @@ export function ETFDetailCard({
     setRefreshModalTitle(`正在刷新 ${etf.symbol} ${activeOption.label} Holdings`);
     setRefreshModalProgress({
       completed: 0,
-      total: 5, // 5个数据源
+      total: 1,
       currentItem: '',
-      message: '准备刷新持仓数据...',
+      message: '请求中...',
     });
     setRefreshModalError(false);
     setRefreshModalComplete(false);
 
     try {
-      // 参考v7.html实现方式：多数据源级别的细粒度进度
-      // 数据源列表
-      const dataSources = [
-        { name: 'Finviz', displayName: 'Finviz' },
-        { name: 'MarketChameleon', displayName: 'MarketChameleon' },
-        { name: '市场数据', displayName: '市场数据 (IBKR)' },
-        { name: '期权数据', displayName: '期权数据 (Futu)' },
-        { name: '其他数据', displayName: '其他数据源' },
-      ];
-
-      const totalSources = dataSources.length;
-      let completedSources = 0;
-
-      // 逐个处理数据源
-      for (let i = 0; i < dataSources.length; i++) {
-        const source = dataSources[i];
-
-        // 更新当前处理的数据源
-        setRefreshModalProgress({
-          completed: completedSources,
-          total: totalSources,
-          currentItem: source.displayName,
-          message: `正在处理 ${source.displayName} 数据...`,
-        });
-
-        setHoldingsRefreshState({
-          isLoading: true,
-          progress: Math.round((i / totalSources) * 100),
-          message: `正在处理 ${source.displayName} 数据...`,
-        });
-
-        try {
-          // 模拟API调用时间 (1.5-2.5秒)
-          // 实际应该调用: await onRefreshHoldings(activeCoverage, source.name)
-          await new Promise((resolve) =>
-            setTimeout(resolve, 1500 + Math.random() * 1000)
-          );
-
-          // 模拟95%成功率
-          const success = Math.random() > 0.05;
-
-          if (success) {
-            completedSources++;
-          }
-
-          // 更新进度
-          setRefreshModalProgress({
-            completed: completedSources,
-            total: totalSources,
-            currentItem: source.displayName,
-            message: success ? `${source.displayName} 刷新成功` : `${source.displayName} 刷新失败`,
-          });
-        } catch (sourceError) {
-          console.error(`Failed to refresh ${source.name}:`, sourceError);
-          // 继续处理下一个数据源
-        }
-      }
-
-      // 调用实际的API（一次性传入完整的coverage参数）
-      try {
-        await onRefreshHoldings(activeCoverage);
-      } catch (apiError) {
-        console.error('API call error:', apiError);
-        // 不中断流程，继续显示完成状态
-      }
+      const resp = await onRefreshHoldings(activeCoverage);
 
       // 完成状态
       setRefreshModalProgress({
-        completed: totalSources,
-        total: totalSources,
+        completed: 1,
+        total: 1,
         currentItem: '',
-        message: `已刷新 ${completedSources}/${totalSources} 个数据源`,
+        message: (resp as { message?: string })?.message || '刷新完成',
       });
       setRefreshModalComplete(true);
 
       setHoldingsRefreshState({
         isLoading: false,
         progress: 100,
-        message: `已刷新 ${completedSources}/${totalSources} 个数据源 · ${activeHoldings.length} 只股票`,
+        message: (resp as { message?: string })?.message || '刷新完成',
       });
 
       // 延迟关闭模态框（1.5秒后自动关闭，给用户查看结果的时间）
@@ -512,7 +336,7 @@ export function ETFDetailCard({
       // 错误状态
       setRefreshModalProgress({
         completed: 0,
-        total: 5,
+        total: 1,
         currentItem: '',
         message: errorMsg,
       });
@@ -533,7 +357,7 @@ export function ETFDetailCard({
         }, 500);
       }, 2000);
     }
-  }, [holdingsRefreshState.isLoading, activeCoverage, activeOption, activeHoldings.length, onRefreshHoldings, etf.symbol]);
+  }, [holdingsRefreshState.isLoading, activeCoverage, activeOption, onRefreshHoldings, etf.symbol]);
 
   const getCoverageTabStyle = (option: CoverageOption, isActive: boolean) => {
     const baseStyle = 'px-3 py-1.5 text-xs font-medium rounded-full border-2 transition-all cursor-pointer flex items-center gap-1.5';
@@ -671,104 +495,6 @@ export function ETFDetailCard({
           />
         </div>
       </div>
-
-      {/* Refresh Progress Section */}
-      {showRefreshDetails && (
-        <div className="mx-5 mt-4 mb-0">
-          <div
-            className="border rounded-[var(--radius-md)] overflow-hidden transition-all"
-            style={{
-              borderColor: refreshProgress.stage === 'error' ? 'rgba(239, 68, 68, 0.3)'
-                : refreshProgress.stage === 'done' ? 'rgba(34, 197, 94, 0.3)'
-                : 'rgba(59, 130, 246, 0.3)',
-              background: refreshProgress.stage === 'error' ? 'rgba(239, 68, 68, 0.05)'
-                : refreshProgress.stage === 'done' ? 'rgba(34, 197, 94, 0.05)'
-                : 'rgba(59, 130, 246, 0.05)',
-            }}
-          >
-            {/* Progress Header */}
-            <div className="flex items-center justify-between px-3 py-2">
-              <div className="flex items-center gap-2">
-                {refreshProgress.stage === 'done' ? (
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--accent-green)" strokeWidth="2">
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
-                  </svg>
-                ) : refreshProgress.stage === 'error' ? (
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--accent-red)" strokeWidth="2">
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
-                  </svg>
-                ) : (
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--accent-blue)" strokeWidth="2" className="animate-spin">
-                    <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
-                    <path d="M3 3v5h5" />
-                  </svg>
-                )}
-                <span className="text-xs font-medium" style={{
-                  color: refreshProgress.stage === 'error' ? 'var(--accent-red)'
-                    : refreshProgress.stage === 'done' ? 'var(--accent-green)'
-                    : 'var(--accent-blue)'
-                }}>
-                  {refreshProgress.message}
-                </span>
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="text-[10px] text-[var(--text-muted)]">{refreshProgress.progress}%</span>
-                {(refreshProgress.stage === 'done' || refreshProgress.stage === 'error') && (
-                  <button
-                    onClick={() => setShowRefreshDetails(false)}
-                    className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
-                  >
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12"/>
-                    </svg>
-                  </button>
-                )}
-              </div>
-            </div>
-
-            {/* Progress Bar */}
-            <div className="h-1 bg-[var(--bg-secondary)]">
-              <div
-                className="h-full transition-all duration-300"
-                style={{
-                  width: `${refreshProgress.progress}%`,
-                  background: refreshProgress.stage === 'error' ? 'var(--accent-red)'
-                    : refreshProgress.stage === 'done' ? 'var(--accent-green)'
-                    : 'var(--accent-blue)',
-                }}
-              />
-            </div>
-
-            {/* Refresh Result Details */}
-            {lastRefreshResult && (refreshProgress.stage === 'done' || refreshProgress.stage === 'error') && (
-              <div className="px-3 py-2 border-t border-[var(--border-light)] text-xs">
-                {lastRefreshResult.data_sources && (
-                  <div className="flex flex-wrap gap-2 mb-2">
-                    {Object.entries(lastRefreshResult.data_sources).map(([source, available]) => (
-                      <span
-                        key={source}
-                        className="px-2 py-0.5 rounded text-[10px] font-medium"
-                        style={{
-                          background: available ? 'rgba(34, 197, 94, 0.1)' : 'rgba(239, 68, 68, 0.1)',
-                          color: available ? 'var(--accent-green)' : 'var(--accent-red)',
-                        }}
-                      >
-                        {source.replace('_', ' ').replace('ibkr', 'IBKR').replace('futu', 'Futu')}
-                        {available ? ' ✓' : ' ✗'}
-                      </span>
-                    ))}
-                  </div>
-                )}
-                {lastRefreshResult.warnings && lastRefreshResult.warnings.length > 0 && (
-                  <div className="text-[var(--accent-amber)] text-[10px]">
-                    ⚠️ {lastRefreshResult.warnings.join(', ')}
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-        </div>
-      )}
 
       {/* Coverage Tabs - Enhanced Version */}
       {showCoverageSection && (
