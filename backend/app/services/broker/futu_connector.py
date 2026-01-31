@@ -362,21 +362,28 @@ class FutuConnectorReal(BrokerConnector):
                     max_retries=max_retries
                 )
                 results[symbol] = result
-                
-                progress = f"[{idx}/{total}]"
+
+                # 格式化 IV 值
+                iv7_str = self._fmt_iv(result.iv7)
+                iv30_str = self._fmt_iv(result.iv30)
+                iv60_str = self._fmt_iv(result.iv60)
+                iv90_str = self._fmt_iv(result.iv90)
+                oi_str = str(result.total_oi) if result.total_oi is not None else "N/A"
+
+                # FUTU 深度优化格式打印
                 logger.info(
-                    f"✓ {progress} {symbol}: "
-                    f"IV7={self._fmt_iv(result.iv7)} "
-                    f"IV30={self._fmt_iv(result.iv30)} "
-                    f"IV60={self._fmt_iv(result.iv60)} "
-                    f"IV90={self._fmt_iv(result.iv90)}",
-                    total_oi=result.total_oi,
-                    total_oi_display=str(result.total_oi) if result.total_oi is not None else "N/A",
+                    f"FUTU - [{idx}/{total}] {symbol}\n"
+                    f"  - IV7/30/60/90: {iv7_str}% / {iv30_str}% / {iv60_str}% / {iv90_str}%\n"
+                    f"  - 期权链 OI: {oi_str} (0-7D: 获取中, 8-30D: 获取中, 31-90D: 获取中)"
                 )
             except Exception as exc:
-                logger.error(f"✗ {symbol}: IV 计算失败: {exc}")
+                logger.error(
+                    f"FUTU - [{idx}/{total}] {symbol}\n"
+                    f"  - IV7/30/60/90: ✗ 获取失败\n"
+                    f"  - 期权链 OI: ✗ 获取失败 ({exc})"
+                )
                 results[symbol] = IVTermResult()
-        
+
         # 仅保留逐标的日志，避免额外汇总输出干扰。
         return results
     

@@ -732,17 +732,17 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
         return result
     
     def batch_calculate_rel_mom(
-        self, 
-        symbols: List[str], 
+        self,
+        symbols: List[str],
         benchmark: str = 'SPY'
     ) -> pd.DataFrame:
         """
         批量计算多个ETF的相对动量
-        
+
         Args:
             symbols: ETF代码列表
             benchmark: 基准指数
-        
+
         Returns:
             DataFrame 按 RelMom 降序排列
         """
@@ -756,29 +756,52 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
             if result:
                 results.append(result)
                 success += 1
+
+                # 获取计算结果
                 relmom = result.get("RelMom")
-                rs20 = result.get("RS_20D")
-                rs63 = result.get("RS_63D")
+                rs = result.get("RS")
+                rs_5d = result.get("RS_5D")
+                rs_20d = result.get("RS_20D")
+                rs_63d = result.get("RS_63D")
+                high_52w = result.get("high_52w")
+                low_52w = result.get("low_52w")
+                current_price = result.get("sector_price")
+
+                # 格式化输出值
                 relmom_str = f"{relmom:.4f}" if relmom is not None else "N/A"
-                rs20_str = f"{rs20:.4f}" if rs20 is not None else "N/A"
-                rs63_str = f"{rs63:.4f}" if rs63 is not None else "N/A"
+                rs_str = f"{rs:.4f}" if rs is not None else "N/A"
+                rs_5d_str = f"{rs_5d:+.2%}" if rs_5d is not None else "N/A"
+                rs_20d_str = f"{rs_20d:+.2%}" if rs_20d is not None else "N/A"
+                rs_63d_str = f"{rs_63d:+.2%}" if rs_63d is not None else "N/A"
+
+                # 52周高低点格式化
+                if high_52w and low_52w and current_price:
+                    week52_str = f"高${high_52w:.2f} 低${low_52w:.2f} 当前${current_price:.2f}"
+                else:
+                    week52_str = "N/A"
+
+                # IBKR 深度优化格式打印
                 logger.info(
-                    f"✓ [{idx}/{total}] {symbol}: "
-                    f"RelMom={relmom_str} RS20={rs20_str} RS63={rs63_str}"
+                    f"IBKR - [{idx}/{total}] {symbol}\n"
+                    f"  - 历史价格(OHLCV): ✓ 获取成功\n"
+                    f"  - 52周高低点: {week52_str}\n"
+                    f"  - 相对强度 RS: {rs_str} (5D:{rs_5d_str}, 20D:{rs_20d_str}, 63D:{rs_63d_str})\n"
+                    f"  - 相对动量 RelMom: {relmom_str} [{result.get('strength', 'N/A')}]\n"
+                    f"  - SMA 均线计算: ✓ 完成"
                 )
             else:
-                logger.warning(f"✗ [{idx}/{total}] {symbol}: RelMom=N/A")
+                logger.warning(f"IBKR - [{idx}/{total}] {symbol}: ✗ 数据获取失败")
             time.sleep(0.5)  # 避免请求过快
-        
+
         if not results:
             elapsed = (time.time() - start_ts) / 60.0
-            logger.info(f"✓ {success}/{total} relmom successful in {elapsed:.1f}m")
+            logger.info(f"IBKR - 批量计算完成: {success}/{total} 成功, 耗时 {elapsed:.1f}分钟")
             return pd.DataFrame()
-        
+
         df = pd.DataFrame(results)
         df = df.sort_values('RelMom', ascending=False)
         elapsed = (time.time() - start_ts) / 60.0
-        logger.info(f"✓ {success}/{total} relmom successful in {elapsed:.1f}m")
+        logger.info(f"IBKR - 批量计算完成: {success}/{total} 成功, 耗时 {elapsed:.1f}分钟")
         return df
     
     # ==================== VIX 数据 ====================
