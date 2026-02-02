@@ -1,171 +1,375 @@
-// Stock types
-export interface StockScores {
-  momentum: number;
-  trend: number;
-  volume: number;
-  quality: number;
-  options: number;
+// ============================================================================
+// Type Definitions for Momentum Analysis Frontend
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// Heat Type Classification
+// ----------------------------------------------------------------------------
+export type HeatType = 'trend' | 'event' | 'hedge' | 'normal';
+
+// ----------------------------------------------------------------------------
+// Threshold Check Results
+// ----------------------------------------------------------------------------
+export interface ThresholdResult {
+  price_above_sma50: 'PASS' | 'FAIL' | 'NO_DATA';
+  rs_positive: 'PASS' | 'FAIL' | 'NO_DATA';
 }
 
-export interface StockChanges {
-  delta3d: number | null;
-  delta5d: number | null;
-}
-
-export interface StockMetrics {
-  return20d: number;
-  return20dEx3d?: number | null;
-  return63d: number;
-  relativeStrength?: number | null;
-  distanceToHigh20d?: number | null;
-  volumeMultiple?: number | null;
-  maAlignment?: string | null;
-  trendPersistence?: number | null;
-  breakoutVolume?: number | null;
-  volumeRatio?: number | null;
-  obvTrend?: string | null;
-  maxDrawdown20d?: number | null;
-  atrPercent?: number | null;
-  deviationFrom20ma?: number | null;
-  overheat?: string | null;
-  optionsHeat?: string | null;
-  optionsRelVolume?: number | null;
-  sma20Slope: number;
-  ivr: number;
-  iv30: number;
-}
-
+// ----------------------------------------------------------------------------
+// Base Stock Interface
+// ----------------------------------------------------------------------------
 export interface Stock {
-  id: number;
   symbol: string;
   name: string;
-  sector: string;
-  industry: string;
+  sector?: string;
+  industry?: string;
+  
+  // Price data
   price: number;
-  scoreTotal: number;
-  scores: StockScores;
-  changes: StockChanges;
-  metrics: StockMetrics;
+  change?: number;
+  changePercent?: number;
+  
+  // Technical indicators
+  sma20?: number;
+  sma50?: number;
+  sma200?: number;
+  rsi?: number;
+  
+  // Momentum metrics
+  return20d?: number;
+  return63d?: number;
+  rs20d?: number | null;
+  
+  // Volume metrics
+  volume?: number;
+  avgVolume?: number;
+  volumeRatio?: number;
+  
+  // Options metrics
+  impliedVolatility?: number;
+  ivr?: number | null;
+  openInterest?: number;
+  
+  // Composite scores
+  totalScore?: number;
+  technicalScore?: number;
+  momentumScore?: number;
+  volumeScore?: number;
+  optionsScore?: number;
+  
+  // Heat analysis (new fields)
+  heatType?: HeatType;
+  heatScore?: number;
+  riskScore?: number;
+  thresholdsPass?: boolean;
+  thresholds?: ThresholdResult;
+  
+  // Metadata
+  lastUpdated?: string;
+  marketCap?: number;
 }
 
-// ETF types
+// ----------------------------------------------------------------------------
+// Score Breakdown Interfaces
+// ----------------------------------------------------------------------------
+export interface TechnicalScoreData {
+  price: number;
+  sma20: number;
+  sma50: number;
+  sma200: number | null;
+  rsi: number;
+  dist_from_52w_high: number;
+  score_breakdown: Record<string, number>;
+}
+
+export interface TechnicalScore {
+  score: number;
+  data: TechnicalScoreData;
+}
+
+export interface MomentumScoreData {
+  return_20d: number;
+  return_63d: number;
+  rs_20d: number | null;
+}
+
+export interface MomentumScore {
+  score: number;
+  data: MomentumScoreData;
+}
+
+export interface VolumeScoreData {
+  volume: number;
+  avg_volume: number;
+  volume_ratio: number;
+  [key: string]: unknown;
+}
+
+export interface VolumeScore {
+  score: number;
+  data: VolumeScoreData;
+}
+
+export interface OptionsScoreData {
+  heat_score: number;
+  risk_score: number;
+  heat_type: string;
+  ivr: number | null;
+  implied_volatility?: number;
+  open_interest?: number;
+}
+
+export interface OptionsScore {
+  score: number;
+  data: OptionsScoreData;
+}
+
+export interface ScoreBreakdown {
+  technical: TechnicalScore;
+  momentum: MomentumScore;
+  volume: VolumeScore;
+  options: OptionsScore;
+}
+
+// ----------------------------------------------------------------------------
+// Stock Detail Interface (Extended with Score Breakdown)
+// ----------------------------------------------------------------------------
+export interface StockDetail extends Stock {
+  scoreBreakdown: ScoreBreakdown;
+}
+
+// ----------------------------------------------------------------------------
+// Compare Data Interface
+// ----------------------------------------------------------------------------
+export interface CompareData {
+  stocks: StockDetail[];
+  metrics: string[];  // List of metrics to compare
+}
+
+// ----------------------------------------------------------------------------
+// API Response Types
+// ----------------------------------------------------------------------------
+export interface ApiResponse<T> {
+  data: T;
+  status: 'success' | 'error';
+  message?: string;
+  timestamp?: string;
+}
+
+export interface PaginatedResponse<T> {
+  data: T[];
+  total: number;
+  page: number;
+  pageSize: number;
+  hasMore: boolean;
+}
+
+// ----------------------------------------------------------------------------
+// Filter and Query Parameters
+// ----------------------------------------------------------------------------
+export interface StockFilters {
+  sector?: string;
+  industry?: string;
+  heatType?: HeatType;
+  minScore?: number;
+  maxScore?: number;
+  minPrice?: number;
+  maxPrice?: number;
+  thresholdsPass?: boolean;
+}
+
+export interface StockQueryParams extends StockFilters {
+  limit?: number;
+  offset?: number;
+  sortBy?: string;
+  sortOrder?: 'asc' | 'desc';
+}
+
+// ----------------------------------------------------------------------------
+// Heat Analysis Types
+// ----------------------------------------------------------------------------
+export interface HeatAnalysis {
+  heatType: HeatType;
+  heatScore: number;
+  riskScore: number;
+  characteristics: string[];
+  recommendation?: string;
+}
+
+// ----------------------------------------------------------------------------
+// Sector Summary Types
+// ----------------------------------------------------------------------------
+export interface SectorSummary {
+  sector: string;
+  stockCount: number;
+  avgScore: number;
+  topStocks: Stock[];
+  heatDistribution: Record<HeatType, number>;
+}
+
+// ----------------------------------------------------------------------------
+// Watchlist Types
+// ----------------------------------------------------------------------------
+export interface WatchlistItem {
+  id: string;
+  symbol: string;
+  addedAt: string;
+  notes?: string;
+  alerts?: Alert[];
+}
+
+export interface Alert {
+  id: string;
+  type: 'price' | 'score' | 'heat';
+  condition: 'above' | 'below';
+  threshold: number;
+  active: boolean;
+}
+
+// ----------------------------------------------------------------------------
+// Chart Data Types
+// ----------------------------------------------------------------------------
+export interface TimeSeriesData {
+  date: string;
+  value: number;
+}
+
+export interface ChartDataPoint {
+  timestamp: string;
+  price: number;
+  volume?: number;
+  sma20?: number;
+  sma50?: number;
+  sma200?: number;
+}
+
+// ----------------------------------------------------------------------------
+// Error Types
+// ----------------------------------------------------------------------------
+export interface ApiError {
+  code: string;
+  message: string;
+  details?: Record<string, unknown>;
+}
+
+// ----------------------------------------------------------------------------
+// User Preferences
+// ----------------------------------------------------------------------------
+export interface UserPreferences {
+  defaultView: 'table' | 'cards' | 'chart';
+  defaultSortBy: string;
+  defaultFilters: StockFilters;
+  watchlist: string[];
+  notifications: {
+    enabled: boolean;
+    types: string[];
+  };
+}
+
+// ----------------------------------------------------------------------------
+// Type Guards
+// ----------------------------------------------------------------------------
+export function isStockDetail(stock: Stock | StockDetail): stock is StockDetail {
+  return 'scoreBreakdown' in stock;
+}
+
+export function isHeatType(value: string): value is HeatType {
+  return ['trend', 'event', 'hedge', 'normal'].includes(value);
+}
+
+export function hasThresholds(stock: Stock): stock is Stock & { thresholds: ThresholdResult } {
+  return stock.thresholds !== undefined;
+}
+
+// ----------------------------------------------------------------------------
+// ETF Types
+// ----------------------------------------------------------------------------
+
+export interface Holding {
+  ticker: string;
+  weight: number;
+  score?: number | null;
+  updatedAt?: string | null;
+}
+
 export interface ETFDelta {
   delta3d: number | null;
   delta5d: number | null;
 }
 
-// 新版本的 ETF 相关类型定义 - 参考 data_config_etf_panel.html 板块 ETF 设计
-export interface RelMomentum {
+export interface ETFDimensionScore {
   score: number;
-  value: string;   // 如 '+12.3%'
-  rank: number;
-}
-
-export interface TrendQuality {
-  score: number;
-  structure: string;  // 如 'Strong', 'Weak'
-  slope: string;      // 如 '+0.08'
-}
-
-export interface Breadth {
-  score: number;
-  above50ma: string;   // 如 '75%'
-  above200ma: string;  // 如 '68%'
-}
-
-export interface OptionsConfirm {
-  score: number;
-  heat: string;     // 如 'High', 'Very High'
-  relVol: string;   // 如 '1.8x'
-  ivr: number;
-}
-
-export interface Holding {
-  ticker: string;
-  weight: number;
-  beta?: number | null;
-  rsi?: number | null;
-  sma50?: number | null;
-  sma200?: number | null;
-  high52w?: number | null;
-  dataStatus?: 'complete' | 'pending' | 'missing';
-  score?: number | null;
-}
-
-export interface DataStatusItem {
-  source: 'Finviz' | 'MarketChameleon' | '市场数据' | '期权数据' | 'IBKR' | 'Futu';
-  status: 'complete' | 'pending' | 'missing' | 'loading';
-  updatedAt: string | null;
-  count?: number;
+  value?: string | number;
+  rank?: number;
+  structure?: string;
+  slope?: string | number;
+  above50ma?: string | number;
+  above200ma?: string | number;
+  heat?: string;
+  relVol?: string | number;
 }
 
 export interface ETF {
-  id: number;
+  id: string;
   symbol: string;
   name: string;
   type: 'sector' | 'industry';
+  parentSector?: string;
+  
+  // Scores
   score: number;
+  compositeScore?: number;
   rank: number;
-  delta: ETFDelta;
+  
+  // Delta tracking
+  delta?: ETFDelta;
+  
+  // Data quality
   completeness: number;
   holdingsCount: number;
-  // 已导入的覆盖范围列表
-  coverageRanges?: string[];
-  // 新增字段 - 板块 ETF 详细分析
-  compositeScore?: number;
-  relMomentum?: RelMomentum;
-  trendQuality?: TrendQuality;
-  breadth?: Breadth;
-  optionsConfirm?: OptionsConfirm;
+  
+  // Detailed dimension scores (optional, only when calculated)
+  relMomentum?: ETFDimensionScore;
+  trendQuality?: ETFDimensionScore;
+  breadth?: ETFDimensionScore;
+  optionsConfirm?: ETFDimensionScore;
+  
+  // Holdings data
   holdings?: Holding[];
-  dataStatus?: DataStatusItem[];
-  // 行业 ETF 额外字段
-  parentSector?: string;  // 父板块符号 (后端返回的字段名)
-  sector?: string;        // 别名，兼容旧代码
-  sectorName?: string;
+  
+  // Metadata
+  lastUpdated?: string;
 }
 
-// ETF Refresh Result types
-export interface RefreshBreakdown {
-  rel_mom?: { score: number; data?: Record<string, unknown> };
-  trend_quality?: { score: number; data?: Record<string, unknown> };
-  breadth?: { score: number; data?: Record<string, unknown> };
-  options_confirm?: { score: number; data?: Record<string, unknown> };
-}
-
-export interface RefreshResult {
-  status: string;
-  symbol: string;
-  message: string;
-  score?: number;
-  rank?: number;
-  completeness?: number;
-  thresholds_pass?: boolean;
-  thresholds?: Record<string, string>;
-  breakdown?: RefreshBreakdown;
-  data_sources?: Record<string, boolean>;
-  warnings?: string[];
-}
-
-// Task types
 export type TaskType = 'rotation' | 'drilldown' | 'momentum';
 
 export interface Task {
-  id: number;
+  id: string;
   title: string;
   type: TaskType;
-  baseIndex: string;
+  baseIndex: 'SPY' | 'QQQ' | 'IWM';
   sector?: string;
   etfs: string[];
   createdAt: string;
+  updatedAt?: string;
+  status?: 'active' | 'paused' | 'completed';
 }
 
-// API Response types
-export interface ApiResponse<T> {
-  data: T;
-  success: boolean;
+export interface CreateTaskInput {
+  title: string;
+  type: TaskType;
+  baseIndex: 'SPY' | 'QQQ' | 'IWM';
+  sector?: string;
+  etfs: string[];
+}
+
+export interface RefreshResult {
+  status: 'success' | 'error' | 'partial' | 'snapshot';
+  symbol: string;
   message?: string;
+  score?: number;
+  thresholds_pass?: boolean;
+  breakdown?: Record<string, number>;
+  completeness?: number;
+  data_sources?: Record<string, boolean>;
 }
-
-// Navigation types
-export type NavSection = 'core' | 'sector' | 'industry' | 'momentum' | 'tracking';

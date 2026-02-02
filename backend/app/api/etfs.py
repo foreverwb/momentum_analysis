@@ -84,6 +84,7 @@ def format_etf_response(etf: ETF, include_holdings: bool = False, db: Session = 
             holdings_today = [h for h in etf.holdings if h.data_date == latest_date]
 
             score_map = {}
+            updated_map = {}
             if db:
                 try:
                     tickers = [h.ticker for h in holdings_today]
@@ -91,6 +92,7 @@ def format_etf_response(etf: ETF, include_holdings: bool = False, db: Session = 
                         stocks = db.query(Stock).filter(Stock.symbol.in_(tickers)).all()
                         for stock in stocks:
                             score_map[stock.symbol] = stock.score_total
+                            updated_map[stock.symbol] = stock.updated_at.isoformat() if stock.updated_at else None
                 except Exception as exc:
                     logger.warning(f"Stock score query failed, skip scores: {exc}")
 
@@ -98,7 +100,8 @@ def format_etf_response(etf: ETF, include_holdings: bool = False, db: Session = 
                 {
                     "ticker": h.ticker,
                     "weight": h.weight,
-                    "score": score_map.get(h.ticker)
+                    "score": score_map.get(h.ticker),
+                    "updatedAt": updated_map.get(h.ticker)
                 }
                 for h in holdings_today
             ]

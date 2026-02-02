@@ -1,6 +1,26 @@
 import React from 'react';
 
+// ============================================================================
+// Re-export Error Boundary and Virtual List Components
+// ============================================================================
+
+export { 
+  ErrorBoundary, 
+  PageErrorFallback, 
+  ComponentErrorFallback, 
+  withErrorBoundary 
+} from './ErrorBoundary';
+
+export { 
+  VirtualList, 
+  VirtualStockList, 
+  useVirtualScroll 
+} from './VirtualList';
+
+// ============================================================================
 // Loading Spinner
+// ============================================================================
+
 export function LoadingSpinner() {
   return (
     <div className="flex items-center justify-center p-8">
@@ -9,7 +29,10 @@ export function LoadingSpinner() {
   );
 }
 
+// ============================================================================
 // Loading State
+// ============================================================================
+
 export function LoadingState({ message = '加载中...' }: { message?: string }) {
   return (
     <div className="flex flex-col items-center justify-center p-12 text-[var(--text-muted)]">
@@ -19,7 +42,10 @@ export function LoadingState({ message = '加载中...' }: { message?: string })
   );
 }
 
+// ============================================================================
 // Error Message
+// ============================================================================
+
 interface ErrorMessageProps {
   error: Error | null;
   onRetry?: () => void;
@@ -45,7 +71,10 @@ export function ErrorMessage({ error, onRetry }: ErrorMessageProps) {
   );
 }
 
+// ============================================================================
 // Badge Component
+// ============================================================================
+
 interface BadgeProps {
   children: React.ReactNode;
   variant?: 'default' | 'green' | 'amber' | 'red' | 'blue' | 'purple' | 'orange';
@@ -77,7 +106,10 @@ export function Badge({ children, variant = 'default', size = 'sm' }: BadgeProps
   );
 }
 
+// ============================================================================
 // Button Component
+// ============================================================================
+
 interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: 'primary' | 'secondary';
   size?: 'sm' | 'md' | 'lg';
@@ -114,7 +146,10 @@ export function Button({
   );
 }
 
+// ============================================================================
 // Select Dropdown
+// ============================================================================
+
 interface SelectProps extends React.SelectHTMLAttributes<HTMLSelectElement> {
   options: { value: string; label: string }[];
 }
@@ -134,7 +169,10 @@ export function Select({ options, className = '', ...props }: SelectProps) {
   );
 }
 
+// ============================================================================
 // Empty State
+// ============================================================================
+
 interface EmptyStateProps {
   icon?: string;
   title: string;

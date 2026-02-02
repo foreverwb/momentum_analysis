@@ -59,7 +59,7 @@ class Stock(Base):
     id = Column(Integer, primary_key=True, index=True)
     symbol = Column(String, unique=True, index=True)
     name = Column(String)
-    sector = Column(String)
+    sector = Column(String, index=True)
     industry = Column(String)
     price = Column(Float)
     score_total = Column(Float)
@@ -72,6 +72,15 @@ class Stock(Base):
     
     # Metrics JSON: {return20d, return63d, sma20Slope, ivr, iv30}
     metrics = Column(JSON)
+    
+    # 热度标签相关
+    heat_type = Column(String, default='normal', index=True)  # 'trend', 'event', 'hedge', 'normal'
+    heat_score = Column(Float, default=0.0)
+    risk_score = Column(Float, default=0.0)
+    
+    # 门槛检查
+    thresholds_pass = Column(Boolean, default=True)
+    thresholds = Column(JSON, default=dict)  # {'price_above_sma50': 'PASS', 'rs_positive': 'PASS'}
     
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -286,6 +295,7 @@ def init_db():
     """初始化数据库，创建所有表"""
     Base.metadata.create_all(bind=engine)
     _ensure_etfs_parent_sector_column()
+    _ensure_stocks_heat_columns()
     logger.info("数据库表已创建")
 
 
@@ -301,6 +311,33 @@ def _ensure_etfs_parent_sector_column():
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE etfs ADD COLUMN parent_sector VARCHAR"))
         logger.info("已补齐列: etfs.parent_sector")
+
+
+def _ensure_stocks_heat_columns():
+    """为旧版 SQLite 数据库补齐 stocks 表的热度相关列"""
+    if engine.dialect.name != "sqlite":
+        return
+    inspector = inspect(engine)
+    if "stocks" not in inspector.get_table_names():
+        return
+    
+    column_names = {col["name"] for col in inspector.get_columns("stocks")}
+    
+    # 需要添加的新列及其默认值
+    new_columns = [
+        ("heat_type", "VARCHAR", "'normal'"),
+        ("heat_score", "FLOAT", "0.0"),
+        ("risk_score", "FLOAT", "0.0"),
+        ("thresholds_pass", "BOOLEAN", "1"),
+        ("thresholds", "JSON", "'{}'"),
+    ]
+    
+    with engine.begin() as conn:
+        for col_name, col_type, default_value in new_columns:
+            if col_name not in column_names:
+                sql = f"ALTER TABLE stocks ADD COLUMN {col_name} {col_type} DEFAULT {default_value}"
+                conn.execute(text(sql))
+                logger.info(f"已补齐列: stocks.{col_name}")
 
 
 def init_default_sector_etfs():

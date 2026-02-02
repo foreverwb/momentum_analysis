@@ -1,2 +1,11 @@
 export { StockCard } from './StockCard';
 export { DimensionCard } from './DimensionCard';
+export { StockDetailView } from './StockDetailView';
+export { ScoreBreakdownPanel } from './ScoreBreakdownPanel';
+export { ThresholdCard } from './ThresholdCard';
+export { CompareBanner } from './CompareBanner';
+export { CompareTable } from './CompareTable';
+export { HeatBadge, HeatBadgeCompact } from './HeatBadge';
+export { ControlsBar } from './ControlsBar';
+export { PageHeader } from './PageHeader';
+export { StockList } from './StockList';
