@@ -396,9 +396,6 @@ export function CoreTerminal() {
               <div className="text-sm text-white/80 mb-1">市场广度</div>
               <div className="text-2xl font-bold">{displayRegime.breadth !== undefined ? `${displayRegime.breadth}%` : 'N/A'}</div>
             </div>
-            <div className="text-center md:col-span-1 lg:col-span-6 text-xs text-white/80">
-              {dist50 !== null && Math.abs(dist50) < 0.02 ? '价格贴近50日均线，默认为 B 档 Neutral' : ''}
-            </div>
           </div>
         </div>
       </div>

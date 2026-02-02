@@ -7,7 +7,6 @@ interface Metric {
 }
 
 interface DimensionCardProps {
-  icon: string;
   title: string;
   subtitle?: string;
   score: number;
@@ -16,7 +15,6 @@ interface DimensionCardProps {
 }
 
 export function DimensionCard({ 
-  icon, 
   title, 
   subtitle, 
   score, 
@@ -43,7 +41,6 @@ export function DimensionCard({
       {/* Header */}
       <div className="flex items-center justify-between mb-3.5">
         <span className="flex items-center gap-2 text-sm font-medium text-[var(--text-primary)]">
-          <span className="text-base">{icon}</span>
           {title}
           {subtitle && <span className="text-[var(--text-muted)]">({subtitle})</span>}
         </span>

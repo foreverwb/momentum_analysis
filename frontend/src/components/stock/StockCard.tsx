@@ -92,12 +92,13 @@ export function StockCard({ stock, rank, onClick }: StockCardProps) {
   ];
 
   const optionsHeatValue = metrics.optionsHeat ?? 'Medium';
-  const optionsHeatClass =
-    optionsHeatValue === 'High'
-      ? 'text-[var(--accent-red)]'
-      : optionsHeatValue === 'Low'
-        ? 'text-[var(--text-muted)]'
-        : 'text-[var(--text-secondary)]';
+  const optionsHeatVariant = optionsHeatValue === 'High' ? 'warning' as const : undefined;
+  const optionsMetrics = [
+    { label: '热度', value: optionsHeatValue, variant: optionsHeatVariant },
+    { label: '相对成交', value: formatMultiple(metrics.optionsRelVolume, 2) },
+    { label: 'IVR', value: formatNumber(metrics.ivr, 0) },
+    { label: 'IV30', value: formatNumber(metrics.iv30, 2) }
+  ];
 
   return (
     <div 
@@ -175,11 +176,10 @@ export function StockCard({ stock, rank, onClick }: StockCardProps) {
         </div>
       </div>
 
-      {/* Dimension Grid - 4 Columns */}
-      <div className="grid grid-cols-4 gap-4 mb-5">
+      {/* Dimension Grid - 5 Columns */}
+      <div className="grid grid-cols-5 gap-4 mb-5">
         {/* Price Momentum */}
         <DimensionCard
-          icon="📈"
           title="价格动能"
           subtitle="主要权重"
           score={stock.scores?.momentum ?? 0}
@@ -189,7 +189,6 @@ export function StockCard({ stock, rank, onClick }: StockCardProps) {
 
         {/* Trend Structure */}
         <DimensionCard
-          icon="〰️"
           title="趋势结构"
           score={stock.scores?.trend ?? 0}
           scoreColor={getScoreColor(stock.scores?.trend ?? 0)}
@@ -198,7 +197,6 @@ export function StockCard({ stock, rank, onClick }: StockCardProps) {
 
         {/* Volume Confirmation */}
         <DimensionCard
-          icon="📊"
           title="量价确认"
           score={stock.scores?.volume ?? 0}
           scoreColor={getScoreColor(stock.scores?.volume ?? 0)}
@@ -207,74 +205,20 @@ export function StockCard({ stock, rank, onClick }: StockCardProps) {
 
         {/* Quality Filter */}
         <DimensionCard
-          icon="🛡️"
           title="质量过滤"
           score={stock.scores?.quality ?? 0}
           scoreColor="blue"
           metrics={qualityMetrics}
         />
-      </div>
 
-      {/* Options Section */}
-      <div 
-        className="rounded-[var(--radius-md)] p-4 mb-5 border"
-        style={{ 
-          background: 'rgba(255, 247, 237, 0.6)', 
-          borderColor: 'rgba(249, 115, 22, 0.2)' 
-        }}
-      >
-        <div className="flex items-center justify-between mb-3">
-          <span className="flex items-center gap-2 text-sm font-medium text-[var(--text-primary)]">
-            <span className="text-base">⏱️</span>
-            期权覆盖 (20%权重)
-          </span>
-          <span className="text-2xl font-bold text-[var(--accent-orange)]">
-            {stock.scores?.options ?? 0}
-          </span>
-        </div>
-        <div className="flex gap-8">
-          <div className="flex items-center gap-2">
-            <span className="text-[13px] text-[var(--text-secondary)]">热度</span>
-            <span className={`text-sm font-semibold ${optionsHeatClass}`}>
-              {optionsHeatValue}
-            </span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-[13px] text-[var(--text-secondary)]">相对成交</span>
-            <span className="text-sm font-semibold">{formatMultiple(metrics.optionsRelVolume, 2)}</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-[13px] text-[var(--text-secondary)]">IVR</span>
-            <span className="text-sm font-semibold">{metrics.ivr ?? '--'}</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-[13px] text-[var(--text-secondary)]">IV30</span>
-            <span className="text-sm font-semibold">{metrics.iv30?.toFixed(2) ?? '--'}</span>
-          </div>
-        </div>
-      </div>
-
-      {/* Weight Distribution */}
-      <div className="bg-[var(--bg-secondary)] rounded-[var(--radius-md)] px-4 py-3.5">
-        <div className="text-[13px] text-[var(--text-muted)] mb-2.5">评分权重分配</div>
-        <div className="flex flex-wrap gap-6">
-          <div className="flex items-center gap-2 text-[13px]">
-            <span className="w-2.5 h-2.5 rounded-full bg-[var(--accent-blue)]" />
-            价格动能+趋势: 65%
-          </div>
-          <div className="flex items-center gap-2 text-[13px]">
-            <span className="w-2.5 h-2.5 rounded-full bg-[var(--accent-purple)]" />
-            量价确认: 15%
-          </div>
-          <div className="flex items-center gap-2 text-[13px]">
-            <span className="w-2.5 h-2.5 rounded-full bg-[var(--accent-orange)]" />
-            期权覆盖: 20%
-          </div>
-          <div className="flex items-center gap-2 text-[13px]">
-            <span className="w-2.5 h-2.5 rounded-full bg-[var(--accent-amber)]" />
-            质量过滤: 降权
-          </div>
-        </div>
+        {/* Options Coverage */}
+        <DimensionCard
+          title="期权覆盖"
+          subtitle="20%权重"
+          score={stock.scores?.options ?? 0}
+          scoreColor="orange"
+          metrics={optionsMetrics}
+        />
       </div>
     </div>
   );
