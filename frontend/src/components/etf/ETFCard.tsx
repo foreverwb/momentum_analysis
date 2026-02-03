@@ -30,6 +30,19 @@ function getOptionsHeatColor(heat: string): string {
   return 'text-slate-500';
 }
 
+function formatUpdatedAt(value?: string | null): string {
+  if (!value) return '--';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '--';
+  const utc = date.getTime() + date.getTimezoneOffset() * 60 * 1000;
+  const beijing = new Date(utc + 8 * 60 * 60 * 1000);
+  const month = `${beijing.getUTCMonth() + 1}`.padStart(2, '0');
+  const day = `${beijing.getUTCDate()}`.padStart(2, '0');
+  const hours = `${beijing.getUTCHours()}`.padStart(2, '0');
+  const minutes = `${beijing.getUTCMinutes()}`.padStart(2, '0');
+  return `${month}-${day} ${hours}:${minutes}`;
+}
+
 // 持仓表格组件
 function HoldingsTable({ holdings, maxDisplay, etfSymbol }: { holdings: Holding[]; maxDisplay: number; etfSymbol: string }) {
   const [isExpanded, setIsExpanded] = useState(false);
@@ -42,19 +55,25 @@ function HoldingsTable({ holdings, maxDisplay, etfSymbol }: { holdings: Holding[
         <span className="text-xs text-slate-600">总持仓数: {holdings.length}</span>
       </div>
       <div className="bg-slate-50 rounded-xl border border-slate-200 overflow-hidden">
-        <div className="grid grid-cols-5 gap-2 p-3 bg-slate-100 text-xs font-bold text-slate-700">
+        <div className="grid grid-cols-6 gap-2 p-3 bg-slate-100 text-xs font-bold text-slate-700">
           <div className="col-span-2">股票代码</div>
-          <div className="text-right col-span-2">持仓权重</div>
-          <div></div>
+          <div className="text-right">得分</div>
+          <div className="text-right col-span-2">更新时间</div>
+          <div className="text-right">持仓权重</div>
         </div>
         <div className="divide-y divide-slate-200">
           {displayHoldings.map((h, idx) => (
-            <div key={idx} className="grid grid-cols-5 gap-2 p-3 hover:bg-slate-100 text-sm">
+            <div key={idx} className="grid grid-cols-6 gap-2 p-3 hover:bg-slate-100 text-sm">
               <div className="col-span-2 flex items-center gap-2">
                 <span className="font-medium">{h.ticker}</span>
               </div>
-              <div className="col-span-2 text-right font-medium">{h.weight.toFixed(2)}%</div>
-              <div></div>
+              <div className="text-right font-semibold text-slate-700">
+                {typeof h.score === 'number' ? h.score.toFixed(1) : '--'}
+              </div>
+              <div className="text-right col-span-2 text-xs text-slate-500">
+                {formatUpdatedAt(h.updatedAt)}
+              </div>
+              <div className="text-right font-medium">{h.weight.toFixed(2)}%</div>
             </div>
           ))}
         </div>

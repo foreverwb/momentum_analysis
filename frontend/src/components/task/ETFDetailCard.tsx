@@ -168,6 +168,19 @@ const formatWeight = (value: number): string => {
   return value.toFixed(2);
 };
 
+const formatUpdatedAt = (value?: string | null): string => {
+  if (!value) return '--';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '--';
+  const utc = date.getTime() + date.getTimezoneOffset() * 60 * 1000;
+  const beijing = new Date(utc + 8 * 60 * 60 * 1000);
+  const month = `${beijing.getUTCMonth() + 1}`.padStart(2, '0');
+  const day = `${beijing.getUTCDate()}`.padStart(2, '0');
+  const hours = `${beijing.getUTCHours()}`.padStart(2, '0');
+  const minutes = `${beijing.getUTCMinutes()}`.padStart(2, '0');
+  return `${month}-${day} ${hours}:${minutes}`;
+};
+
 const getCoverageHoldings = (holdings: HoldingSummary[], option: CoverageOption): HoldingSummary[] => {
   if (!holdings.length) {
     return [];
@@ -725,12 +738,15 @@ export function ETFDetailCard({
                   <div className="flex items-center gap-2">
                     <span className="text-[var(--text-primary)] font-semibold min-w-[60px]">{holding.ticker}</span>
                     <span className="text-[var(--text-muted)]">
-                      权重 {formatWeight(holding.weight)}%
+                      {formatWeight(holding.weight)}%
                     </span>
                   </div>
                   <span className="text-sm font-bold text-[var(--accent-blue)]">
                     {typeof holding.score === 'number' ? holding.score.toFixed(1) : '--'}
                   </span>
+                   <span className="text-[var(--text-muted)]">
+                      {formatUpdatedAt(holding.updatedAt)}
+                    </span>
                 </div>
               ))
             ) : (

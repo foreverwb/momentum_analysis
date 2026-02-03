@@ -90,6 +90,7 @@ export interface Holding {
   high52w?: number | null;
   dataStatus?: 'complete' | 'pending' | 'missing';
   score?: number | null;
+  updatedAt?: string | null;
 }
 
 export interface DataStatusItem {
