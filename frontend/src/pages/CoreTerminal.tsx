@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import type { ETF } from '../types';
 import * as api from '../services/api';
 
 // ============ 类型定义 ============
@@ -21,29 +22,17 @@ interface Sector {
   code: string;
   name: string;
   score: number;
-  momentum: string;
+  delta: number | null;
   heat: 'high' | 'medium' | 'low';
-  trend: 'strong' | 'stable' | 'weak';
 }
 
-interface Industry {
+interface IndustryRow {
+  symbol: string;
   name: string;
-  fullName: string;
   score: number;
-  relVol: number;
-  ivr: number;
-  change: string;
-}
-
-interface SectorDetail {
-  code: string;
-  name: string;
-  trendLevel: string;
-  relMomentum: string;
-  breadth: string;
-  capitalFlow: string;
-  trendQuality: number;
-  industries: Industry[];
+  completeness: number;
+  delta: number | null;
+  rank: number;
 }
 
 // ============ SVG 图标组件 ============
@@ -69,108 +58,85 @@ const RefreshIcon = ({ className = '' }: { className?: string }) => (
   </svg>
 );
 
-// ============ Mock 数据 ============
+const EditIcon = ({ className = '' }: { className?: string }) => (
+  <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={className}>
+    <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+    <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+  </svg>
+);
+
+// ============ 可编辑数字组件 ============
+interface EditableNumberProps {
+  value: number | undefined;
+  onChange: (value: string) => void;
+  suffix?: string;
+  className?: string;
+}
+
+function EditableNumber({ value, onChange, suffix = '%', className = '' }: EditableNumberProps) {
+  const [isEditing, setIsEditing] = useState(false);
+  const [localValue, setLocalValue] = useState('');
+
+  const displayValue = value !== undefined ? `${value}${suffix}` : 'N/A';
+
+  const handleFocus = () => {
+    setIsEditing(true);
+    setLocalValue(value !== undefined ? String(value) : '');
+  };
+
+  const handleBlur = () => {
+    setIsEditing(false);
+    onChange(localValue);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter') {
+      (e.target as HTMLInputElement).blur();
+    } else if (e.key === 'Escape') {
+      setLocalValue(value !== undefined ? String(value) : '');
+      (e.target as HTMLInputElement).blur();
+    }
+  };
+
+  return (
+    <div className={`group relative inline-block ${className}`}>
+      <input
+        type="text"
+        value={isEditing ? localValue : displayValue}
+        onChange={(e) => setLocalValue(e.target.value)}
+        onFocus={handleFocus}
+        onBlur={handleBlur}
+        onKeyDown={handleKeyDown}
+        className="
+          w-full text-2xl font-bold text-center bg-transparent border-none outline-none
+          cursor-default
+          group-hover:cursor-text
+          focus:cursor-text
+        "
+        style={{
+          appearance: 'none',
+          WebkitAppearance: 'none',
+          MozAppearance: 'textfield',
+        }}
+      />
+      {/* Hover indicator */}
+      <div className="
+        absolute inset-0 rounded-md border-2 border-transparent
+        group-hover:border-white/30 group-hover:bg-white/5
+        transition-all duration-200 pointer-events-none
+      ">
+        <EditIcon className="absolute top-1 right-1 text-white/60 opacity-0 group-hover:opacity-100 transition-opacity" />
+      </div>
+    </div>
+  );
+}
+
+// ============ 默认数据（无实时数据时展示） ============
 const marketRegime: MarketRegime = {
   status: 'A',
   spy: { price: 485.20, sma20: 472.5, sma50: 460.0, return20d: 0.028, sma20Slope: 0.35, distToSma20: 0.027, distToSma50: 0.055 },
   vix: 14.2,
   breadth: 68
-};
-
-const sectors: Sector[] = [
-  { code: 'XLK', name: '科技', score: 92, momentum: '+12.3%', heat: 'high', trend: 'strong' },
-  { code: 'XLF', name: '金融', score: 78, momentum: '+6.8%', heat: 'medium', trend: 'stable' },
-  { code: 'XLE', name: '能源', score: 85, momentum: '+9.1%', heat: 'high', trend: 'strong' },
-  { code: 'XLV', name: '医疗', score: 65, momentum: '+3.2%', heat: 'low', trend: 'weak' },
-  { code: 'XLI', name: '工业', score: 72, momentum: '+5.6%', heat: 'medium', trend: 'stable' },
-  { code: 'XLY', name: '消费', score: 88, momentum: '+10.5%', heat: 'high', trend: 'strong' }
-];
-
-const sectorDetails: Record<string, SectorDetail> = {
-  'XLK': {
-    code: 'XLK',
-    name: '科技板块',
-    trendLevel: 'Strong',
-    relMomentum: '+12.3%',
-    breadth: '75%',
-    capitalFlow: '+$2.1B',
-    trendQuality: 88,
-    industries: [
-      { name: 'SOXX', fullName: '半导体', score: 95, relVol: 1.8, ivr: 72, change: '+15.2%' },
-      { name: 'IGV', fullName: '软件', score: 88, relVol: 1.4, ivr: 65, change: '+11.8%' },
-      { name: 'SMH', fullName: '半导体设备', score: 91, relVol: 1.6, ivr: 68, change: '+13.5%' }
-    ]
-  },
-  'XLF': {
-    code: 'XLF',
-    name: '金融板块',
-    trendLevel: 'Stable',
-    relMomentum: '+6.8%',
-    breadth: '62%',
-    capitalFlow: '+$0.8B',
-    trendQuality: 72,
-    industries: [
-      { name: 'KBE', fullName: '银行', score: 75, relVol: 1.2, ivr: 55, change: '+7.2%' },
-      { name: 'KIE', fullName: '保险', score: 71, relVol: 1.1, ivr: 48, change: '+5.8%' },
-      { name: 'XLF', fullName: '多元金融', score: 78, relVol: 1.3, ivr: 52, change: '+6.5%' }
-    ]
-  },
-  'XLE': {
-    code: 'XLE',
-    name: '能源板块',
-    trendLevel: 'Strong',
-    relMomentum: '+9.1%',
-    breadth: '68%',
-    capitalFlow: '+$1.5B',
-    trendQuality: 82,
-    industries: [
-      { name: 'XOP', fullName: '油气勘探', score: 88, relVol: 1.7, ivr: 70, change: '+12.1%' },
-      { name: 'OIH', fullName: '油服', score: 82, relVol: 1.5, ivr: 65, change: '+8.5%' },
-      { name: 'AMLP', fullName: '能源基建', score: 76, relVol: 1.2, ivr: 58, change: '+6.2%' }
-    ]
-  },
-  'XLV': {
-    code: 'XLV',
-    name: '医疗板块',
-    trendLevel: 'Weak',
-    relMomentum: '+3.2%',
-    breadth: '48%',
-    capitalFlow: '-$0.3B',
-    trendQuality: 58,
-    industries: [
-      { name: 'XBI', fullName: '生物科技', score: 62, relVol: 1.1, ivr: 68, change: '+2.8%' },
-      { name: 'IHI', fullName: '医疗器械', score: 68, relVol: 1.0, ivr: 45, change: '+4.2%' },
-      { name: 'XLV', fullName: '制药', score: 65, relVol: 0.9, ivr: 42, change: '+3.0%' }
-    ]
-  },
-  'XLI': {
-    code: 'XLI',
-    name: '工业板块',
-    trendLevel: 'Stable',
-    relMomentum: '+5.6%',
-    breadth: '58%',
-    capitalFlow: '+$0.5B',
-    trendQuality: 68,
-    industries: [
-      { name: 'ITA', fullName: '航空航天', score: 78, relVol: 1.3, ivr: 55, change: '+7.8%' },
-      { name: 'IYT', fullName: '运输', score: 70, relVol: 1.1, ivr: 50, change: '+5.2%' },
-      { name: 'XLI', fullName: '工业设备', score: 72, relVol: 1.2, ivr: 48, change: '+5.8%' }
-    ]
-  },
-  'XLY': {
-    code: 'XLY',
-    name: '消费板块',
-    trendLevel: 'Strong',
-    relMomentum: '+10.5%',
-    breadth: '72%',
-    capitalFlow: '+$1.8B',
-    trendQuality: 85,
-    industries: [
-      { name: 'XRT', fullName: '零售', score: 86, relVol: 1.5, ivr: 62, change: '+11.2%' },
-      { name: 'PBJ', fullName: '餐饮', score: 82, relVol: 1.3, ivr: 55, change: '+9.8%' },
-      { name: 'XHB', fullName: '房建', score: 78, relVol: 1.4, ivr: 58, change: '+8.5%' }
-    ]
-  }
 };
 
 // ============ 辅助函数 ============
@@ -203,6 +169,59 @@ function getTrendLevelColor(level: string): string {
   if (level === 'Strong') return 'bg-emerald-50 border-emerald-200 text-emerald-600';
   if (level === 'Stable') return 'bg-blue-50 border-blue-200 text-blue-600';
   return 'bg-amber-50 border-amber-200 text-amber-600';
+}
+
+function clampScore(score?: number | null): number {
+  if (score === null || score === undefined || Number.isNaN(score)) return 0;
+  return Math.max(0, Math.min(100, Number(score.toFixed(1))));
+}
+
+function getHeatLevel(score: number): 'high' | 'medium' | 'low' {
+  if (score >= 85) return 'high';
+  if (score >= 70) return 'medium';
+  return 'low';
+}
+
+function getTrendLevel(delta: number | null, score?: number | null): 'Strong' | 'Stable' | 'Weak' {
+  if (delta !== null && delta !== undefined && !Number.isNaN(delta)) {
+    if (delta >= 1) return 'Strong';
+    if (delta <= -1) return 'Weak';
+    return 'Stable';
+  }
+  if (score !== null && score !== undefined && !Number.isNaN(score)) {
+    if (score >= 80) return 'Strong';
+    if (score >= 60) return 'Stable';
+    return 'Weak';
+  }
+  return 'Stable';
+}
+
+function formatDelta(value: number | null | undefined, digits = 1, suffix = ''): string {
+  if (value === null || value === undefined || Number.isNaN(value)) return '--';
+  const sign = value > 0 ? '+' : '';
+  return `${sign}${value.toFixed(digits)}${suffix}`;
+}
+
+function formatScoreValue(value: number | null | undefined, digits = 1): string {
+  if (value === null || value === undefined || Number.isNaN(value) || value <= 0) return '--';
+  return value.toFixed(digits);
+}
+
+function formatPercentValue(value: number | null | undefined, digits = 0): string {
+  if (value === null || value === undefined || Number.isNaN(value) || value <= 0) return '--';
+  return `${value.toFixed(digits)}%`;
+}
+
+function formatRankValue(value: number | null | undefined): string {
+  if (value === null || value === undefined || Number.isNaN(value) || value <= 0) return '--';
+  return `#${value}`;
+}
+
+function getDeltaColor(value: number | null | undefined): string {
+  if (value === null || value === undefined || Number.isNaN(value)) return 'text-slate-500';
+  if (value > 0) return 'text-emerald-600';
+  if (value < 0) return 'text-red-600';
+  return 'text-slate-600';
 }
 
 // ============ Regime 计算辅助 ============
@@ -247,7 +266,11 @@ function computeRegime(inputs: { price?: number; sma50?: number; return20d?: num
 
 // ============ 主组件 ============
 export function CoreTerminal() {
-  const [selectedSector, setSelectedSector] = useState<string>('XLK');
+  const [selectedSector, setSelectedSector] = useState<string>('');
+  const [sectorEtfs, setSectorEtfs] = useState<ETF[]>([]);
+  const [industryEtfs, setIndustryEtfs] = useState<ETF[]>([]);
+  const [sectorLoading, setSectorLoading] = useState(false);
+  const [sectorError, setSectorError] = useState<string | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [marketStatus, setMarketStatus] = useState<{
     status?: string;
@@ -264,9 +287,107 @@ export function CoreTerminal() {
     breadth?: string;
   }>({});
 
-  const currentSectorDetail = sectorDetails[selectedSector] || sectorDetails['XLK'];
+  const fetchSectorData = useCallback(async () => {
+    setSectorLoading(true);
+    setSectorError(null);
+    try {
+      const [sectorsResponse, industriesResponse] = await Promise.all([
+        api.getETFs('sector', false),
+        api.getETFs('industry', false),
+      ]);
 
-  const numberFromManual = (value?: string) => (value !== undefined && value !== '' ? Number(value) : undefined);
+      setSectorEtfs(sectorsResponse || []);
+      setIndustryEtfs(industriesResponse || []);
+      setSelectedSector((prev) => {
+        if (!sectorsResponse || sectorsResponse.length === 0) return prev;
+        const normalized = prev ? prev.toUpperCase() : '';
+        if (normalized && sectorsResponse.some((etf) => etf.symbol === normalized)) {
+          return normalized;
+        }
+        return sectorsResponse[0].symbol;
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '加载板块数据失败';
+      setSectorError(message);
+    } finally {
+      setSectorLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchSectorData();
+  }, [fetchSectorData]);
+
+  const sectorList = useMemo<Sector[]>(() => {
+    if (!sectorEtfs || sectorEtfs.length === 0) return [];
+    const sorted = [...sectorEtfs].sort((a, b) => {
+      const rankA = a.rank ?? 0;
+      const rankB = b.rank ?? 0;
+      if (rankA > 0 && rankB > 0) return rankA - rankB;
+      return (b.score ?? 0) - (a.score ?? 0);
+    });
+    return sorted.map((etf) => {
+      const score = clampScore(etf.score);
+      const delta = etf.delta?.delta5d ?? etf.delta?.delta3d ?? null;
+      return {
+        code: etf.symbol,
+        name: etf.name || etf.symbol,
+        score,
+        delta,
+        heat: getHeatLevel(score),
+      };
+    });
+  }, [sectorEtfs]);
+
+  const selectedSectorETF = useMemo(() => {
+    if (!selectedSector) return undefined;
+    return sectorEtfs.find((etf) => etf.symbol === selectedSector);
+  }, [sectorEtfs, selectedSector]);
+
+  const industryRows = useMemo<IndustryRow[]>(() => {
+    if (!selectedSector) return [];
+    const normalized = selectedSector.toUpperCase();
+    return industryEtfs
+      .filter((etf) => (etf.parentSector || '').toUpperCase() === normalized)
+      .sort((a, b) => {
+        const rankA = a.rank ?? 0;
+        const rankB = b.rank ?? 0;
+        if (rankA > 0 && rankB > 0) return rankA - rankB;
+        return (b.score ?? 0) - (a.score ?? 0);
+      })
+      .map((etf) => ({
+        symbol: etf.symbol,
+        name: etf.name || etf.symbol,
+        score: etf.score ?? 0,
+        completeness: etf.completeness ?? 0,
+        delta: etf.delta?.delta5d ?? etf.delta?.delta3d ?? null,
+        rank: etf.rank ?? 0,
+      }));
+  }, [industryEtfs, selectedSector]);
+
+  const handleBreadthChange = useCallback((value: string) => {
+    const trimmed = value.trim();
+    if (trimmed === '') {
+      setManualInputs((prev) => ({ ...prev, breadth: '' }));
+      return;
+    }
+
+    const normalized = trimmed.replace(/[^\d.-]/g, '');
+    const parsed = Number(normalized);
+    if (Number.isNaN(parsed)) {
+      setManualInputs((prev) => ({ ...prev, breadth: '' }));
+      return;
+    }
+
+    const clamped = Math.max(0, Math.min(100, parsed));
+    setManualInputs((prev) => ({ ...prev, breadth: clamped.toString() }));
+  }, []);
+
+  const numberFromManual = (value?: string) => {
+    if (value === undefined || value === '') return undefined;
+    const parsed = Number(value);
+    return Number.isNaN(parsed) ? undefined : parsed;
+  };
 
   const baseSpy = marketStatus?.spy || marketRegime.spy;
   const priceVal = numberFromManual(manualInputs.price) ?? baseSpy.price;
@@ -307,9 +428,21 @@ export function CoreTerminal() {
   const dist20 = percentDiff(effectiveSpy.price, effectiveSpy.sma20);
   const dist50 = effectiveSpy.distToSma50 ?? percentDiff(effectiveSpy.price, effectiveSpy.sma50);
 
+  const sectorDelta = selectedSectorETF?.delta?.delta5d ?? selectedSectorETF?.delta?.delta3d ?? null;
+  const sectorTrendLevel = getTrendLevel(sectorDelta, selectedSectorETF?.score);
+  const hasSectorData = Boolean(selectedSectorETF);
+  const sectorTrendDisplay = hasSectorData ? sectorTrendLevel : '--';
+  const sectorTrendColor = hasSectorData ? getTrendLevelColor(sectorTrendLevel) : 'bg-slate-50 border-slate-200 text-slate-500';
+  const sectorName = selectedSectorETF?.name || selectedSector || '—';
+  const sectorSymbol = selectedSectorETF?.symbol || selectedSector || '—';
+  const sectorSubtitle = selectedSectorETF
+    ? `${sectorName} · ${sectorName.replace('板块', '')} Sector`
+    : '暂无板块数据';
+
   const handleRefresh = async () => {
     setIsRefreshing(true);
     setMarketStatusError(null);
+    fetchSectorData();
     try {
       const response = await api.getMarketRegime();
       const spy = (response.spy || {}) as any;
@@ -394,7 +527,11 @@ export function CoreTerminal() {
             </div>
             <div className="text-center">
               <div className="text-sm text-white/80 mb-1">市场广度</div>
-              <div className="text-2xl font-bold">{displayRegime.breadth !== undefined ? `${displayRegime.breadth}%` : 'N/A'}</div>
+              <EditableNumber
+                value={displayRegime.breadth}
+                onChange={handleBreadthChange}
+                suffix="%"
+              />
             </div>
           </div>
         </div>
@@ -405,56 +542,80 @@ export function CoreTerminal() {
         {/* 左侧：板块热力榜 */}
         <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-lg">
           <div className="flex items-center gap-2 mb-6">
-            <FlameIcon className="text-orange-500" />
             <h3 className="text-lg font-bold text-slate-900">板块热力榜</h3>
           </div>
-          <div className="space-y-3">
-            {sectors.map(sector => (
-              <div 
-                key={sector.code}
-                onClick={() => setSelectedSector(sector.code)}
-                className={`p-4 rounded-xl cursor-pointer transition-all ${
-                  selectedSector === sector.code 
-                    ? 'bg-gradient-to-r from-blue-100 to-purple-100 border border-blue-300 shadow-md' 
-                    : 'bg-slate-50 hover:bg-slate-100 border border-slate-200'
-                }`}
+          {sectorError && (
+            <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 flex items-center justify-between">
+              <span>板块数据加载失败：{sectorError}</span>
+              <button
+                onClick={fetchSectorData}
+                className="text-xs font-medium text-red-600 hover:text-red-700"
               >
-                <div className="flex items-center justify-between mb-2">
-                  <div>
-                    <div className="font-bold text-sm text-slate-900">{sector.code}</div>
-                    <div className="text-xs text-slate-600">{sector.name}</div>
+                重试
+              </button>
+            </div>
+          )}
+          {sectorLoading && sectorList.length > 0 && (
+            <div className="mb-2 text-xs text-slate-400">正在更新...</div>
+          )}
+          {sectorLoading && sectorList.length === 0 ? (
+            <div className="text-sm text-slate-500">正在加载板块数据...</div>
+          ) : sectorList.length === 0 ? (
+            <div className="text-sm text-slate-500">暂无板块数据</div>
+          ) : (
+            <div className="space-y-3">
+              {sectorList.map((sector) => {
+                const scoreText = formatScoreValue(sector.score);
+                return (
+                  <div
+                    key={sector.code}
+                    onClick={() => setSelectedSector(sector.code)}
+                    className={`p-4 rounded-xl cursor-pointer transition-all ${
+                      selectedSector === sector.code
+                        ? 'bg-gradient-to-r from-blue-100 to-purple-100 border border-blue-300 shadow-md'
+                        : 'bg-slate-50 hover:bg-slate-100 border border-slate-200'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between mb-2">
+                      <div>
+                        <div className="font-bold text-sm text-slate-900">{sector.code}</div>
+                        <div className="text-xs text-slate-600">{sector.name}</div>
+                      </div>
+                      <div className="text-right">
+                        <div className={`text-lg font-bold ${getScoreColor(sector.score)}`}>{scoreText}</div>
+                        <div className="text-xs text-slate-600">综合分</div>
+                      </div>
+                    </div>
+                    <div className="flex items-center justify-between text-xs">
+                      <span className={`${getDeltaColor(sector.delta)} font-medium`}>
+                        {formatDelta(sector.delta, 1, '分')}
+                      </span>
+                      <FlameIcon className={`w-4 h-4 ${getHeatColor(sector.heat)}`} />
+                    </div>
+                    <div className="mt-2 h-1.5 bg-slate-200 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-gradient-to-r from-emerald-500 to-blue-500 transition-all duration-500"
+                        style={{ width: `${clampScore(sector.score)}%` }}
+                      />
+                    </div>
                   </div>
-                  <div className="text-right">
-                    <div className={`text-lg font-bold ${getScoreColor(sector.score)}`}>{sector.score}</div>
-                    <div className="text-xs text-slate-600">综合分</div>
-                  </div>
-                </div>
-                <div className="flex items-center justify-between text-xs">
-                  <span className="text-emerald-600 font-medium">{sector.momentum}</span>
-                  <FlameIcon className={`w-4 h-4 ${getHeatColor(sector.heat)}`} />
-                </div>
-                <div className="mt-2 h-1.5 bg-slate-200 rounded-full overflow-hidden">
-                  <div 
-                    className="h-full bg-gradient-to-r from-emerald-500 to-blue-500 transition-all duration-500" 
-                    style={{ width: `${sector.score}%` }}
-                  />
-                </div>
-              </div>
-            ))}
-          </div>
+                );
+              })}
+            </div>
+          )}
         </div>
 
         {/* 右侧：板块详情面板 (占2列) */}
         <div className="col-span-2 bg-white rounded-2xl p-6 border border-slate-200 shadow-lg">
           <div className="flex items-start justify-between mb-6">
             <div>
-              <h2 className="text-3xl font-bold text-slate-900 mb-2">{selectedSector}</h2>
-              <p className="text-slate-600">{currentSectorDetail.name} · {currentSectorDetail.name.replace('板块', '')} Sector</p>
+              <h2 className="text-3xl font-bold text-slate-900 mb-2">{sectorSymbol}</h2>
+              <p className="text-slate-600">{sectorSubtitle}</p>
             </div>
             <div className="flex items-center gap-3">
-              <div className={`px-4 py-2 rounded-sm border ${getTrendLevelColor(currentSectorDetail.trendLevel)}`}>
+              <div className={`px-4 py-2 rounded-sm border ${sectorTrendColor}`}>
                 <div className="text-xs mb-1">趋势等级</div>
-                <div className="text-xl font-bold">{currentSectorDetail.trendLevel}</div>
+                <div className="text-xl font-bold">{sectorTrendDisplay}</div>
               </div>
             </div>
           </div>
@@ -462,22 +623,28 @@ export function CoreTerminal() {
           {/* 四个关键指标卡片 */}
           <div className="grid grid-cols-4 gap-4 mb-6">
             <div className="bg-slate-50 rounded-xl p-4 border border-slate-200">
-              <div className="text-xs text-slate-600 mb-2">相对动量</div>
-              <div className="text-2xl font-bold text-blue-600">{currentSectorDetail.relMomentum}</div>
-            </div>
-            <div className="bg-slate-50 rounded-xl p-4 border border-slate-200">
-              <div className="text-xs text-slate-600 mb-2">行业广度</div>
-              <div className="text-2xl font-bold text-emerald-600">{currentSectorDetail.breadth}</div>
-            </div>
-            <div className="bg-slate-50 rounded-xl p-4 border border-slate-200">
-              <div className="text-xs text-slate-600 mb-2">资金流入</div>
-              <div className={`text-2xl font-bold ${currentSectorDetail.capitalFlow.startsWith('-') ? 'text-red-600' : 'text-purple-600'}`}>
-                {currentSectorDetail.capitalFlow}
+              <div className="text-xs text-slate-600 mb-2">综合评分</div>
+              <div className={`text-2xl font-bold ${getScoreColor(selectedSectorETF?.score ?? 0)}`}>
+                {formatScoreValue(selectedSectorETF?.score)}
               </div>
             </div>
             <div className="bg-slate-50 rounded-xl p-4 border border-slate-200">
-              <div className="text-xs text-slate-600 mb-2">趋势质量</div>
-              <div className="text-2xl font-bold text-amber-600">{currentSectorDetail.trendQuality}</div>
+              <div className="text-xs text-slate-600 mb-2">5D评分变化</div>
+              <div className={`text-2xl font-bold ${getDeltaColor(sectorDelta)}`}>
+                {formatDelta(sectorDelta, 1, '分')}
+              </div>
+            </div>
+            <div className="bg-slate-50 rounded-xl p-4 border border-slate-200">
+              <div className="text-xs text-slate-600 mb-2">数据完整度</div>
+              <div className="text-2xl font-bold text-purple-600">
+                {formatPercentValue(selectedSectorETF?.completeness)}
+              </div>
+            </div>
+            <div className="bg-slate-50 rounded-xl p-4 border border-slate-200">
+              <div className="text-xs text-slate-600 mb-2">排名</div>
+              <div className="text-2xl font-bold text-amber-600">
+                {formatRankValue(selectedSectorETF?.rank)}
+              </div>
             </div>
           </div>
 
@@ -486,33 +653,44 @@ export function CoreTerminal() {
             <h4 className="text-sm font-bold text-slate-700 mb-3 flex items-center gap-2">
               <BarChartIcon className="text-blue-600" />
               子行业强度排名
+              <span className="text-xs font-normal text-slate-500">({industryRows.length})</span>
             </h4>
-            <div className="space-y-2">
-              {currentSectorDetail.industries.map((ind, idx) => (
-                <div 
-                  key={ind.name}
-                  className="flex items-center gap-3 p-3 bg-slate-50 rounded-sm hover:bg-slate-100 border border-slate-200 transition-colors"
-                >
-                  <div className="w-8 h-8 bg-gradient-to-br from-blue-500 to-purple-600 rounded-sm flex items-center justify-center font-bold text-sm text-white">
-                    {idx + 1}
-                  </div>
-                  <div className="flex-1">
-                    <div className="flex items-center gap-2">
-                      <span className="font-bold text-sm text-slate-900">{ind.name}</span>
-                      <span className="text-xs text-slate-600">{ind.fullName}</span>
+            {industryRows.length === 0 ? (
+              <div className="text-sm text-slate-500">暂无子行业 ETF 数据</div>
+            ) : (
+              <div className="space-y-2">
+                {industryRows.map((ind, idx) => (
+                  <div
+                    key={ind.symbol}
+                    className="flex items-center gap-3 p-3 bg-slate-50 rounded-sm hover:bg-slate-100 border border-slate-200 transition-colors"
+                  >
+                    <div className="w-8 h-8 bg-gradient-to-br from-blue-500 to-purple-600 rounded-sm flex items-center justify-center font-bold text-sm text-white">
+                      {idx + 1}
                     </div>
-                    <div className="flex items-center gap-4 mt-1 text-xs text-slate-600">
-                      <span>相对成交: <span className="text-blue-600 font-medium">{ind.relVol}x</span></span>
-                      <span>IVR: <span className="text-purple-600 font-medium">{ind.ivr}</span></span>
+                    <div className="flex-1">
+                      <div className="flex items-center gap-2">
+                        <span className="font-bold text-sm text-slate-900">{ind.symbol}</span>
+                        <span className="text-xs text-slate-600">{ind.name}</span>
+                      </div>
+                      <div className="flex items-center gap-4 mt-1 text-xs text-slate-600">
+                        <span>
+                          综合分: <span className="text-blue-600 font-medium">{formatScoreValue(ind.score)}</span>
+                        </span>
+                        <span>
+                          完整度: <span className="text-purple-600 font-medium">{formatPercentValue(ind.completeness)}</span>
+                        </span>
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <div className={`text-lg font-bold ${getDeltaColor(ind.delta)}`}>
+                        {formatDelta(ind.delta, 1, '分')}
+                      </div>
+                      <div className="text-xs text-slate-600">5D评分变化</div>
                     </div>
                   </div>
-                  <div className="text-right">
-                    <div className="text-lg font-bold text-emerald-600">{ind.change}</div>
-                    <div className="text-xs text-slate-600">20D涨幅</div>
-                  </div>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       </div>

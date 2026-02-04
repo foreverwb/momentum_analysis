@@ -34,7 +34,7 @@ export function Header({ activeSection, onNavigate }: HeaderProps) {
   };
 
   return (
-    <header className="mb-6 flex items-center justify-between">
+    <header className="sticky top-0 z-50 mb-6 flex items-center justify-between bg-gradient-to-br from-slate-50 via-blue-50 to-slate-100 pb-4 pt-4 backdrop-blur-sm bg-opacity-95">
       {/* Logo Section - 参考原型设计 */}
       <div className="flex items-center gap-4">
         <div className="w-12 h-12 bg-gradient-to-br from-blue-600 to-purple-600 rounded-xl flex items-center justify-center shadow-lg">
