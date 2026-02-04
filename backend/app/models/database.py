@@ -6,13 +6,16 @@ from sqlalchemy import (
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime, date
+from pathlib import Path
 import enum
 import re
 import logging
 
 logger = logging.getLogger(__name__)
 
-SQLALCHEMY_DATABASE_URL = "sqlite:///./momentum_radar.db"
+BACKEND_ROOT = Path(__file__).resolve().parents[2]
+DB_FILE = BACKEND_ROOT / "momentum_radar.db"
+SQLALCHEMY_DATABASE_URL = f"sqlite:///{DB_FILE}"
 
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
@@ -99,6 +102,8 @@ class ETF(Base):
     
     # Delta JSON: {delta3d, delta5d}
     delta = Column(JSON, default=dict)
+    # 可用覆盖范围（例如 top10/weight70），用于前端导入后回显
+    coverage_ranges = Column(JSON, default=list)
     
     completeness = Column(Float, default=0.0)
     holdings_count = Column(Integer, default=0)
@@ -183,6 +188,24 @@ class IVData(Base):
     iv90 = Column(Float)
     total_oi = Column(BigInteger)
     delta_oi_1d = Column(BigInteger)
+    oi_bucket_0_7 = Column(BigInteger)
+    oi_bucket_8_30 = Column(BigInteger)
+    oi_bucket_31_90 = Column(BigInteger)
+    call_oi_bucket_0_7 = Column(BigInteger)
+    call_oi_bucket_8_30 = Column(BigInteger)
+    call_oi_bucket_31_90 = Column(BigInteger)
+    put_oi_bucket_0_7 = Column(BigInteger)
+    put_oi_bucket_8_30 = Column(BigInteger)
+    put_oi_bucket_31_90 = Column(BigInteger)
+    net_delta_oi_0_7 = Column(BigInteger)
+    net_delta_oi_8_30 = Column(BigInteger)
+    net_delta_oi_31_90 = Column(BigInteger)
+    call_delta_oi_0_7 = Column(BigInteger)
+    call_delta_oi_8_30 = Column(BigInteger)
+    call_delta_oi_31_90 = Column(BigInteger)
+    put_delta_oi_0_7 = Column(BigInteger)
+    put_delta_oi_8_30 = Column(BigInteger)
+    put_delta_oi_31_90 = Column(BigInteger)
     source = Column(String(20), default='futu')
     created_at = Column(DateTime, default=datetime.utcnow)
     
@@ -223,6 +246,22 @@ class ScoreSnapshot(Base):
     __table_args__ = (
         UniqueConstraint('symbol', 'symbol_type', 'date', name='uix_score_symbol_type_date'),
     )
+
+
+class MarketRegimeSnapshot(Base):
+    """市场环境每日快照表"""
+    __tablename__ = 'market_regime_snapshots'
+
+    id = Column(Integer, primary_key=True)
+    snapshot_date = Column(Date, nullable=False, unique=True, index=True)
+    status = Column(String(20), nullable=False)
+    regime_text = Column(String(50), nullable=True)
+    spy = Column(JSON, nullable=True)
+    vix = Column(Float, nullable=True)
+    indicators = Column(JSON, nullable=True)
+    error = Column(String(500), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class BrokerStatus(Base):
@@ -295,7 +334,10 @@ def init_db():
     """初始化数据库，创建所有表"""
     Base.metadata.create_all(bind=engine)
     _ensure_etfs_parent_sector_column()
+    _ensure_etfs_coverage_ranges_column()
     _ensure_stocks_heat_columns()
+    _ensure_iv_data_bucket_columns()
+    _ensure_options_overlay_indexes()
     logger.info("数据库表已创建")
 
 
@@ -311,6 +353,20 @@ def _ensure_etfs_parent_sector_column():
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE etfs ADD COLUMN parent_sector VARCHAR"))
         logger.info("已补齐列: etfs.parent_sector")
+
+
+def _ensure_etfs_coverage_ranges_column():
+    """为旧版 SQLite 数据库补齐 etfs.coverage_ranges 列"""
+    if engine.dialect.name != "sqlite":
+        return
+    inspector = inspect(engine)
+    if "etfs" not in inspector.get_table_names():
+        return
+    column_names = {col["name"] for col in inspector.get_columns("etfs")}
+    if "coverage_ranges" not in column_names:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE etfs ADD COLUMN coverage_ranges JSON DEFAULT '[]'"))
+        logger.info("已补齐列: etfs.coverage_ranges")
 
 
 def _ensure_stocks_heat_columns():
@@ -338,6 +394,65 @@ def _ensure_stocks_heat_columns():
                 sql = f"ALTER TABLE stocks ADD COLUMN {col_name} {col_type} DEFAULT {default_value}"
                 conn.execute(text(sql))
                 logger.info(f"已补齐列: stocks.{col_name}")
+
+
+def _ensure_options_overlay_indexes():
+    """为 options-overlay 关键查询补齐复合索引"""
+    if engine.dialect.name != "sqlite":
+        return
+    inspector = inspect(engine)
+    table_names = set(inspector.get_table_names())
+    with engine.begin() as conn:
+        if "imported_data" in table_names:
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_imported_symbol_source_date_id "
+                    "ON imported_data(symbol, source, date DESC, id DESC)"
+                )
+            )
+        if "iv_data" in table_names:
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_iv_symbol_date_id "
+                    "ON iv_data(symbol, date DESC, id DESC)"
+                )
+            )
+
+
+def _ensure_iv_data_bucket_columns():
+    """为旧版 SQLite 数据库补齐 iv_data 分桶与分桶增量列"""
+    if engine.dialect.name != "sqlite":
+        return
+    inspector = inspect(engine)
+    if "iv_data" not in inspector.get_table_names():
+        return
+    column_names = {col["name"] for col in inspector.get_columns("iv_data")}
+    required_columns = [
+        ("oi_bucket_0_7", "BIGINT"),
+        ("oi_bucket_8_30", "BIGINT"),
+        ("oi_bucket_31_90", "BIGINT"),
+        ("call_oi_bucket_0_7", "BIGINT"),
+        ("call_oi_bucket_8_30", "BIGINT"),
+        ("call_oi_bucket_31_90", "BIGINT"),
+        ("put_oi_bucket_0_7", "BIGINT"),
+        ("put_oi_bucket_8_30", "BIGINT"),
+        ("put_oi_bucket_31_90", "BIGINT"),
+        ("net_delta_oi_0_7", "BIGINT"),
+        ("net_delta_oi_8_30", "BIGINT"),
+        ("net_delta_oi_31_90", "BIGINT"),
+        ("call_delta_oi_0_7", "BIGINT"),
+        ("call_delta_oi_8_30", "BIGINT"),
+        ("call_delta_oi_31_90", "BIGINT"),
+        ("put_delta_oi_0_7", "BIGINT"),
+        ("put_delta_oi_8_30", "BIGINT"),
+        ("put_delta_oi_31_90", "BIGINT"),
+    ]
+    with engine.begin() as conn:
+        for col_name, col_type in required_columns:
+            if col_name in column_names:
+                continue
+            conn.execute(text(f"ALTER TABLE iv_data ADD COLUMN {col_name} {col_type}"))
+            logger.info(f"已补齐列: iv_data.{col_name}")
 
 
 def init_default_sector_etfs():

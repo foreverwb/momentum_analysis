@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState, useCallback } from 'react';
 import { RefreshProgressModal } from '../modal';
 import type { RefreshResult } from '../../types';
+import { getHoldingsRefreshProgress } from '../../services/api';
 
 interface DataStatus {
   source: 'Finviz' | 'MarketChameleon' | '市场数据' | '期权数据' | 'IBKR' | 'Futu';
@@ -12,11 +13,11 @@ interface DataStatus {
 interface HoldingSummary {
   ticker: string;
   weight: number;
-  dataStatus?: 'complete' | 'pending' | 'missing';
+  dataStatus?: 'complete' | 'pending' | 'missing' | 'loading';
   completeness?: number;  // 0-100 percentage
-  score?: number; // 个股得分
+  score?: number | null; // 个股得分
   dataSources?: Record<string, boolean>;  // { finviz, market_chameleon, market_data, options_data }
-  updatedAt?: string;  // timestamp
+  updatedAt?: string | null;  // timestamp
 }
 
 interface ETFDetailCardProps {
@@ -34,7 +35,7 @@ interface ETFDetailCardProps {
     dataStatus: DataStatus[];
   };
   coverageRanges?: string[];
-  onRefreshHoldings: (coverageId: string) => Promise<unknown>;
+  onRefreshHoldings: (coverageId: string, expectedSymbolsCount?: number, progressToken?: string) => Promise<unknown>;
   onImportHoldings?: (coverageId?: string) => void;
   onViewStockDetail?: (ticker: string) => void;
   refreshResult?: RefreshResult;
@@ -60,53 +61,53 @@ const COVERAGE_OPTIONS: CoverageOption[] = [
   { id: 'weight85', label: 'Weight85%', type: 'weight', value: 85 },
 ];
 
-const statusConfig = {
-  complete: {
-    label: '完整',
-    bgColor: 'rgba(34, 197, 94, 0.1)',
-    textColor: 'var(--accent-green)',
-    icon: (
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-        <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
-      </svg>
-    ),
-  },
-  pending: {
-    label: '待更新',
-    bgColor: 'rgba(245, 158, 11, 0.1)',
-    textColor: 'var(--accent-amber)',
-    icon: (
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-        <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
-      </svg>
-    ),
-  },
-  missing: {
-    label: '缺失',
-    bgColor: 'rgba(239, 68, 68, 0.1)',
-    textColor: 'var(--accent-red)',
-    icon: (
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-        <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
-      </svg>
-    ),
-  },
-  loading: {
-    label: '加载中',
-    bgColor: 'rgba(59, 130, 246, 0.1)',
-    textColor: 'var(--accent-blue)',
-    icon: (
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="animate-spin">
-        <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
-      </svg>
-    ),
-  },
+const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000;
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
+type CoverageSourceKey = 'finviz' | 'marketchameleon' | 'ibkr' | 'futu';
+
+const COVERAGE_SOURCE_META: Record<CoverageSourceKey, { label: string; color: string }> = {
+  finviz: { label: 'Finviz', color: '#93c5fd' },
+  marketchameleon: { label: 'MarketChameleon', color: '#86efac' },
+  ibkr: { label: '市场数据(IBKR)', color: '#fca5a5' },
+  futu: { label: '期权数据(Futu)', color: '#fb923c' },
 };
 
-const holdingStatusConfig = {
-  complete: { color: 'var(--accent-green)' },
-  pending: { color: 'var(--accent-amber)' },
-  missing: { color: 'var(--text-muted)' },
+interface RefreshDimension {
+  score?: number;
+  data?: Record<string, unknown>;
+}
+
+const toNumber = (value: unknown): number | undefined => {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const resolveDimension = (
+  breakdown: RefreshResult['breakdown'],
+  key: 'rel_mom' | 'trend_quality' | 'breadth' | 'options_confirm'
+): RefreshDimension => {
+  const source = breakdown?.[key];
+  if (source === undefined || source === null) {
+    return {};
+  }
+  if (typeof source === 'number') {
+    return { score: source };
+  }
+  if (isRecord(source)) {
+    return {
+      score: toNumber(source.score),
+      data: isRecord(source.data) ? source.data : undefined,
+    };
+  }
+  return {};
 };
 
 // 评分维度卡片组件
@@ -168,9 +169,25 @@ const formatWeight = (value: number): string => {
   return value.toFixed(2);
 };
 
+const normalizeIsoTimestamp = (value?: string | null): string | null => {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  // Backend may return naive UTC timestamps; normalize to explicit UTC for stable parsing.
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(trimmed)) {
+    return `${trimmed}Z`;
+  }
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(trimmed)) {
+    return `${trimmed.replace(' ', 'T')}Z`;
+  }
+  return trimmed;
+};
+
 const formatUpdatedAt = (value?: string | null): string => {
   if (!value) return '--';
-  const date = new Date(value);
+  const normalized = normalizeIsoTimestamp(value);
+  if (!normalized) return '--';
+  const date = new Date(normalized);
   if (Number.isNaN(date.getTime())) return '--';
   const utc = date.getTime() + date.getTimezoneOffset() * 60 * 1000;
   const beijing = new Date(utc + 8 * 60 * 60 * 1000);
@@ -200,44 +217,101 @@ const getCoverageHoldings = (holdings: HoldingSummary[], option: CoverageOption)
   return picked;
 };
 
-// 获取北京时间当天 8 点的时间戳
-const getBeiјingToday8AM = (): number => {
-  const now = new Date();
-  const utcTime = now.getTime();
-  const beijingTime = new Date(utcTime + 8 * 60 * 60 * 1000);
-
-  const year = beijingTime.getUTCFullYear();
-  const month = beijingTime.getUTCMonth();
-  const date = beijingTime.getUTCDate();
-
-  return new Date(year, month, date, 8, 0, 0).getTime();
+const getBeijingResetBoundaryMs = (nowMs: number): number => {
+  const beijingNow = new Date(nowMs + BEIJING_OFFSET_MS);
+  const year = beijingNow.getUTCFullYear();
+  const month = beijingNow.getUTCMonth();
+  const day = beijingNow.getUTCDate();
+  const hour = beijingNow.getUTCHours();
+  let boundaryUtcMs = Date.UTC(year, month, day, 0, 0, 0, 0); // 08:00 BJT
+  if (hour < 8) {
+    boundaryUtcMs -= ONE_DAY_MS;
+  }
+  return boundaryUtcMs;
 };
 
-// 检查当前覆盖范围下的所有 holdings 是否都有在北京时间 8 点以后更新的 MarketChameleon 和 Finviz 数据
-const areHoldingsDataUpdatedAfter8AM = (holdings: HoldingSummary[]): boolean => {
-  if (!holdings.length) {
+const parseUpdatedAtMs = (value?: string | null): number => {
+  if (!value) return Number.NaN;
+  const normalized = normalizeIsoTimestamp(value);
+  if (!normalized) return Number.NaN;
+  return new Date(normalized).getTime();
+};
+
+const hasFreshHoldingData = (holding: HoldingSummary, boundaryMs: number): boolean => {
+  const updatedAtMs = parseUpdatedAtMs(holding.updatedAt);
+  if (!Number.isFinite(updatedAtMs) || updatedAtMs < boundaryMs) {
     return false;
   }
 
-  const todayBeijing8AM = getBeiјingToday8AM();
+  const sourceFlags = [
+    getHoldingSourceAvailable(holding, 'finviz'),
+    getHoldingSourceAvailable(holding, 'marketchameleon'),
+    getHoldingSourceAvailable(holding, 'ibkr'),
+    getHoldingSourceAvailable(holding, 'futu'),
+  ].filter((flag): flag is boolean => typeof flag === 'boolean');
 
-  return holdings.every(holding => {
-    const dataSources = holding.dataSources || {};
-    const hasFinviz = dataSources.finviz === true;
-    const hasMarketChameleon = dataSources.market_chameleon === true;
+  // 若已具备来源明细，则“完整”定义为当前可识别来源全部可用且为当日有效
+  if (sourceFlags.length > 0) {
+    return sourceFlags.every((flag) => flag === true);
+  }
 
-    if (!hasFinviz || !hasMarketChameleon) {
-      return false;
-    }
+  // 回退逻辑（历史数据兼容）
+  if (holding.dataStatus === 'missing' || holding.dataStatus === 'pending') {
+    return false;
+  }
+  return true;
+};
 
-    // 检查 updatedAt 是否晚于北京时间 8 点
-    if (!holding.updatedAt) {
-      return false;
-    }
+const isHoldingSourceFresh = (
+  holding: HoldingSummary,
+  sourceKey: CoverageSourceKey,
+  boundaryMs: number
+): boolean => {
+  const sourceReady = getHoldingSourceAvailable(holding, sourceKey) === true;
+  if (!sourceReady) return false;
+  const updatedAtMs = parseUpdatedAtMs(holding.updatedAt);
+  return Number.isFinite(updatedAtMs) && updatedAtMs >= boundaryMs;
+};
 
-    const updatedAtTime = new Date(holding.updatedAt).getTime();
-    return updatedAtTime >= todayBeijing8AM;
-  });
+const getHoldingSourceAvailable = (
+  holding: HoldingSummary,
+  sourceKey: CoverageSourceKey
+): boolean | undefined => {
+  const dataSources = holding.dataSources;
+  if (!dataSources) return undefined;
+  if (sourceKey === 'finviz') {
+    return dataSources.finviz;
+  }
+  if (sourceKey === 'marketchameleon') {
+    return dataSources.marketchameleon ?? dataSources.market_chameleon ?? dataSources.mc_options;
+  }
+  if (sourceKey === 'ibkr') {
+    return dataSources.ibkr ?? dataSources.market_data ?? dataSources.ibkr_price ?? dataSources.ibkr_relmom ?? dataSources.ibkr_trend;
+  }
+  return dataSources.futu ?? dataSources.options_data ?? dataSources.futu_iv;
+};
+
+const getCoverageAccentColor = (option: CoverageOption): string => {
+  switch (option.id) {
+    case 'top10':
+      return '#f59e0b';
+    case 'top15':
+      return '#ec4899';
+    case 'top20':
+      return '#3b82f6';
+    case 'top30':
+      return '#10b981';
+    default:
+      return option.type === 'weight' ? '#8b5cf6' : 'var(--accent-blue)';
+  }
+};
+
+const createProgressToken = (): string => {
+  const tokenCore =
+    typeof globalThis.crypto !== 'undefined' && typeof globalThis.crypto.randomUUID === 'function'
+      ? globalThis.crypto.randomUUID().replace(/-/g, '')
+      : `${Date.now()}_${Math.random().toString(36).slice(2, 12)}`;
+  return `hld_${tokenCore}`;
 };
 
 export function ETFDetailCard({
@@ -250,6 +324,10 @@ export function ETFDetailCard({
 }: ETFDetailCardProps) {
   const [activeCoverage, setActiveCoverage] = useState<CoverageOption['id']>('top10');
   const lastRefreshResult = refreshResult || null;
+  const relMom = resolveDimension(lastRefreshResult?.breakdown, 'rel_mom');
+  const trendQuality = resolveDimension(lastRefreshResult?.breakdown, 'trend_quality');
+  const breadth = resolveDimension(lastRefreshResult?.breakdown, 'breadth');
+  const optionsConfirm = resolveDimension(lastRefreshResult?.breakdown, 'options_confirm');
 
   // Unified refresh modal state for both ETF and Holdings refresh
   const [showRefreshModal, setShowRefreshModal] = useState(false);
@@ -277,11 +355,19 @@ export function ETFDetailCard({
 
   // Top holdings section collapse state
   const [isTopHoldingsCollapsed, setIsTopHoldingsCollapsed] = useState(false);
+  const [clockNowMs, setClockNowMs] = useState<number>(() => Date.now());
 
   const sortedHoldings = useMemo(() => {
     const holdings = etf.holdings || [];
     return [...holdings].sort((a, b) => b.weight - a.weight);
   }, [etf.holdings]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setClockNowMs(Date.now());
+    }, 30 * 1000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   // 按得分排序的前五标的（若无得分则按权重排序）
   const topScoreHoldings = useMemo(() => {
@@ -317,9 +403,65 @@ export function ETFDetailCard({
   }, [activeCoverage, availableCoverageOptions]);
 
   const showCoverageSection = availableCoverageOptions.length >= 1;
+  const beijingResetBoundaryMs = useMemo(() => getBeijingResetBoundaryMs(clockNowMs), [clockNowMs]);
+
+  const coverageStatsByOption = useMemo(() => {
+    const stats = new Map<CoverageOption['id'], {
+      total: number;
+      completeCount: number;
+      pendingCount: number;
+      allComplete: boolean;
+    }>();
+
+    availableCoverageOptions.forEach((option) => {
+      const holdings = getCoverageHoldings(sortedHoldings, option);
+      const completeCount = holdings.filter((holding) => hasFreshHoldingData(holding, beijingResetBoundaryMs)).length;
+      const pendingCount = Math.max(0, holdings.length - completeCount);
+      stats.set(option.id, {
+        total: holdings.length,
+        completeCount,
+        pendingCount,
+        allComplete: holdings.length > 0 && pendingCount === 0,
+      });
+    });
+
+    return stats;
+  }, [availableCoverageOptions, sortedHoldings, beijingResetBoundaryMs]);
+
   const activeOption = availableCoverageOptions.find((option) => option.id === activeCoverage) || availableCoverageOptions[0] || COVERAGE_OPTIONS[0];
   const activeHoldings = getCoverageHoldings(sortedHoldings, activeOption);
   const coverageSum = activeHoldings.reduce((sum, item) => sum + item.weight, 0);
+  const activeCoverageStats = coverageStatsByOption.get(activeOption.id) || {
+    total: activeHoldings.length,
+    completeCount: activeHoldings.filter((holding) => hasFreshHoldingData(holding, beijingResetBoundaryMs)).length,
+    pendingCount: activeHoldings.filter((holding) => !hasFreshHoldingData(holding, beijingResetBoundaryMs)).length,
+    allComplete: false,
+  };
+
+  const activeCoverageSourceIndicators = useMemo(() => {
+    const latestMs = activeHoldings.reduce((acc, holding) => {
+      const ts = parseUpdatedAtMs(holding.updatedAt);
+      return Number.isFinite(ts) ? Math.max(acc, ts) : acc;
+    }, Number.NEGATIVE_INFINITY);
+    const latestUpdatedAt = Number.isFinite(latestMs) ? new Date(latestMs).toISOString() : null;
+
+    return (Object.keys(COVERAGE_SOURCE_META) as CoverageSourceKey[]).map((sourceKey) => {
+      const hasCompleteCoverage =
+        activeHoldings.length > 0 &&
+        activeHoldings.every((holding) => typeof getHoldingSourceAvailable(holding, sourceKey) === 'boolean');
+      const isComplete =
+        hasCompleteCoverage &&
+        activeHoldings.every((holding) => isHoldingSourceFresh(holding, sourceKey, beijingResetBoundaryMs));
+      return {
+        key: sourceKey,
+        label: COVERAGE_SOURCE_META[sourceKey].label,
+        color: COVERAGE_SOURCE_META[sourceKey].color,
+        isComplete,
+        statusLabel: isComplete ? '完备' : '缺失',
+        updatedAt: latestUpdatedAt,
+      };
+    });
+  }, [activeHoldings, beijingResetBoundaryMs]);
 
   const formatDelta = (value: number | null): { text: string; className: string } => {
     if (value === null || value === undefined) {
@@ -340,12 +482,24 @@ export function ETFDetailCard({
   const handleRefreshHoldings = useCallback(async () => {
     // 防止重复点击
     if (holdingsRefreshState.isLoading) return;
+    const estimatedSymbolsCount =
+      activeHoldings.length > 0
+        ? activeHoldings.length
+        : activeOption.type === 'top'
+          ? activeOption.value
+          : undefined;
+    const progressToken = createProgressToken();
+    const defaultProgressTotal =
+      estimatedSymbolsCount && estimatedSymbolsCount > 0 ? estimatedSymbolsCount : 1;
 
     // 立即更新UI状态
     setHoldingsRefreshState({
       isLoading: true,
       progress: 0,
-      message: '已发送请求，等待后端返回...',
+      message:
+        estimatedSymbolsCount && estimatedSymbolsCount > 0
+          ? `已发送请求，预计处理 ${estimatedSymbolsCount} 个标的...`
+          : '已发送请求，等待后端返回...',
     });
 
     // 立即显示模态框 - 这是关键
@@ -353,29 +507,110 @@ export function ETFDetailCard({
     setRefreshModalTitle(`正在刷新 ${etf.symbol} ${activeOption.label} Holdings`);
     setRefreshModalProgress({
       completed: 0,
-      total: 1,
+      total: estimatedSymbolsCount && estimatedSymbolsCount > 0 ? estimatedSymbolsCount : 1,
       currentItem: '',
-      message: '请求中...',
+      message:
+        estimatedSymbolsCount && estimatedSymbolsCount > 0
+          ? `请求中...（${estimatedSymbolsCount} 个标的）`
+          : '请求中...',
     });
     setRefreshModalError(false);
     setRefreshModalComplete(false);
 
+    let stopPolling = false;
+    let pollTimer: number | null = null;
+    let pollFailureCount = 0;
+    const pollProgress = async () => {
+      if (stopPolling) return;
+      try {
+        const progress = await getHoldingsRefreshProgress(etf.symbol, progressToken);
+        if (stopPolling) return;
+        pollFailureCount = 0;
+
+        const total =
+          typeof progress.total === 'number' && progress.total > 0
+            ? progress.total
+            : defaultProgressTotal;
+        const completedRaw = typeof progress.completed === 'number' ? progress.completed : 0;
+        const completed = Math.min(total, Math.max(0, completedRaw));
+        const currentItem = typeof progress.current_item === 'string' ? progress.current_item : '';
+        const message =
+          typeof progress.message === 'string' && progress.message.trim() !== ''
+            ? progress.message
+            : `请求中...（${total} 个标的）`;
+
+        setRefreshModalProgress({
+          completed,
+          total,
+          currentItem,
+          message,
+        });
+        setHoldingsRefreshState({
+          isLoading: true,
+          progress: total > 0 ? Math.round((completed / total) * 100) : 0,
+          message,
+        });
+
+        if (progress.status === 'completed' || progress.status === 'error') {
+          stopPolling = true;
+          if (pollTimer !== null) {
+            window.clearInterval(pollTimer);
+            pollTimer = null;
+          }
+        }
+      } catch {
+        pollFailureCount += 1;
+        if (pollFailureCount >= 3) {
+          stopPolling = true;
+          if (pollTimer !== null) {
+            window.clearInterval(pollTimer);
+            pollTimer = null;
+          }
+          setRefreshModalProgress((prev) => ({
+            ...prev,
+            message: '进度同步暂不可用，等待后端任务完成...',
+          }));
+        }
+      }
+    };
+    void pollProgress();
+    pollTimer = window.setInterval(() => {
+      void pollProgress();
+    }, 2000);
+
     try {
-      const resp = await onRefreshHoldings(activeCoverage);
+      const resp = await onRefreshHoldings(activeCoverage, estimatedSymbolsCount, progressToken);
+      stopPolling = true;
+      if (pollTimer !== null) {
+        window.clearInterval(pollTimer);
+        pollTimer = null;
+      }
+      const responseRecord = resp as { message?: string; stocks_count?: number; updated_stocks?: unknown[] };
+      const refreshedCount = typeof responseRecord.stocks_count === 'number'
+        ? responseRecord.stocks_count
+        : Array.isArray(responseRecord.updated_stocks)
+          ? responseRecord.updated_stocks.length
+          : 0;
+      const progressTotal = estimatedSymbolsCount && estimatedSymbolsCount > 0
+        ? estimatedSymbolsCount
+        : refreshedCount > 0
+          ? refreshedCount
+          : defaultProgressTotal;
+      const progressCompleted = Math.min(progressTotal, refreshedCount > 0 ? refreshedCount : progressTotal);
 
       // 完成状态
       setRefreshModalProgress({
-        completed: 1,
-        total: 1,
+        completed: progressCompleted,
+        total: progressTotal,
         currentItem: '',
-        message: (resp as { message?: string })?.message || '刷新完成',
+        message: responseRecord.message || '刷新完成',
       });
       setRefreshModalComplete(true);
 
       setHoldingsRefreshState({
         isLoading: false,
         progress: 100,
-        message: (resp as { message?: string })?.message || '刷新完成',
+        message: responseRecord.message || '刷新完成',
       });
 
       // 延迟关闭模态框（1.5秒后自动关闭，给用户查看结果的时间）
@@ -387,13 +622,18 @@ export function ETFDetailCard({
         }, 500);
       }, 1500);
     } catch (error) {
+      stopPolling = true;
+      if (pollTimer !== null) {
+        window.clearInterval(pollTimer);
+        pollTimer = null;
+      }
       const errorMsg = error instanceof Error ? error.message : '刷新失败';
       console.error('Holdings refresh error:', error);
 
       // 错误状态
       setRefreshModalProgress({
         completed: 0,
-        total: 1,
+        total: defaultProgressTotal,
         currentItem: '',
         message: errorMsg,
       });
@@ -413,8 +653,20 @@ export function ETFDetailCard({
           setHoldingsRefreshState({ isLoading: false, progress: 0, message: '' });
         }, 500);
       }, 2000);
+    } finally {
+      stopPolling = true;
+      if (pollTimer !== null) {
+        window.clearInterval(pollTimer);
+      }
     }
-  }, [holdingsRefreshState.isLoading, activeCoverage, activeOption, onRefreshHoldings, etf.symbol]);
+  }, [
+    holdingsRefreshState.isLoading,
+    activeCoverage,
+    activeOption,
+    activeHoldings.length,
+    onRefreshHoldings,
+    etf.symbol,
+  ]);
 
   const getCoverageTabStyle = (option: CoverageOption, isActive: boolean) => {
     const baseStyle = 'px-3 py-1.5 text-xs font-medium rounded-full border-2 transition-all cursor-pointer flex items-center gap-1.5';
@@ -476,36 +728,36 @@ export function ETFDetailCard({
           <ScoreDimensionCard
             label="相对动量"
             weight="45%"
-            score={lastRefreshResult?.breakdown?.rel_mom?.score}
+            score={relMom.score}
             color="var(--accent-green)"
-            data={lastRefreshResult?.breakdown?.rel_mom?.data}
+            data={relMom.data}
           />
 
           {/* 趋势质量 (25%) */}
           <ScoreDimensionCard
             label="趋势质量"
             weight="25%"
-            score={lastRefreshResult?.breakdown?.trend_quality?.score}
+            score={trendQuality.score}
             color="var(--accent-blue)"
-            data={lastRefreshResult?.breakdown?.trend_quality?.data}
+            data={trendQuality.data}
           />
 
           {/* 广度/参与度 (20%) */}
           <ScoreDimensionCard
             label="广度/参与度"
             weight="20%"
-            score={lastRefreshResult?.breakdown?.breadth?.score}
+            score={breadth.score}
             color="var(--accent-amber)"
-            data={lastRefreshResult?.breakdown?.breadth?.data}
+            data={breadth.data}
           />
 
           {/* 期权确认 (10%) */}
           <ScoreDimensionCard
             label="期权确认"
             weight="10%"
-            score={lastRefreshResult?.breakdown?.options_confirm?.score}
+            score={optionsConfirm.score}
             color="var(--accent-purple)"
-            data={lastRefreshResult?.breakdown?.options_confirm?.data}
+            data={optionsConfirm.data}
           />
         </div>
       </div>
@@ -514,17 +766,13 @@ export function ETFDetailCard({
       {showCoverageSection && (
         <div className="px-5 py-5">
           <div className="pt-0 border-t border-[var(--border-light)]">
-            <div className="flex items-center gap-2 text-[13px] text-[var(--text-muted)] mb-3">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path strokeLinecap="round" strokeLinejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/>
-              </svg>
-              已导入的覆盖范围（点击切换查看详情）
-            </div>
-
             {/* Coverage Tab Buttons */}
-            <div className="flex items-center gap-2 flex-wrap mb-3">
+            <div className="flex items-center gap-2 flex-wrap mb-3 mt-3">
               {availableCoverageOptions.map((option) => {
                 const isActive = option.id === activeCoverage;
+                const optionStats = coverageStatsByOption.get(option.id);
+                const dotColor = getCoverageAccentColor(option);
+                const isComplete = Boolean(optionStats?.allComplete);
                 return (
                   <button
                     key={option.id}
@@ -532,8 +780,11 @@ export function ETFDetailCard({
                     className={getCoverageTabStyle(option, isActive)}
                   >
                     <span
-                      className="w-2 h-2 rounded-full"
-                      style={{ background: 'var(--accent-green)' }}
+                      className="w-2 h-2 rounded-full border"
+                      style={{
+                        borderColor: dotColor,
+                        background: isComplete ? dotColor : 'transparent',
+                      }}
                     />
                     {option.label}
                   </button>
@@ -561,23 +812,45 @@ export function ETFDetailCard({
                     >
                       {activeOption.label}
                     </span>
-                    <span className="text-sm font-medium text-[var(--text-primary)]">
-                      持仓股数据状态
-                    </span>
                   </div>
                   <div className="flex items-center gap-3 text-xs">
-                    <span className="flex items-center gap-1">
-                      <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent-green)]" />
-                      <span className="text-[var(--text-muted)]">
-                        {activeHoldings.filter(h => h.dataStatus !== 'missing').length} 完整
+                    <div className="flex items-center gap-1.5">
+                      {activeCoverageSourceIndicators.map((indicator) => (
+                        <span
+                          key={indicator.key}
+                          className="relative inline-flex h-2.5 w-2.5 items-center justify-center rounded-full border"
+                          style={{
+                            borderColor: indicator.isComplete ? indicator.color : '#cbd5e1',
+                            background: indicator.isComplete ? indicator.color : 'transparent',
+                          }}
+                          title={`${indicator.label}: ${indicator.statusLabel} · ${formatUpdatedAt(indicator.updatedAt)}`}
+                        >
+                          {!indicator.isComplete && (
+                            <svg
+                              width="6"
+                              height="6"
+                              viewBox="0 0 8 8"
+                              fill="none"
+                              className="pointer-events-none"
+                            >
+                              <path d="M1 1L7 7M7 1L1 7" stroke="#94a3b8" strokeWidth="1.25" strokeLinecap="round" />
+                            </svg>
+                          )}
+                        </span>
+                      ))}
+                    </div>
+                    <div className="flex flex-col gap-1 text-left">
+                      <span className="flex items-center gap-1">
+                        <span className="text-[var(--text-muted)]">
+                         Completed: {activeCoverageStats.completeCount} 
+                        </span>
                       </span>
-                    </span>
-                    <span className="flex items-center gap-1">
-                      <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent-amber)]" />
-                      <span className="text-[var(--text-muted)]">
-                        {activeHoldings.filter(h => h.dataStatus === 'pending').length} 待更新
+                      <span className="flex items-center gap-1">
+                        <span className="text-[var(--text-muted)]">
+                          Incomplete: {activeCoverageStats.pendingCount} 
+                        </span>
                       </span>
-                    </span>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -596,7 +869,12 @@ export function ETFDetailCard({
                 {activeHoldings.length > 0 ? (
                   <div className="flex flex-wrap gap-2">
                     {activeHoldings.map((holding) => {
-                      const statusColor = holdingStatusConfig[holding.dataStatus || 'complete'].color;
+                      const isHoldingComplete = hasFreshHoldingData(holding, beijingResetBoundaryMs);
+                      const statusColor = isHoldingComplete
+                        ? 'var(--accent-green)'
+                        : holding.dataStatus === 'missing'
+                          ? 'var(--accent-red)'
+                          : 'var(--accent-amber)';
                       const completeness = holding.completeness || 0;
                       const dataSources = holding.dataSources || {};
 
@@ -630,33 +908,14 @@ export function ETFDetailCard({
                           }`}
                           title={tooltipText}
                         >
-                          {/* Status indicator with completeness ring */}
-                          <div className="relative w-3 h-3 flex-shrink-0">
-                            <div
-                              className="w-1.5 h-1.5 rounded-full absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2"
-                              style={{ background: statusColor }}
-                            />
-                            {/* Completeness ring */}
-                            {completeness < 100 && (
-                              <svg className="absolute inset-0" viewBox="0 0 12 12">
-                                <circle
-                                  cx="6"
-                                  cy="6"
-                                  r="5"
-                                  fill="none"
-                                  stroke={
-                                    completeness >= 80
-                                      ? 'var(--accent-green)'
-                                      : completeness >= 50
-                                      ? 'var(--accent-amber)'
-                                      : 'var(--accent-red)'
-                                  }
-                                  strokeWidth="1"
-                                  opacity="0.3"
-                                />
-                              </svg>
-                            )}
-                          </div>
+                          {/* Data freshness indicator: complete=solid, pending=hollow */}
+                          <span
+                            className="h-2.5 w-2.5 rounded-full border flex-shrink-0"
+                            style={{
+                              borderColor: statusColor,
+                              background: isHoldingComplete ? statusColor : 'transparent',
+                            }}
+                          />
 
                           <span className="font-semibold text-[var(--text-primary)]">
                             {holding.ticker}
@@ -730,25 +989,40 @@ export function ETFDetailCard({
         {!isTopHoldingsCollapsed && (
           <div className="border border-[var(--border-light)] rounded-[var(--radius-md)] overflow-hidden">
             {topScoreHoldings.length > 0 ? (
-              topScoreHoldings.map((holding) => (
-                <div
-                  key={holding.ticker}
-                  className="flex items-center justify-between text-xs px-3 py-2.5 border-b border-[var(--border-light)] last:border-0"
-                >
-                  <div className="flex items-center gap-2">
-                    <span className="text-[var(--text-primary)] font-semibold min-w-[60px]">{holding.ticker}</span>
-                    <span className="text-[var(--text-muted)]">
-                      {formatWeight(holding.weight)}%
+              topScoreHoldings.map((holding) => {
+                const isHoldingComplete = hasFreshHoldingData(holding, beijingResetBoundaryMs);
+                const statusColor = isHoldingComplete
+                  ? 'var(--accent-green)'
+                  : holding.dataStatus === 'missing'
+                    ? 'var(--accent-red)'
+                    : 'var(--accent-amber)';
+                return (
+                  <div
+                    key={holding.ticker}
+                    className="flex items-center justify-between text-xs px-3 py-2.5 border-b border-[var(--border-light)] last:border-0"
+                  >
+                    <div className="flex items-center gap-2">
+                      <span
+                        className="h-2.5 w-2.5 rounded-full border flex-shrink-0"
+                        style={{
+                          borderColor: statusColor,
+                          background: isHoldingComplete ? statusColor : 'transparent',
+                        }}
+                      />
+                      <span className="text-[var(--text-primary)] font-semibold min-w-[60px]">{holding.ticker}</span>
+                      <span className="text-[var(--text-muted)]">
+                        {formatWeight(holding.weight)}%
+                      </span>
+                    </div>
+                    <span className="text-sm font-bold text-[var(--accent-blue)]">
+                      {typeof holding.score === 'number' ? holding.score.toFixed(1) : '--'}
                     </span>
-                  </div>
-                  <span className="text-sm font-bold text-[var(--accent-blue)]">
-                    {typeof holding.score === 'number' ? holding.score.toFixed(1) : '--'}
-                  </span>
-                   <span className="text-[var(--text-muted)]">
+                    <span className="text-[var(--text-muted)]">
                       {formatUpdatedAt(holding.updatedAt)}
                     </span>
-                </div>
-              ))
+                  </div>
+                );
+              })
             ) : (
               <div className="text-xs text-[var(--text-muted)] px-3 py-3 text-center">
                 暂无得分数据，请先刷新或导入数据。

@@ -82,7 +82,7 @@ export const StockList = memo(function StockList({
     return (
       <VirtualStockList
         stocks={stocks}
-        itemHeight={280}
+        itemHeight={420}
         maxHeight={maxHeight}
         renderStock={renderStock}
         keyExtractor={keyExtractor}

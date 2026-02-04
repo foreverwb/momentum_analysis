@@ -35,12 +35,18 @@ MC_FIELD_MAPPING = {
     "Relative Notional to 90-Day Avg": "rel_notional_to_90d",
     "Rel Notional to 90-Day Avg": "rel_notional_to_90d",
     "RelNotional90d": "rel_notional_to_90d",
+    "RelNotionalTo90D": "rel_notional_to_90d",
+    "RelVolTo90D": "rel_vol_to_90d",
     
     # Call/Put 数据
     "Call Volume": "call_volume",
     "CallVolume": "call_volume",
+    "Call Notional": "call_notional",
+    "CallNotional": "call_notional",
     "Put Volume": "put_volume",
     "PutVolume": "put_volume",
+    "Put Notional": "put_notional",
+    "PutNotional": "put_notional",
     "Put %": "put_pct",
     "PutPct": "put_pct",
     "Call %": "call_pct",
@@ -65,6 +71,7 @@ MC_FIELD_MAPPING = {
     "IV Rank": "ivr",
     "IV30 52-Week Position": "iv_52w_position",
     "IV52WPosition": "iv_52w_position",
+    "IV_52W_P": "iv_52w_position",
     
     # 历史波动率
     "20-Day Historical Vol": "hv20",
@@ -81,6 +88,7 @@ MC_FIELD_MAPPING = {
     # OI 相关
     "Open Interest % Rank": "oi_pct_rank",
     "OIPctRank": "oi_pct_rank",
+    "OI_PctRank": "oi_pct_rank",
     "Open Interest": "open_interest",
     "OI": "open_interest",
     
@@ -185,6 +193,13 @@ def parse_mc_json(json_data: List[Dict]) -> List[Dict]:
                 # symbol 字段保持原值，不作为数字解析
                 if our_key == 'symbol':
                     parsed[our_key] = str(value) if value else None
+                # 财报事件字段是文本（如 "29-Jan-2026 AMC"），不能按数值解析
+                elif our_key == 'earnings_date':
+                    if value is None:
+                        parsed[our_key] = None
+                    else:
+                        text_value = str(value).strip()
+                        parsed[our_key] = text_value if text_value and text_value not in {'-', 'N/A'} else None
                 else:
                     parsed[our_key] = _parse_value(value)
         

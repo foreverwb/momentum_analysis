@@ -1,0 +1,11 @@
+# IBKR连接配置
+ibkr:
+  host: '127.0.0.1'
+  port: 4002   # Gateway Paper: 4002, Gateway Live: 4001
+  client_id: 1
+  timeout: 30
+
+futu:
+  host: '127.0.0.1'
+  port: 11111
+  market: 'US'

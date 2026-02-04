@@ -101,22 +101,6 @@ npm run dev
 
 ---
 
-## 🎨 Design System
-
-The app uses a custom design system extracted from the prototype:
-
-### Colors
-- Background: `--bg-primary`, `--bg-secondary`, `--bg-tertiary`
-- Text: `--text-primary`, `--text-secondary`, `--text-muted`
-- Accents: `--accent-blue`, `--accent-purple`, `--accent-green`, `--accent-amber`, `--accent-red`, `--accent-orange`
-
-### Border Radius
-- Small: `--radius-sm` (6px)
-- Medium: `--radius-md` (10px)
-- Large: `--radius-lg` (16px)
-
----
-
 ## 📝 Development Notes
 
 - Frontend uses mock data by default (see `services/api.ts`)
@@ -132,6 +116,9 @@ The app uses a custom design system extracted from the prototype:
 
 ### Windows
 关闭 "Momentum Radar - Backend" 和 "Momentum Radar - Frontend" 两个命令行窗口
+
+## CLI
+运行 CLI 前请先激活后端虚拟环境或直接使用 `.venv` 的 Python。
 
 # 上传板块 ETF holdings
 python cli.py uploads -d 2026-01-25 -t sector -a XLK holdings.xlsx

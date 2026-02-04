@@ -52,10 +52,10 @@ class StockScoreCalculator:
     
     使用示例:
     ```python
-    ibkr = IBKRConnector()
-    ibkr.connect()
+    # ibkr_data 需提供 get_ohlcv_data/get_current_price 等接口
+    ibkr_data = ...
     
-    calc = StockScoreCalculator(ibkr)
+    calc = StockScoreCalculator(ibkr_data)
     
     # 单个股票评分
     result = calc.calculate_composite_score('AAPL', sector_etf='XLK')
@@ -64,7 +64,7 @@ class StockScoreCalculator:
     finviz_data = [{'symbol': 'AAPL', ...}, {'symbol': 'MSFT', ...}]
     results = calc.batch_calculate_scores(['AAPL', 'MSFT'], finviz_data=finviz_data)
     
-    ibkr.disconnect()
+    # 若对象实现了连接生命周期，可按需断开
     ```
     """
     
@@ -87,7 +87,7 @@ class StockScoreCalculator:
         初始化个股评分计算器
         
         Args:
-            ibkr: IBKRConnector 实例
+            ibkr: IBKR 数据对象（需提供价格相关接口）
             futu: FutuConnector 实例（可选）
         """
         self.ibkr = ibkr
@@ -844,7 +844,7 @@ def create_stock_calculator(ibkr, futu=None) -> StockScoreCalculator:
     创建个股评分计算器的工厂函数
     
     Args:
-        ibkr: IBKRConnector 实例
+        ibkr: IBKR 数据对象（需提供价格相关接口）
         futu: FutuConnector 实例（可选）
     
     Returns:

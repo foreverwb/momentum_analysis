@@ -79,16 +79,16 @@ class ETFScoreCalculator:
     
     使用示例:
     ```python
-    ibkr = IBKRConnector()
-    ibkr.connect()
+    # ibkr_data 需提供 get_price_data/get_ohlcv_data/get_current_price/get_vix 接口
+    ibkr_data = ...
     
-    calc = ETFScoreCalculator(ibkr)
+    calc = ETFScoreCalculator(ibkr_data)
     result = calc.calculate_composite_score('XLK', 'SPY')
     
     print(f"总分: {result['total_score']}")
     print(f"门槛通过: {result['thresholds_pass']}")
     
-    ibkr.disconnect()
+    # 若对象实现了连接生命周期，可按需断开
     ```
     """
     
@@ -112,7 +112,7 @@ class ETFScoreCalculator:
         初始化 ETF 评分计算器
         
         Args:
-            ibkr: IBKRConnector 实例
+            ibkr: IBKR 数据对象（需提供价格相关接口）
             futu: FutuConnector 实例（可选）
         """
         self.ibkr = ibkr
@@ -587,7 +587,7 @@ def create_etf_calculator(ibkr, futu=None) -> ETFScoreCalculator:
     创建 ETF 评分计算器的工厂函数
     
     Args:
-        ibkr: IBKRConnector 实例
+        ibkr: IBKR 数据对象（需提供价格相关接口）
         futu: FutuConnector 实例（可选）
     
     Returns:

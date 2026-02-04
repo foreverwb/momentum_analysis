@@ -195,8 +195,6 @@ async def get_api_status():
                 "GET /api/import/templates/marketchameleon"
             ],
             "broker": [
-                "GET /api/broker/status",
-                "GET /api/broker/status/{broker}",
                 "POST /api/broker/ibkr/connect",
                 "POST /api/broker/ibkr/disconnect",
                 "POST /api/broker/futu/connect",

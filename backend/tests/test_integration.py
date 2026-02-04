@@ -60,7 +60,15 @@ class TestDatabaseSchema:
         from app.models.database import IVData
         
         columns = [c.name for c in IVData.__table__.columns]
-        expected = ['id', 'symbol', 'date', 'iv7', 'iv30', 'iv60', 'iv90', 'total_oi', 'delta_oi_1d']
+        expected = [
+            'id', 'symbol', 'date', 'iv7', 'iv30', 'iv60', 'iv90', 'total_oi', 'delta_oi_1d',
+            'oi_bucket_0_7', 'oi_bucket_8_30', 'oi_bucket_31_90',
+            'call_oi_bucket_0_7', 'call_oi_bucket_8_30', 'call_oi_bucket_31_90',
+            'put_oi_bucket_0_7', 'put_oi_bucket_8_30', 'put_oi_bucket_31_90',
+            'net_delta_oi_0_7', 'net_delta_oi_8_30', 'net_delta_oi_31_90',
+            'call_delta_oi_0_7', 'call_delta_oi_8_30', 'call_delta_oi_31_90',
+            'put_delta_oi_0_7', 'put_delta_oi_8_30', 'put_delta_oi_31_90',
+        ]
         
         for col in expected:
             assert col in columns, f"Missing column: {col}"
@@ -405,8 +413,8 @@ class TestFastAPIApp:
             data = response.json()
             assert "endpoints" in data
     
-    async def test_broker_status_endpoint(self):
-        """测试 Broker 状态端点"""
+    async def test_broker_status_endpoint_removed(self):
+        """Broker 状态端点已废弃，应返回 404"""
         from httpx import AsyncClient, ASGITransport
         from app.main import app
         
@@ -416,10 +424,7 @@ class TestFastAPIApp:
         ) as client:
             response = await client.get("/api/broker/status")
             
-            assert response.status_code == 200
-            data = response.json()
-            assert "ibkr" in data
-            assert "futu" in data
+            assert response.status_code == 404
     
     async def test_import_template_endpoint(self):
         """测试导入模板端点"""

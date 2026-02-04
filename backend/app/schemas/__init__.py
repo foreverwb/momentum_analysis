@@ -35,6 +35,7 @@ class StockMetrics(BaseModel):
     return20dEx3d: Optional[float] = None
     return63d: float
     relativeStrength: Optional[float] = None
+    relativeStrengthDiff: Optional[float] = None
     distanceToHigh20d: Optional[float] = None
     volumeMultiple: Optional[float] = None
     maAlignment: Optional[str] = None
@@ -51,6 +52,8 @@ class StockMetrics(BaseModel):
     sma20Slope: float
     ivr: float
     iv30: float
+    rsi: Optional[float] = None
+    beta: Optional[float] = None
 
 
 class StockBase(BaseModel):

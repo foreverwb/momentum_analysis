@@ -161,7 +161,11 @@ class DataCompletenessCalculator:
         # 检查 MarketChameleon 数据
         if holding_data.get('mc_heat_score') is not None:
             data_sources['market_chameleon'] = True
-        elif 'mc' in holding_data.get('data_sources', []):
+        elif (
+            'mc' in holding_data.get('data_sources', []) or
+            'marketchameleon' in holding_data.get('data_sources', []) or
+            'market_chameleon' in holding_data.get('data_sources', [])
+        ):
             data_sources['market_chameleon'] = True
 
         # 计算完整度分数

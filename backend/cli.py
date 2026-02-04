@@ -23,6 +23,7 @@ Momentum Radar 命令行工具
 """
 
 import argparse
+import importlib.util
 import sys
 import os
 from datetime import datetime
@@ -32,10 +33,56 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def _running_in_venv() -> bool:
+    base_prefix = getattr(sys, "base_prefix", sys.prefix)
+    return base_prefix != sys.prefix
+
+
+def _maybe_reexec_in_venv() -> None:
+    if os.environ.get("CLI_NO_VENV") == "1":
+        return
+    if _running_in_venv():
+        return
+    backend_dir = Path(__file__).resolve().parent
+    project_root = backend_dir.parent
+    venv_dirs = [backend_dir / ".venv", project_root / ".venv"]
+    candidates = []
+    if os.name == "nt":
+        candidates = [venv / "Scripts" / "python.exe" for venv in venv_dirs]
+    else:
+        for venv in venv_dirs:
+            candidates.extend([venv / "bin" / "python3", venv / "bin" / "python"])
+    for candidate in candidates:
+        if candidate.exists():
+            os.execv(str(candidate), [str(candidate), str(Path(__file__).resolve())] + sys.argv[1:])
+
+
+def _ensure_dependency(module_name: str) -> None:
+    if importlib.util.find_spec(module_name) is not None:
+        return
+    print(f"\n错误: 缺少依赖 {module_name}")
+    print("请先安装后端依赖，再运行命令。推荐方式:")
+    print("  cd backend")
+    print("  python3 -m venv .venv")
+    print("  source .venv/bin/activate  # Windows: .venv\\Scripts\\activate")
+    print("  python -m pip install -r requirements.txt")
+    print("\n也可以直接使用虚拟环境的 Python 运行:")
+    print("  backend/.venv/bin/python backend/cli.py <命令> ...")
+    sys.exit(1)
+
+
+def _ensure_db_dependencies() -> None:
+    _ensure_dependency("sqlalchemy")
+
+
+_maybe_reexec_in_venv()
+
+
 def parse_xlsx_holdings(file_path: str) -> list:
     """解析 xlsx 文件，提取 Ticker 和 Weight 列"""
     try:
         import openpyxl
+        import re
         
         workbook = openpyxl.load_workbook(file_path, read_only=True)
         sheet = workbook.active
@@ -49,15 +96,22 @@ def parse_xlsx_holdings(file_path: str) -> list:
             headers = [str(cell).strip() if cell else "" for cell in row]
             break
         
+        def normalize_header(value) -> str:
+            if value is None:
+                return ""
+            text = str(value).strip().lower().replace("\u00a0", " ")
+            text = re.sub(r"\s+", " ", text)
+            return re.sub(r"[^a-z0-9]", "", text)
+
         # 查找 Ticker 和 Weight 列索引
         ticker_idx = None
         weight_idx = None
         
         for idx, header in enumerate(headers):
-            header_lower = header.lower()
-            if header_lower == "ticker":
+            header_key = normalize_header(header)
+            if header_key in {"ticker", "symbol"}:
                 ticker_idx = idx
-            elif header_lower == "weight":
+            elif header_key == "weight":
                 weight_idx = idx
         
         if ticker_idx is None:
@@ -94,17 +148,25 @@ def parse_csv_holdings(file_path: str) -> list:
     """解析 csv 文件，提取 Ticker 和 Weight 列"""
     try:
         import csv
+        import re
         
         holdings = []
         
         with open(file_path, 'r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
             
-            # 查找 Ticker 和 Weight 列（不区分大小写）
-            fieldnames_lower = {name.lower(): name for name in reader.fieldnames} if reader.fieldnames else {}
+            def normalize_header(value) -> str:
+                if value is None:
+                    return ""
+                text = str(value).strip().lower().replace("\u00a0", " ")
+                text = re.sub(r"\s+", " ", text)
+                return re.sub(r"[^a-z0-9]", "", text)
+
+            # 查找 Ticker 和 Weight 列（支持 Weight (%)/Weight %）
+            normalized = {normalize_header(name): name for name in reader.fieldnames} if reader.fieldnames else {}
             
-            ticker_col = fieldnames_lower.get('ticker')
-            weight_col = fieldnames_lower.get('weight')
+            ticker_col = normalized.get('ticker') or normalized.get('symbol')
+            weight_col = normalized.get('weight')
             
             if not ticker_col:
                 raise ValueError("未找到 'Ticker' 列")
@@ -118,7 +180,7 @@ def parse_csv_holdings(file_path: str) -> list:
                 if ticker and weight is not None:
                     # 处理可能带有千分位逗号的数字
                     if isinstance(weight, str):
-                        weight = weight.replace(',', '')
+                        weight = weight.replace(',', '').replace('%', '')
                     holdings.append({
                         "row": row_idx,
                         "ticker": str(ticker).strip(),
@@ -135,6 +197,14 @@ def parse_csv_holdings(file_path: str) -> list:
 def validate_holdings(holdings: list) -> tuple:
     """验证并过滤持仓数据"""
     import re
+
+    def normalize_weight(value):
+        if isinstance(value, str):
+            cleaned = value.strip().replace(",", "")
+            if cleaned.endswith("%"):
+                cleaned = cleaned[:-1].strip()
+            return cleaned
+        return value
     
     def is_valid_ticker(ticker: str) -> bool:
         if not ticker or not isinstance(ticker, str):
@@ -164,7 +234,7 @@ def validate_holdings(holdings: list) -> tuple:
         
         # 验证 Weight
         try:
-            weight_float = float(weight)
+            weight_float = float(normalize_weight(weight))
             if weight_float <= 0:
                 skipped.append({
                     "row": str(row),
@@ -555,6 +625,9 @@ def main():
     if not args.command:
         parser.print_help()
         sys.exit(1)
+
+    if args.command in {"uploads", "update", "init", "list-etfs", "list-holdings"}:
+        _ensure_db_dependencies()
     
     args.func(args)
 

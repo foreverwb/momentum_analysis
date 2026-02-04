@@ -23,7 +23,7 @@ function getScoreBg(score: number): string {
 }
 
 // 期权热度颜色
-function getOptionsHeatColor(heat: string): string {
+function getOptionsHeatColor(heat?: string): string {
   if (heat === 'Very High') return 'text-red-600';
   if (heat === 'High') return 'text-orange-600';
   if (heat === 'Medium') return 'text-amber-600';
@@ -44,7 +44,7 @@ function formatUpdatedAt(value?: string | null): string {
 }
 
 // 持仓表格组件
-function HoldingsTable({ holdings, maxDisplay, etfSymbol }: { holdings: Holding[]; maxDisplay: number; etfSymbol: string }) {
+function HoldingsTable({ holdings, maxDisplay }: { holdings: Holding[]; maxDisplay: number }) {
   const [isExpanded, setIsExpanded] = useState(false);
   const displayHoldings = isExpanded ? holdings : holdings.slice(0, maxDisplay);
 
@@ -328,7 +328,28 @@ export function ETFCard({ etf, onViewHoldings, onRefresh }: ETFCardProps) {
 
       {/* 持仓表格 */}
       {etf.holdings && etf.holdings.length > 0 && (
-        <HoldingsTable holdings={etf.holdings} maxDisplay={10} etfSymbol={etf.symbol} />
+        <HoldingsTable holdings={etf.holdings} maxDisplay={10} />
+      )}
+
+      {(onViewHoldings || onRefresh) && (
+        <div className="mt-4 flex items-center gap-2 border-t border-slate-200 pt-4">
+          {onViewHoldings ? (
+            <button
+              onClick={onViewHoldings}
+              className="rounded-[var(--radius-sm)] border border-[var(--accent-blue)] px-3 py-1.5 text-xs font-medium text-[var(--accent-blue)] transition-colors hover:bg-blue-50"
+            >
+              查看持仓
+            </button>
+          ) : null}
+          {onRefresh ? (
+            <button
+              onClick={onRefresh}
+              className="rounded-[var(--radius-sm)] border border-[var(--border-light)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:bg-slate-50"
+            >
+              刷新数据
+            </button>
+          ) : null}
+        </div>
       )}
     </div>
   );

@@ -337,7 +337,7 @@ export function useFilteredStocks(filters: {
 
       // Apply score filters client-side
       return stocks.filter(stock => {
-        const score = stock.totalScore || 0;
+        const score = stock.scoreTotal ?? stock.totalScore ?? 0;
         if (minScore !== undefined && score < minScore) return false;
         if (maxScore !== undefined && score > maxScore) return false;
         return true;
@@ -460,7 +460,7 @@ export function useRefreshETF() {
 export const taskQueryKeys = {
   all: ['tasks'] as const,
   lists: () => [...taskQueryKeys.all, 'list'] as const,
-  detail: (id: string) => [...taskQueryKeys.all, 'detail', id] as const,
+  detail: (id: string | number) => [...taskQueryKeys.all, 'detail', id] as const,
 };
 
 /**
@@ -496,7 +496,7 @@ export function useDeleteTask() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (id: string) => deleteTask(id),
+    mutationFn: (id: string | number) => deleteTask(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: taskQueryKeys.lists() });
     },

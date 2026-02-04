@@ -87,17 +87,17 @@ class RegimeGateCalculator:
     
     使用示例:
     ```python
-    ibkr = IBKRConnector()
-    ibkr.connect()
+    # ibkr_data 需提供 get_price_data/get_vix 接口
+    ibkr_data = ...
     
-    calc = RegimeGateCalculator(ibkr)
+    calc = RegimeGateCalculator(ibkr_data)
     result = calc.calculate_regime()
     
     print(f"市场状态: {result['status']}")  # A, B, C
     print(f"环境: {result['regime']}")       # RISK_ON, NEUTRAL, RISK_OFF
     print(f"火力: {result['fire_power']}")   # 满火力, 半火力, 低火力/空仓
     
-    ibkr.disconnect()
+    # 若对象实现了连接生命周期，可按需断开
     ```
     """
     
@@ -113,7 +113,7 @@ class RegimeGateCalculator:
         初始化 Regime Gate 计算器
         
         Args:
-            ibkr: IBKRConnector 实例
+            ibkr: IBKR 数据对象（需提供价格相关接口）
         """
         self.ibkr = ibkr
 
@@ -132,6 +132,23 @@ class RegimeGateCalculator:
             return value
         except Exception:
             return default
+
+    def _resolve_data_error(self) -> Optional[str]:
+        """
+        Try reading upstream provider error details for clearer diagnostics.
+        """
+        try:
+            getter = getattr(self.ibkr, "get_last_error", None)
+            if callable(getter):
+                payload = getter(max_age_seconds=15)
+                if isinstance(payload, dict):
+                    message = payload.get("message")
+                    code = payload.get("code")
+                    if message:
+                        return f"IBKR[{code}] {message}" if code is not None else str(message)
+        except Exception:
+            return None
+        return None
     
     def calculate_regime(self) -> Dict:
         """
@@ -156,12 +173,16 @@ class RegimeGateCalculator:
             
             if spy_df is None or len(spy_df) < 60:
                 logger.error("无法获取足够的 SPY 数据")
+                upstream_error = self._resolve_data_error()
+                error_message = "Failed to get SPY data"
+                if upstream_error:
+                    error_message = f"{error_message}: {upstream_error}"
                 return {
                     'status': 'UNKNOWN',
                     'regime': 'UNKNOWN',
                     'fire_power': '未知',
                     'data': None,
-                    'error': 'Failed to get SPY data'
+                    'error': error_message
                 }
             
             prices = spy_df['SPY']
@@ -518,7 +539,7 @@ def create_regime_calculator(ibkr) -> RegimeGateCalculator:
     创建 Regime Gate 计算器的工厂函数
     
     Args:
-        ibkr: IBKRConnector 实例
+        ibkr: IBKR 数据对象（需提供价格相关接口）
     
     Returns:
         RegimeGateCalculator 实例
@@ -531,7 +552,7 @@ def get_quick_regime(ibkr) -> str:
     快速获取当前 Regime 状态
     
     Args:
-        ibkr: IBKRConnector 实例
+        ibkr: IBKR 数据对象（需提供价格相关接口）
     
     Returns:
         str: 'A', 'B', 'C', or 'UNKNOWN'

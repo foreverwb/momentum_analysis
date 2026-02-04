@@ -34,7 +34,7 @@ export function Header({ activeSection, onNavigate }: HeaderProps) {
   };
 
   return (
-    <header className="mb-6 flex items-center justify-between">
+    <header className="sticky top-0 z-50 mb-6 flex items-center justify-between bg-gradient-to-br from-slate-50 via-blue-50 to-slate-100 pb-4 pt-4 backdrop-blur-sm bg-opacity-95">
       {/* Logo Section - 参考原型设计 */}
       <div className="flex items-center gap-4">
         <div className="w-12 h-12 bg-gradient-to-br from-blue-600 to-purple-600 rounded-xl flex items-center justify-center shadow-lg">
@@ -45,23 +45,25 @@ export function Header({ activeSection, onNavigate }: HeaderProps) {
         </div>
       </div>
 
-      {/* Navigation - 白色容器内的按钮组 */}
-      <div className="flex gap-2 bg-white p-1 rounded-xl border border-slate-200 shadow-sm">
-        {navItems.map((item) => (
-          <button
-            key={item.id}
-            onClick={() => handleNavClick(item.id)}
-            className={`
-              px-4 py-2 rounded-sm text-sm font-medium transition-all
-              ${activeSection === item.id
-                ? 'bg-gradient-to-r from-blue-600 to-purple-600 text-white shadow-md'
-                : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
-              }
-            `}
-          >
-            {item.label}
-          </button>
-        ))}
+      <div className="flex items-center gap-3">
+        {/* Navigation - 白色容器内的按钮组 */}
+        <div className="flex gap-2 bg-white p-1 rounded-xl border border-slate-200 shadow-sm">
+          {navItems.map((item) => (
+            <button
+              key={item.id}
+              onClick={() => handleNavClick(item.id)}
+              className={`
+                px-4 py-2 rounded-sm text-sm font-medium transition-all
+                ${activeSection === item.id
+                  ? 'bg-gradient-to-r from-blue-600 to-purple-600 text-white shadow-md'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
+                }
+              `}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
       </div>
     </header>
   );

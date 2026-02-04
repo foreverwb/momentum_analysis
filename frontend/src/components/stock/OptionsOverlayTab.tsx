@@ -26,10 +26,15 @@ export function OptionsOverlayTab({ stock }: OptionsOverlayTabProps) {
     let cancelled = false;
     
     async function fetchOptionsData() {
-      if (!stock.symbol) return;
+      if (!stock.symbol) {
+        setIsLoading(false);
+        setOptionsOverlay(null);
+        return;
+      }
       
       setIsLoading(true);
       setError(null);
+      setOptionsOverlay(null);
       
       try {
         const data = await getOptionsOverlayData(stock.symbol);
@@ -40,7 +45,7 @@ export function OptionsOverlayTab({ stock }: OptionsOverlayTabProps) {
         if (!cancelled) {
           // 如果 API 不存在或失败，使用 stock 中的基础数据
           console.warn('Options overlay API not available, using base data:', err);
-          setError(null); // 不显示错误，静默降级
+          setError(err instanceof Error ? err.message : '期权覆盖数据加载失败');
         }
       } finally {
         if (!cancelled) {
@@ -56,14 +61,63 @@ export function OptionsOverlayTab({ stock }: OptionsOverlayTabProps) {
     };
   }, [stock.symbol]);
 
+  const metricsRaw = (stock.metrics ?? {}) as Record<string, unknown>;
+  const toMetricNumber = (value: unknown): number | null => {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && value.trim() !== '') {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+    return null;
+  };
+  const normalizeHeatLabelToScore = (value: unknown): number | null => {
+    if (typeof value !== 'string') return null;
+    const normalized = value.trim().toLowerCase();
+    if (!normalized) return null;
+    if (normalized.includes('high') || normalized.includes('高')) return 85;
+    if (normalized.includes('medium') || normalized.includes('中')) return 60;
+    if (normalized.includes('low') || normalized.includes('低')) return 35;
+    return null;
+  };
+  const normalizeHeatType = (value: unknown): string | null => {
+    if (typeof value !== 'string') return null;
+    const normalized = value.trim().toLowerCase();
+    if (!normalized) return null;
+    if (normalized.includes('trend')) return 'trend';
+    if (normalized.includes('event')) return 'event';
+    if (normalized.includes('hedge')) return 'hedge';
+    return 'normal';
+  };
+
   // 使用后端数据或回退到基础数据
-  const heatScore = optionsOverlay?.heatScore ?? baseOptionsData.heat_score ?? stock.heatScore ?? 0;
-  const riskScore = optionsOverlay?.riskScore ?? baseOptionsData.risk_score ?? stock.riskScore ?? 0;
-  const optionsScore = optionsOverlay 
+  const heatScore =
+    optionsOverlay?.heatScore ??
+    baseOptionsData.heat_score ??
+    stock.heatScore ??
+    toMetricNumber(metricsRaw.heat_score) ??
+    normalizeHeatLabelToScore(metricsRaw.optionsHeat) ??
+    baseOptionsScore;
+  const riskScore =
+    optionsOverlay?.riskScore ??
+    baseOptionsData.risk_score ??
+    stock.riskScore ??
+    toMetricNumber(metricsRaw.risk_score) ??
+    (() => {
+      const ivr = toMetricNumber(metricsRaw.ivr);
+      return ivr == null ? null : Math.max(0, Math.min(100, 100 - ivr));
+    })() ??
+    baseOptionsScore;
+  const optionsScore = optionsOverlay
     ? Math.round((heatScore + riskScore + (optionsOverlay.termStructureScore || 0)) / 3)
-    : baseOptionsScore;
+    : (baseOptionsScore > 0 ? baseOptionsScore : Math.round((heatScore + riskScore) / 2));
   const termStructureScore = optionsOverlay?.termStructureScore ?? (Math.round((optionsScore + heatScore) / 2) || 0);
-  const heatType = optionsOverlay?.heatType ?? baseOptionsData.heat_type ?? stock.heatType ?? 'normal';
+  const heatType =
+    optionsOverlay?.heatType ??
+    baseOptionsData.heat_type ??
+    stock.heatType ??
+    normalizeHeatType(metricsRaw.heat_type) ??
+    'normal';
+  const normalizedHeatType = heatType.toLowerCase();
 
   // 获取热度类型显示
   const getHeatBadge = () => {
@@ -73,7 +127,7 @@ export function OptionsOverlayTab({ stock }: OptionsOverlayTabProps) {
       hedge: { label: '对冲热', icon: '🛡️', className: 'bg-blue-100 text-blue-600' },
       normal: { label: '常规', icon: '📊', className: 'bg-gray-100 text-gray-600' },
     };
-    return badges[heatType] || badges.normal;
+    return badges[normalizedHeatType] || badges.normal;
   };
 
   const badge = getHeatBadge();
@@ -112,14 +166,63 @@ export function OptionsOverlayTab({ stock }: OptionsOverlayTabProps) {
     if (typeof value === 'string') {
       const cleaned = value.replace(/,/g, '').trim();
       if (!cleaned) return null;
-      const parsed = Number(cleaned);
+      const normalized = cleaned.endsWith('%') ? cleaned.slice(0, -1).trim() : cleaned;
+      const parsed = Number(normalized);
       return Number.isNaN(parsed) ? null : parsed;
     }
     return null;
   };
+  const relativeNominalValue =
+    toNumber(optionsOverlay?.relativeNominal) ??
+    toNumber(metricsRaw.rel_notional) ??
+    toNumber(metricsRaw.rel_notional_to_90d);
+  const relativeVolumeValue =
+    toNumber(optionsOverlay?.relativeVolume) ??
+    toNumber(metricsRaw.rel_vol) ??
+    toNumber(metricsRaw.rel_vol_to_90d) ??
+    toNumber(metricsRaw.optionsRelVolume);
+  const iv30ChangeValue =
+    toNumber(optionsOverlay?.iv30Change) ??
+    toNumber(metricsRaw.iv30_chg_pct ?? metricsRaw.iv30Change ?? metricsRaw.iv_change);
+  const iv30ForSlope = toNumber(optionsOverlay?.iv30 ?? metricsRaw.iv30);
+  const iv90ForSlope = toNumber(optionsOverlay?.iv90 ?? metricsRaw.iv90 ?? metricsRaw.iv90_futu);
+  const slopeValue = (() => {
+    const slopeFromApi = toNumber(optionsOverlay?.slope);
+    if (slopeFromApi != null) return slopeFromApi;
+    if (iv30ForSlope == null || iv90ForSlope == null || iv90ForSlope === 0) return null;
+    return iv30ForSlope / iv90ForSlope;
+  })();
+
+  const normalizeBucketLabel = (value: string): string => {
+    const trimmed = value.replace(/\s+/g, '');
+    const normalized = trimmed
+      .replace(/[天日]/gi, '')
+      .replace(/[–—]/g, '-')
+      .replace(/[~～]/g, '-')
+      .replace(/[dD]/g, '')
+      .replace(/至/g, '-');
+
+    if (/^(0|1)-?7/.test(normalized)) return '0-7';
+    if (/^8-?30/.test(normalized)) return '8-30';
+    if (/^31-?90/.test(normalized)) return '31-90';
+    return value;
+  };
 
   const normalizePositioning = (raw: unknown): OptionsPositioningData[] => {
     const normalizeRow = (row: any, bucketFallback?: string): OptionsPositioningData | null => {
+      if (typeof row === 'number') {
+        if (!bucketFallback) return null;
+        const bucket = normalizeBucketLabel(String(bucketFallback));
+        return {
+          bucket,
+          callOI: null,
+          putOI: null,
+          netOI: row,
+          delta3d: row,
+          delta5d: null,
+          trend: row >= 0 ? '偏多' : '偏空',
+        };
+      }
       if (!row || typeof row !== 'object') return null;
       const bucket = String(
         row.bucket ??
@@ -132,6 +235,7 @@ export function OptionsOverlayTab({ stock }: OptionsOverlayTabProps) {
           ''
       ).trim();
       if (!bucket) return null;
+      const normalizedBucket = normalizeBucketLabel(bucket);
 
       const callOI = toNumber(
         row.callOI ?? row.call_oi ?? row.call_delta ?? row.callDelta ?? row.call_change ?? row.callChange ?? row.call
@@ -142,21 +246,36 @@ export function OptionsOverlayTab({ stock }: OptionsOverlayTabProps) {
       const netOI = toNumber(
         row.netOI ?? row.net_oi ?? row.net_delta ?? row.netDelta ?? row.net_change ?? row.netChange ?? row.net
       );
-
-      const hasAny = [callOI, putOI, netOI].some((value) => typeof value === 'number');
+      const delta3d = toNumber(row.delta3d ?? row.delta_3d ?? row.delta3D ?? row.delta_oi_3d);
+      const delta5d = toNumber(row.delta5d ?? row.delta_5d ?? row.delta5D ?? row.delta_oi_5d);
+      // Compatibility fix: old payload used 0/0 as placeholder when call/put split was unavailable.
+      const placeholderSplit =
+        callOI === 0 &&
+        putOI === 0 &&
+        [netOI, delta3d, delta5d].some((value) => typeof value === 'number' && value !== 0);
+      const normalizedCallOI = placeholderSplit ? null : callOI;
+      const normalizedPutOI = placeholderSplit ? null : putOI;
+      const hasAny = [normalizedCallOI, normalizedPutOI, netOI, delta3d, delta5d].some((value) => typeof value === 'number');
       if (!hasAny) return null;
 
       const resolvedNet =
-        netOI ?? (typeof callOI === 'number' && typeof putOI === 'number' ? callOI - putOI : 0);
+        netOI ??
+        (typeof normalizedCallOI === 'number' && typeof normalizedPutOI === 'number'
+          ? normalizedCallOI - normalizedPutOI
+          : null);
       const trend =
         String(row.trend ?? row.signal ?? row.direction ?? row.bias ?? '').trim() ||
-        (resolvedNet >= 0 ? '偏多' : '偏空');
+        (typeof resolvedNet === 'number'
+          ? (resolvedNet >= 0 ? '偏多' : '偏空')
+          : '中性');
 
       return {
-        bucket,
-        callOI: callOI ?? 0,
-        putOI: putOI ?? 0,
+        bucket: normalizedBucket,
+        callOI: normalizedCallOI ?? null,
+        putOI: normalizedPutOI ?? null,
         netOI: resolvedNet,
+        delta3d: delta3d ?? resolvedNet,
+        delta5d: delta5d ?? null,
         trend,
       };
     };
@@ -182,13 +301,133 @@ export function OptionsOverlayTab({ stock }: OptionsOverlayTabProps) {
     return [];
   };
 
+  const metrics = (stock.metrics ?? {}) as Record<string, unknown>;
+  const bucketFallbackList = () => {
+    const bucketSources: Array<{ bucket: string; value: number | null }> = [
+      { bucket: '0-7', value: toNumber(metrics.oi_bucket_0_7 ?? metrics.oiBucket0_7 ?? metrics.oi_0_7 ?? metrics.delta_oi_0_7) },
+      { bucket: '8-30', value: toNumber(metrics.oi_bucket_8_30 ?? metrics.oiBucket8_30 ?? metrics.oi_8_30 ?? metrics.delta_oi_8_30) },
+      { bucket: '31-90', value: toNumber(metrics.oi_bucket_31_90 ?? metrics.oiBucket31_90 ?? metrics.oi_31_90 ?? metrics.delta_oi_31_90) },
+    ];
+    return bucketSources
+      .filter((item) => item.value !== null)
+      .map((item) => ({
+        bucket: item.bucket,
+        callOI: null,
+        putOI: null,
+        netOI: item.value ?? 0,
+        delta3d: item.value ?? 0,
+        delta5d: null,
+        trend: (item.value ?? 0) >= 0 ? '偏多' : '偏空',
+      }));
+  };
+
   // 从后端数据或生成默认持仓数据
   const getPositioningData = (): OptionsPositioningData[] => {
-    return normalizePositioning(optionsOverlay?.positioning);
+    const sources: OptionsPositioningData[] = [];
+    sources.push(...normalizePositioning(optionsOverlay?.positioning));
+    sources.push(...normalizePositioning(metrics.optionsPositioning));
+    sources.push(...normalizePositioning(metrics.positioning));
+    sources.push(...bucketFallbackList());
+
+    if (!sources.length) {
+      return [];
+    }
+
+    const completenessScore = (row: OptionsPositioningData): number => {
+      let score = 0;
+      if (typeof row.callOI === 'number') score += 1;
+      if (typeof row.putOI === 'number') score += 1;
+      if (typeof row.netOI === 'number') score += 1;
+      if (typeof row.delta3d === 'number') score += 1;
+      if (typeof row.delta5d === 'number') score += 1;
+      return score;
+    };
+
+    const aggregated: Record<string, OptionsPositioningData> = {};
+    sources.forEach((row) => {
+      const bucketKey = normalizeBucketLabel(row.bucket);
+      if (!aggregated[bucketKey]) {
+        aggregated[bucketKey] = {
+          bucket: bucketKey,
+          callOI: null,
+          putOI: null,
+          netOI: null,
+          delta3d: null,
+          delta5d: null,
+          trend: '中性',
+        };
+      }
+      const current = aggregated[bucketKey];
+      if (completenessScore(row) > completenessScore(current)) {
+        aggregated[bucketKey] = {
+          ...current,
+          ...row,
+          bucket: bucketKey,
+          trend: row.trend || current.trend || '中性',
+        };
+        return;
+      }
+      if (current.callOI == null && row.callOI != null) current.callOI = row.callOI;
+      if (current.putOI == null && row.putOI != null) current.putOI = row.putOI;
+      if (current.netOI == null && row.netOI != null) current.netOI = row.netOI;
+      if (current.delta3d == null && row.delta3d != null) current.delta3d = row.delta3d;
+      if (current.delta5d == null && row.delta5d != null) current.delta5d = row.delta5d;
+      if (!current.trend && row.trend) current.trend = row.trend;
+    });
+
+    return Object.values(aggregated).map((row) => ({
+      ...row,
+      trend: row.trend || (
+        typeof row.netOI === 'number'
+          ? row.netOI >= 0 ? '偏多' : '偏空'
+          : '中性'
+      ),
+    }));
   };
 
   const positioningData = getPositioningData();
-  const hasPositioningData = positioningData.length > 0;
+  const bucketOrder = ['0-7', '8-30', '31-90'];
+  const bucketLabels: Record<string, string> = {
+    '0-7': '0-7天',
+    '8-30': '8-30天',
+    '31-90': '31-90天',
+  };
+  const orderedPositioning = [
+    ...bucketOrder.map((bucket) => {
+      const existing = positioningData.find((row) => row.bucket === bucket);
+      if (existing) return existing;
+      return {
+        bucket,
+        callOI: null,
+        putOI: null,
+        netOI: null,
+        delta3d: null,
+        delta5d: null,
+        trend: '--',
+      } as OptionsPositioningData;
+    }),
+    ...positioningData.filter((row) => !bucketOrder.includes(row.bucket)),
+  ];
+
+  const hasPositioningData = orderedPositioning.some((row) => (
+    typeof row.callOI === 'number' ||
+    typeof row.putOI === 'number' ||
+    typeof row.netOI === 'number' ||
+    typeof row.delta3d === 'number' ||
+    typeof row.delta5d === 'number'
+  ));
+  const termStructureInterpretation = optionsOverlay?.termStructureInterpretation ?? (() => {
+    if (typeof slopeValue !== 'number') {
+      if (iv30ForSlope != null && (iv90ForSlope == null || iv90ForSlope === 0)) {
+        return 'IV90缺失（90天期限样本不足）';
+      }
+      return '--';
+    }
+    const slope = slopeValue;
+    if (slope >= 1.1) return '短端昂贵（倒挂/恐慌）';
+    if (slope < 0.9) return '正常陡峭结构';
+    return '正常';
+  })();
 
   return (
     <div className="space-y-6">
@@ -206,6 +445,11 @@ export function OptionsOverlayTab({ stock }: OptionsOverlayTabProps) {
               {optionsOverlay?.dataSource && (
                 <span className="inline-flex items-center gap-1 px-3 py-1 rounded-full text-sm font-medium bg-blue-50 text-blue-600">
                   📡 {optionsOverlay.dataSource}
+                </span>
+              )}
+              {error && (
+                <span className="inline-flex items-center gap-1 px-3 py-1 rounded-full text-sm font-medium bg-red-50 text-red-600">
+                  ⚠️ {error}
                 </span>
               )}
             </div>
@@ -235,14 +479,14 @@ export function OptionsOverlayTab({ stock }: OptionsOverlayTabProps) {
             <div className="space-y-3">
               <MetricRow 
                 label="相对名义成交" 
-                value={optionsOverlay?.relativeNominal != null 
-                  ? `${optionsOverlay.relativeNominal.toFixed(1)}x` 
+                value={relativeNominalValue != null 
+                  ? `${relativeNominalValue.toFixed(1)}x` 
                   : (heatScore > 0 ? `${(heatScore / 50).toFixed(1)}x` : '--')} 
               />
               <MetricRow 
                 label="相对成交量" 
-                value={optionsOverlay?.relativeVolume != null 
-                  ? `${optionsOverlay.relativeVolume.toFixed(1)}x` 
+                value={relativeVolumeValue != null 
+                  ? `${relativeVolumeValue.toFixed(1)}x` 
                   : (heatScore > 0 ? `${(heatScore / 50).toFixed(1)}x` : '--')} 
               />
               <MetricRow 
@@ -273,8 +517,8 @@ export function OptionsOverlayTab({ stock }: OptionsOverlayTabProps) {
               />
               <MetricRow 
                 label="IV30变化" 
-                value={optionsOverlay?.iv30Change != null 
-                  ? `${optionsOverlay.iv30Change >= 0 ? '+' : ''}${optionsOverlay.iv30Change.toFixed(1)}%`
+                value={iv30ChangeValue != null
+                  ? `${iv30ChangeValue >= 0 ? '+' : ''}${iv30ChangeValue.toFixed(1)}%`
                   : '--'} 
               />
             </div>
@@ -292,14 +536,12 @@ export function OptionsOverlayTab({ stock }: OptionsOverlayTabProps) {
             </div>
             <div className="space-y-3">
               <MetricRow 
-                label="Slope" 
-                value={optionsOverlay?.slope != null ? formatValue(optionsOverlay.slope) : '--'} 
+                label="Slope (IV30/IV90)" 
+                value={slopeValue != null ? formatValue(slopeValue) : '--'} 
               />
               <MetricRow 
-                label="ΔSlope" 
-                value={optionsOverlay?.slopeChange != null 
-                  ? `${optionsOverlay.slopeChange >= 0 ? '+' : ''}${optionsOverlay.slopeChange.toFixed(2)}`
-                  : '--'} 
+                label="结构解读" 
+                value={termStructureInterpretation}
               />
               <MetricRow 
                 label="财报事件" 
@@ -315,7 +557,7 @@ export function OptionsOverlayTab({ stock }: OptionsOverlayTabProps) {
         <h4 className="text-lg font-semibold text-[var(--text-primary)] mb-4">
           持仓变化 (Positioning Score)
         </h4>
-        
+
         {isLoading ? (
           <div className="flex items-center justify-center py-8">
             <div className="flex items-center gap-2 text-[var(--text-muted)]">
@@ -326,56 +568,63 @@ export function OptionsOverlayTab({ stock }: OptionsOverlayTabProps) {
               <span>正在加载期权持仓数据...</span>
             </div>
           </div>
-        ) : hasPositioningData ? (
-          <div className="overflow-x-auto">
-            <table className="w-full">
-              <thead>
-                <tr className="border-b border-[var(--border-light)]">
-                  <th className="text-left py-3 px-4 text-sm font-medium text-[var(--text-secondary)]">
-                    期限桶
-                  </th>
-                  <th className="text-right py-3 px-4 text-sm font-medium text-[var(--text-secondary)]">
-                    Call ΔOI
-                  </th>
-                  <th className="text-right py-3 px-4 text-sm font-medium text-[var(--text-secondary)]">
-                    Put ΔOI
-                  </th>
-                  <th className="text-right py-3 px-4 text-sm font-medium text-[var(--text-secondary)]">
-                    净增量
-                  </th>
-                  <th className="text-left py-3 px-4 text-sm font-medium text-[var(--text-secondary)]">
-                    趋势
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {positioningData.map((row, index) => (
-                  <PositionRow 
-                    key={index}
-                    bucket={row.bucket} 
-                    callOI={formatOI(row.callOI)} 
-                    putOI={formatOI(row.putOI)} 
-                    net={formatOI(row.netOI)} 
-                    netColor={row.netOI >= 0 ? 'green' : 'red'}
-                    trend={row.trend} 
-                  />
-                ))}
-              </tbody>
-            </table>
-          </div>
         ) : (
-          <div className="text-center py-8">
-            <div className="text-[var(--text-muted)] mb-2">
-              <svg className="w-12 h-12 mx-auto opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-              </svg>
+          <div>
+            <div className="overflow-x-auto">
+              <table className="w-full">
+                <thead>
+                  <tr className="border-b border-[var(--border-light)]">
+                    <th className="text-left py-3 px-4 text-sm font-medium text-[var(--text-secondary)]">
+                      期限桶
+                    </th>
+                    <th className="text-right py-3 px-4 text-sm font-medium text-[var(--text-secondary)]">
+                      Call ΔOI
+                    </th>
+                    <th className="text-right py-3 px-4 text-sm font-medium text-[var(--text-secondary)]">
+                      Put ΔOI
+                    </th>
+                    <th className="text-right py-3 px-4 text-sm font-medium text-[var(--text-secondary)]">
+                      Δ_3D
+                    </th>
+                    <th className="text-right py-3 px-4 text-sm font-medium text-[var(--text-secondary)]">
+                      Δ_5D
+                    </th>
+                    <th className="text-left py-3 px-4 text-sm font-medium text-[var(--text-secondary)]">
+                      趋势
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {orderedPositioning.map((row, index) => {
+                    const muted = (
+                      row.callOI == null &&
+                      row.putOI == null &&
+                      row.netOI == null &&
+                      row.delta3d == null &&
+                      row.delta5d == null
+                    );
+                    return (
+                      <PositionRow 
+                        key={`${row.bucket}-${index}`}
+                        bucket={bucketLabels[row.bucket] ?? row.bucket}
+                        callOI={row.callOI}
+                        putOI={row.putOI}
+                        delta3d={row.delta3d ?? row.netOI ?? null}
+                        delta5d={row.delta5d ?? null}
+                        trend={row.trend || '--'}
+                        muted={muted}
+                        formatOI={formatOI}
+                      />
+                    );
+                  })}
+                </tbody>
+              </table>
             </div>
-            <p className="text-sm text-[var(--text-muted)]">
-              暂无持仓变化数据
-            </p>
-            <p className="text-xs text-[var(--text-muted)] mt-1">
-              需要接入期权数据源以获取实时持仓变化
-            </p>
+            {!hasPositioningData && (
+              <p className="text-xs text-[var(--text-muted)] mt-3">
+                暂无可用的持仓变化分桶数据
+              </p>
+            )}
           </div>
         )}
 
@@ -404,28 +653,48 @@ function PositionRow({
   bucket, 
   callOI, 
   putOI, 
-  net, 
-  netColor,
-  trend 
+  delta3d,
+  delta5d,
+  trend,
+  formatOI,
+  muted = false
 }: { 
   bucket: string; 
-  callOI: string; 
-  putOI: string; 
-  net: string; 
-  netColor: 'green' | 'red';
+  callOI: number | null;
+  putOI: number | null;
+  delta3d: number | null;
+  delta5d: number | null;
   trend: string;
+  formatOI: (value: number | null | undefined) => string;
+  muted?: boolean;
 }) {
+  const getDeltaClass = (value: number | null): string => {
+    if (muted || value == null) return 'text-[var(--text-muted)]';
+    if (value > 0) return 'text-[var(--accent-green)]';
+    if (value < 0) return 'text-[var(--accent-red)]';
+    return 'text-[var(--text-secondary)]';
+  };
+
   return (
     <tr className="border-b border-[var(--border-light)] last:border-0">
-      <td className="py-3 px-4 text-sm text-[var(--text-primary)]">{bucket}</td>
-      <td className="py-3 px-4 text-sm text-right text-[var(--text-primary)]">{callOI}</td>
-      <td className="py-3 px-4 text-sm text-right text-[var(--text-primary)]">{putOI}</td>
-      <td className={`py-3 px-4 text-sm text-right font-medium ${
-        netColor === 'green' ? 'text-[var(--accent-green)]' : 'text-[var(--accent-red)]'
-      }`}>
-        {net}
+      <td className={`py-3 px-4 text-sm ${muted ? 'text-[var(--text-muted)]' : 'text-[var(--text-primary)]'}`}>
+        {bucket}
       </td>
-      <td className="py-3 px-4 text-sm text-[var(--text-secondary)]">{trend}</td>
+      <td className={`py-3 px-4 text-sm text-right ${muted ? 'text-[var(--text-muted)]' : 'text-[var(--text-primary)]'}`}>
+        {formatOI(callOI)}
+      </td>
+      <td className={`py-3 px-4 text-sm text-right ${muted ? 'text-[var(--text-muted)]' : 'text-[var(--text-primary)]'}`}>
+        {formatOI(putOI)}
+      </td>
+      <td className={`py-3 px-4 text-sm text-right font-medium ${getDeltaClass(delta3d)}`}>
+        {formatOI(delta3d)}
+      </td>
+      <td className={`py-3 px-4 text-sm text-right font-medium ${getDeltaClass(delta5d)}`}>
+        {formatOI(delta5d)}
+      </td>
+      <td className={`py-3 px-4 text-sm ${muted ? 'text-[var(--text-muted)]' : 'text-[var(--text-secondary)]'}`}>
+        {trend}
+      </td>
     </tr>
   );
 }

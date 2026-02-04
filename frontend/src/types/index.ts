@@ -6,6 +6,57 @@
 // Heat Type Classification
 // ----------------------------------------------------------------------------
 export type HeatType = 'trend' | 'event' | 'hedge' | 'normal';
+export type NavSection = 'core' | 'sector' | 'industry' | 'momentum' | 'tracking';
+
+export type ComparisonType = 'industry' | 'sector' | 'market';
+
+export interface StockComparison {
+  symbol: string;
+  type: ComparisonType;
+  return20d?: number | null;
+  rs20d?: number | null;
+  sma20Slope?: number | null;
+  beta?: number | null;
+}
+
+export interface StockMetrics {
+  return20d?: number;
+  return20dEx3d?: number | null;
+  return63d?: number;
+  relativeStrength?: number | null;
+  relativeStrengthDiff?: number | null;
+  distanceToHigh20d?: number | null;
+  volumeMultiple?: number | null;
+  maAlignment?: string | null;
+  trendPersistence?: number | null;
+  breakoutVolume?: number | null;
+  volumeRatio?: number | null;
+  obvTrend?: string | null;
+  maxDrawdown20d?: number | null;
+  atrPercent?: number | null;
+  deviationFrom20ma?: number | null;
+  overheat?: string | null;
+  optionsHeat?: string | null;
+  optionsRelVolume?: number | null;
+  sma20Slope?: number | null;
+  ivr?: number | null;
+  iv30?: number | null;
+  rsi?: number | null;
+  beta?: number | null;
+}
+
+export interface StockScores {
+  momentum: number;
+  trend: number;
+  volume: number;
+  quality: number;
+  options: number;
+}
+
+export interface StockChanges {
+  delta3d: number | null;
+  delta5d: number | null;
+}
 
 // ----------------------------------------------------------------------------
 // Threshold Check Results
@@ -19,10 +70,13 @@ export interface ThresholdResult {
 // Base Stock Interface
 // ----------------------------------------------------------------------------
 export interface Stock {
+  id?: number;
+  rank?: number;
   symbol: string;
   name: string;
   sector?: string;
   industry?: string;
+  industryEtfs?: string[];
   
   // Price data
   price: number;
@@ -34,6 +88,7 @@ export interface Stock {
   sma50?: number;
   sma200?: number;
   rsi?: number;
+  beta?: number;
   
   // Momentum metrics
   return20d?: number;
@@ -51,11 +106,14 @@ export interface Stock {
   openInterest?: number;
   
   // Composite scores
+  scoreTotal?: number;
   totalScore?: number;
   technicalScore?: number;
   momentumScore?: number;
   volumeScore?: number;
   optionsScore?: number;
+  scores?: StockScores;
+  changes?: StockChanges;
   
   // Heat analysis (new fields)
   heatType?: HeatType;
@@ -67,6 +125,10 @@ export interface Stock {
   // Metadata
   lastUpdated?: string;
   marketCap?: number;
+
+  // Extended metrics payload
+  metrics?: StockMetrics;
+  comparisons?: StockComparison[];
 }
 
 // ----------------------------------------------------------------------------
@@ -91,6 +153,7 @@ export interface MomentumScoreData {
   return_20d: number;
   return_63d: number;
   rs_20d: number | null;
+  score_breakdown?: Record<string, number>;
 }
 
 export interface MomentumScore {
@@ -290,6 +353,9 @@ export interface Holding {
   weight: number;
   score?: number | null;
   updatedAt?: string | null;
+  dataSources?: Record<string, boolean>;
+  dataStatus?: 'complete' | 'pending' | 'missing' | 'loading';
+  completeness?: number;
 }
 
 export interface ETFDelta {
@@ -310,7 +376,7 @@ export interface ETFDimensionScore {
 }
 
 export interface ETF {
-  id: string;
+  id: number;
   symbol: string;
   name: string;
   type: 'sector' | 'industry';
@@ -336,6 +402,7 @@ export interface ETF {
   
   // Holdings data
   holdings?: Holding[];
+  coverageRanges?: string[];
   
   // Metadata
   lastUpdated?: string;
@@ -344,7 +411,7 @@ export interface ETF {
 export type TaskType = 'rotation' | 'drilldown' | 'momentum';
 
 export interface Task {
-  id: string;
+  id: number;
   title: string;
   type: TaskType;
   baseIndex: 'SPY' | 'QQQ' | 'IWM';
@@ -364,12 +431,12 @@ export interface CreateTaskInput {
 }
 
 export interface RefreshResult {
-  status: 'success' | 'error' | 'partial' | 'snapshot';
+  status: 'success' | 'error' | 'partial' | 'snapshot' | 'failed' | 'warning';
   symbol: string;
   message?: string;
   score?: number;
   thresholds_pass?: boolean;
-  breakdown?: Record<string, number>;
+  breakdown?: Record<string, unknown>;
   completeness?: number;
   data_sources?: Record<string, boolean>;
 }

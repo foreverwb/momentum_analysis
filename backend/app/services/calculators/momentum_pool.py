@@ -179,7 +179,26 @@ def calculate_momentum_pool_result(
     计算单只股票的动能股池评分与指标。
     price_df 必须包含 close/high/low/volume 列。
     """
-    analysis = analyze_technical(price_df)
+    required_cols = {"close", "high", "low", "volume"}
+    if not isinstance(price_df, pd.DataFrame) or price_df.empty:
+        return None
+    if not required_cols.issubset(price_df.columns):
+        return None
+    if sector_df is not None:
+        if not isinstance(sector_df, pd.DataFrame) or sector_df.empty or "close" not in sector_df.columns:
+            sector_df = None
+    if finviz_data is not None and not isinstance(finviz_data, dict):
+        finviz_data = None
+    if mc_data is not None and not isinstance(mc_data, dict):
+        mc_data = None
+    if iv_data is not None and not isinstance(iv_data, dict):
+        iv_data = None
+
+    try:
+        analysis = analyze_technical(price_df)
+    except Exception:
+        return None
+
     if analysis is None:
         return None
 
@@ -266,6 +285,7 @@ def calculate_momentum_pool_result(
         'return20dEx3d': _safe_pct(return_20d_ex3d, 1),
         'return63d': _safe_pct(return_63d, 1),
         'relativeStrength': _round(rs_ratio_20d, 2),
+        'relativeStrengthDiff': _safe_pct(rs_diff_20d, 1),
         'distanceToHigh20d': _round(distance_to_high_pct, 1),
         'volumeMultiple': _round(breakout_volume, 2),
         'maAlignment': _label_alignment(analysis.ma_alignment),
@@ -287,7 +307,9 @@ def calculate_momentum_pool_result(
             mc_data.get('iv30') if mc_data else (iv_data.get('iv30') if iv_data else None),
             2
         ),
-        'sma20Slope': _round(analysis.sma20_slope, 4)
+        'sma20Slope': _round(analysis.sma20_slope, 4),
+        'rsi': _round(analysis.rsi, 2),
+        'beta': _round(finviz_data.get('beta') if finviz_data else None, 2)
     }
 
     scores = {

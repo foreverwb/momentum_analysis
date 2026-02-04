@@ -56,6 +56,8 @@ from .technical import (
     get_technical_summary,
     TechnicalAnalysisResult,
 )
+from .momentum import MomentumCalculator
+from .momentum_pool import MomentumPoolResult, calculate_momentum_pool_result
 
 __all__ = [
     # 移动平均线
@@ -103,6 +105,9 @@ __all__ = [
     'analyze_technical',
     'get_technical_summary',
     'TechnicalAnalysisResult',
+    'MomentumCalculator',
+    'MomentumPoolResult',
+    'calculate_momentum_pool_result',
 ]
 
 # ETF 评分计算器

@@ -1,5 +1,5 @@
 import React, { memo, useMemo, useCallback } from 'react';
-import type { Stock } from '../../types';
+import type { Stock, StockMetrics } from '../../types';
 import { DimensionCard } from './DimensionCard';
 
 interface StockCardProps {
@@ -97,21 +97,36 @@ export const StockCard = memo(function StockCard({
     }
   }, [onToggleSelect, stock.symbol]);
 
-  // 使用 useMemo 缓存 delta 值计算
-  const delta3d = useMemo(() => formatDelta(stock.changes?.delta3d), [stock.changes?.delta3d]);
-  const delta5d = useMemo(() => formatDelta(stock.changes?.delta5d), [stock.changes?.delta5d]);
+  const scoreTotal = stock.scoreTotal ?? stock.totalScore ?? null;
+  const momentumScore = stock.scores?.momentum ?? stock.momentumScore ?? 0;
+  const trendScore = stock.scores?.trend ?? stock.technicalScore ?? 0;
+  const volumeScore = stock.scores?.volume ?? stock.volumeScore ?? 0;
+  const qualityScore = stock.scores?.quality ?? 0;
+  const optionsScore = stock.scores?.options ?? stock.optionsScore ?? 0;
 
-  const metrics = (stock.metrics ?? {}) as Stock['metrics'];
+  const delta3dValue = stock.changes?.delta3d ?? null;
+  const delta5dValue = stock.changes?.delta5d ?? null;
+  const delta3d = useMemo(() => formatDelta(delta3dValue), [delta3dValue]);
+  const delta5d = useMemo(() => formatDelta(delta5dValue), [delta5dValue]);
+
+  const metrics = (stock.metrics ?? {}) as StockMetrics;
+  const industryEtfs = stock.industryEtfs && stock.industryEtfs.length > 0
+    ? stock.industryEtfs
+    : stock.industry
+      ? [stock.industry]
+      : [];
+  const betaValue = metrics?.beta ?? stock.beta;
+  const rsiValue = metrics?.rsi ?? stock.rsi;
   
   // 使用 useMemo 缓存指标数组
   const momentumMetrics = useMemo(() => [
-    { label: '20D收益', value: formatPercent(metrics.return20d, 1), variant: 'highlight' as const },
+    { label: '20D收益', value: formatPercent(metrics.return20d ?? stock.return20d, 1), variant: 'highlight' as const },
     { label: '20D收益(去3日)', value: formatPercent(metrics.return20dEx3d, 1) },
-    { label: '63D收益', value: formatPercent(metrics.return63d, 1), variant: 'highlight' as const },
-    { label: '相对行业强度', value: formatNumber(metrics.relativeStrength, 2) },
+    { label: '63D收益', value: formatPercent(metrics.return63d ?? stock.return63d, 1), variant: 'highlight' as const },
+    { label: '相对行业强度', value: formatNumber(metrics.relativeStrength ?? stock.rs20d, 2) },
     { label: '距20日高点', value: formatPercent(metrics.distanceToHigh20d, 1, false), variant: 'warning' as const },
     { label: '放量倍数', value: formatMultiple(metrics.volumeMultiple ?? metrics.breakoutVolume, 2), variant: 'warning' as const }
-  ], [metrics.return20d, metrics.return20dEx3d, metrics.return63d, metrics.relativeStrength, metrics.distanceToHigh20d, metrics.volumeMultiple, metrics.breakoutVolume]);
+  ], [metrics.breakoutVolume, metrics.distanceToHigh20d, metrics.relativeStrength, metrics.return20d, metrics.return20dEx3d, metrics.return63d, metrics.volumeMultiple, stock.return20d, stock.return63d, stock.rs20d]);
 
   const maAlignmentValue = metrics.maAlignment ?? 'N/A';
   const maAlignmentVariant = maAlignmentValue === 'N/A' ? 'muted' as const : undefined;
@@ -124,9 +139,9 @@ export const StockCard = memo(function StockCard({
 
   const volumeMetrics = useMemo(() => [
     { label: '突破放量', value: formatMultiple(metrics.breakoutVolume, 2) },
-    { label: '量比结构', value: formatNumber(metrics.volumeRatio, 2) },
+    { label: '量比结构', value: formatNumber(metrics.volumeRatio ?? stock.volumeRatio, 2) },
     { label: 'OBV趋势', value: metrics.obvTrend ?? 'Neutral', variant: metrics.obvTrend ? undefined : 'muted' as const }
-  ], [metrics.breakoutVolume, metrics.volumeRatio, metrics.obvTrend]);
+  ], [metrics.breakoutVolume, metrics.obvTrend, metrics.volumeRatio, stock.volumeRatio]);
 
   const overheatValue = metrics.overheat ?? 'Normal';
   const overheatVariant = overheatValue === 'Hot' ? 'warning' as const : undefined;
@@ -142,9 +157,30 @@ export const StockCard = memo(function StockCard({
   const optionsMetrics = useMemo(() => [
     { label: '热度', value: optionsHeatValue, variant: optionsHeatVariant },
     { label: '相对成交', value: formatMultiple(metrics.optionsRelVolume, 2) },
-    { label: 'IVR', value: formatNumber(metrics.ivr, 0) },
-    { label: 'IV30', value: formatNumber(metrics.iv30, 2) }
-  ], [optionsHeatValue, optionsHeatVariant, metrics.optionsRelVolume, metrics.ivr, metrics.iv30]);
+    { label: 'IVR', value: formatNumber(metrics.ivr ?? stock.ivr, 0) },
+    { label: 'IV30', value: formatNumber(metrics.iv30 ?? stock.impliedVolatility, 2) }
+  ], [metrics.iv30, metrics.ivr, metrics.optionsRelVolume, optionsHeatValue, optionsHeatVariant, stock.impliedVolatility, stock.ivr]);
+
+  const comparisonItems = useMemo(() => {
+    if (stock.comparisons && stock.comparisons.length > 0) {
+      return stock.comparisons;
+    }
+
+    const items = [];
+    for (const symbol of industryEtfs) {
+      items.push({ symbol, type: 'industry' as const });
+    }
+    if (stock.sector) {
+      items.push({
+        symbol: stock.sector,
+        type: 'sector' as const,
+        rs20d: metrics.relativeStrengthDiff ?? stock.rs20d ?? undefined
+      });
+    }
+    items.push({ symbol: 'SPY', type: 'market' as const });
+    items.push({ symbol: 'QQQ', type: 'market' as const });
+    return items;
+  }, [stock.comparisons, industryEtfs, stock.sector, metrics.relativeStrengthDiff, stock.rs20d]);
 
   return (
     <div 
@@ -193,7 +229,7 @@ export const StockCard = memo(function StockCard({
                 {stock.name ?? '--'}
               </span>
             </div>
-            <div className="flex items-center gap-2 text-[13px] text-[var(--text-secondary)]">
+            <div className="flex flex-wrap items-center gap-2 text-[13px] text-[var(--text-secondary)]">
               <span className="flex items-center gap-1">
                 <span className="text-[var(--text-muted)]">板块:</span>
                 <span className="text-[var(--accent-blue)]">{stock.sector ?? '--'}</span>
@@ -201,13 +237,21 @@ export const StockCard = memo(function StockCard({
               <span>·</span>
               <span className="flex items-center gap-1">
                 <span className="text-[var(--text-muted)]">行业:</span>
-                <span className="text-[var(--accent-blue)]">{stock.industry ?? '--'}</span>
+                <span className="text-[var(--accent-purple)]">
+                  {industryEtfs.length > 0 ? industryEtfs.join(' | ') : '--'}
+                </span>
               </span>
               <span>·</span>
               <span className="flex items-center gap-1">
-                <span className="text-[var(--text-muted)]">价格:</span>
+                <span className="text-[var(--text-muted)]">BETA</span>
                 <span className="text-[var(--accent-green)] font-medium">
-                  ${stock.price?.toFixed(2) ?? '--'}
+                  {formatNumber(betaValue, 1)}
+                </span>
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="text-[var(--text-muted)]">RSI</span>
+                <span className="text-[var(--accent-green)] font-medium">
+                  {formatNumber(rsiValue, 0, false)}
                 </span>
               </span>
             </div>
@@ -218,7 +262,7 @@ export const StockCard = memo(function StockCard({
         <div className="text-right">
           <div className="text-xs text-[var(--text-muted)] mb-1">综合得分</div>
           <div className="text-[40px] font-bold text-[var(--text-primary)] leading-none">
-            {stock.scoreTotal?.toFixed(1) ?? '--'}
+            {scoreTotal?.toFixed(1) ?? '--'}
           </div>
         </div>
       </div>
@@ -248,31 +292,31 @@ export const StockCard = memo(function StockCard({
         <DimensionCard
           title="价格动能"
           subtitle="主要权重"
-          score={stock.scores?.momentum ?? 0}
-          scoreColor={getScoreColor(stock.scores?.momentum ?? 0)}
+          score={momentumScore}
+          scoreColor={getScoreColor(momentumScore)}
           metrics={momentumMetrics}
         />
 
         {/* Trend Structure */}
         <DimensionCard
           title="趋势结构"
-          score={stock.scores?.trend ?? 0}
-          scoreColor={getScoreColor(stock.scores?.trend ?? 0)}
+          score={trendScore}
+          scoreColor={getScoreColor(trendScore)}
           metrics={trendMetrics}
         />
 
         {/* Volume Confirmation */}
         <DimensionCard
           title="量价确认"
-          score={stock.scores?.volume ?? 0}
-          scoreColor={getScoreColor(stock.scores?.volume ?? 0)}
+          score={volumeScore}
+          scoreColor={getScoreColor(volumeScore)}
           metrics={volumeMetrics}
         />
 
         {/* Quality Filter */}
         <DimensionCard
           title="质量过滤"
-          score={stock.scores?.quality ?? 0}
+          score={qualityScore}
           scoreColor="blue"
           metrics={qualityMetrics}
         />
@@ -281,11 +325,102 @@ export const StockCard = memo(function StockCard({
         <DimensionCard
           title="期权覆盖"
           subtitle="20%权重"
-          score={stock.scores?.options ?? 0}
+          score={optionsScore}
           scoreColor="orange"
           metrics={optionsMetrics}
         />
       </div>
+
+      {comparisonItems.length > 0 && (
+        <div className="flex flex-nowrap gap-4 w-full overflow-x-auto pb-1">
+          {comparisonItems.map((item, idx) => (
+            <ComparisonCard
+              key={`${item.symbol}-${item.type}-${idx}`}
+              symbol={item.symbol}
+              type={item.type}
+              rs20d={item.rs20d}
+              sma20Slope={item.sma20Slope}
+              beta={item.beta ?? betaValue}
+            />
+          ))}
+        </div>
+      )}
     </div>
   );
 })
+
+interface ComparisonCardProps {
+  symbol: string;
+  type: 'industry' | 'sector' | 'market';
+  rs20d?: number | null;
+  sma20Slope?: number | null;
+  beta?: number | null;
+}
+
+function ComparisonCard({ symbol, type, rs20d, sma20Slope, beta }: ComparisonCardProps) {
+  const labelMap = {
+    industry: '行业ETF',
+    sector: '板块ETF',
+    market: '大盘'
+  };
+  const badgeClass = {
+    industry: 'bg-blue-50 text-[var(--accent-blue)]',
+    sector: 'bg-purple-50 text-[var(--accent-purple)]',
+    market: 'bg-emerald-50 text-[var(--accent-green)]'
+  };
+
+  const rsValue = rs20d === null || rs20d === undefined ? '--' : formatPercent(rs20d, 1, true);
+  const rsValueClass = rs20d === null || rs20d === undefined
+    ? 'text-[var(--text-muted)]'
+    : rs20d >= 0
+      ? 'text-[var(--accent-green)]'
+      : 'text-[var(--accent-red)]';
+  const rsStatus = rs20d === null || rs20d === undefined
+    ? { text: '--', className: 'text-[var(--text-muted)]' }
+    : rs20d > 0
+      ? { text: `✓ 跑赢${type === 'industry' ? '行业' : type === 'sector' ? '板块' : '大盘'}`, className: 'text-[var(--accent-green)]' }
+      : rs20d < 0
+        ? { text: `✗ 跑输${type === 'industry' ? '行业' : type === 'sector' ? '板块' : '大盘'}`, className: 'text-[var(--accent-red)]' }
+        : { text: `— 持平${type === 'industry' ? '行业' : type === 'sector' ? '板块' : '大盘'}`, className: 'text-[var(--text-muted)]' };
+
+  const dmaStatus = sma20Slope === null || sma20Slope === undefined
+    ? { text: '--', className: 'text-[var(--text-muted)]' }
+    : sma20Slope > 0
+      ? { text: '✓ 向上', className: 'text-[var(--accent-green)]' }
+      : sma20Slope < 0
+        ? { text: '↘ 向下', className: 'text-[var(--accent-red)]' }
+        : { text: '— 走平', className: 'text-[var(--text-muted)]' };
+
+  return (
+    <div className="bg-[var(--bg-secondary)] rounded-xl p-4 border border-[var(--border-light)] min-w-[220px] flex-1 basis-0">
+      <div className="flex items-center justify-between mb-3">
+        <div className="text-sm font-semibold text-[var(--text-primary)]">{symbol}</div>
+        <span className={`text-xs px-2 py-1 rounded-full ${badgeClass[type]}`}>
+          {labelMap[type]}
+        </span>
+      </div>
+      <div className="space-y-2 text-xs text-[var(--text-secondary)]">
+        <div className="flex items-center justify-between">
+          <span>相对强度 (20D)</span>
+          <span className={`font-semibold ${rsValueClass}`}>{rsValue}</span>
+        </div>
+        <div className="flex items-center justify-between">
+          <span>RS状态</span>
+          <span className={`font-semibold ${rsStatus.className}`}>{rsStatus.text}</span>
+        </div>
+        <div className="flex items-center justify-between">
+          <span>20DMA</span>
+          <span className={`font-semibold ${dmaStatus.className}`}>{dmaStatus.text}</span>
+        </div>
+        {type === 'market' && (
+          <div className="flex items-center justify-between">
+            <span>Beta相关</span>
+            <span className="font-semibold text-[var(--text-primary)]">
+              {beta === null || beta === undefined ? '--' : beta.toFixed(2)}
+            </span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

@@ -5,7 +5,8 @@ interface HoldingsImportDrawerProps {
   isOpen: boolean;
   onClose: () => void;
   etfSymbol: string;
-  onImport: (data: HoldingsImportData) => void;
+  selectedCoverage?: string;
+  onImport: (data: HoldingsImportData) => Promise<void> | void;
 }
 
 export interface HoldingsImportData {
@@ -49,12 +50,14 @@ export function HoldingsImportDrawer({
   isOpen,
   onClose,
   etfSymbol,
+  selectedCoverage,
   onImport,
 }: HoldingsImportDrawerProps) {
   const [source, setSource] = useState<'finviz' | 'marketchameleon'>('finviz');
   const [coverage, setCoverage] = useState<CoverageType>('top10');
   const [jsonData, setJsonData] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [isImporting, setIsImporting] = useState(false);
   const [holdings, setHoldings] = useState<HoldingInfo[]>([]);
   const [showAllHoldings, setShowAllHoldings] = useState(false);
   const [copySuccess, setCopySuccess] = useState(false);
@@ -62,9 +65,15 @@ export function HoldingsImportDrawer({
   // 加载 ETF 持仓数据
   useEffect(() => {
     if (isOpen && etfSymbol) {
+      if (
+        selectedCoverage &&
+        COVERAGE_OPTIONS.some((option) => option.value === selectedCoverage)
+      ) {
+        setCoverage(selectedCoverage as CoverageType);
+      }
       loadHoldings();
     }
-  }, [isOpen, etfSymbol]);
+  }, [isOpen, etfSymbol, selectedCoverage]);
 
   // 切换覆盖范围时收起展开状态
   useEffect(() => {
@@ -139,7 +148,7 @@ export function HoldingsImportDrawer({
     setError(null);
   };
 
-  const handleImport = () => {
+  const handleImport = async () => {
     try {
       if (jsonData.trim()) {
         JSON.parse(jsonData);
@@ -148,14 +157,19 @@ export function HoldingsImportDrawer({
         return;
       }
       setError(null);
-      onImport({ source, coverage, jsonData });
+      setIsImporting(true);
+      await onImport({ source, coverage, jsonData });
       handleClose();
-    } catch {
-      setError('JSON 格式错误，请检查输入');
+    } catch (e) {
+      const fallback = '导入失败，请检查 JSON 数据或后端服务';
+      setError(e instanceof Error && e.message ? e.message : fallback);
+    } finally {
+      setIsImporting(false);
     }
   };
 
   const handleClose = () => {
+    if (isImporting) return;
     setJsonData('');
     setError(null);
     setSource('finviz');
@@ -179,7 +193,7 @@ export function HoldingsImportDrawer({
           fixed inset-0 bg-black/40 z-40 transition-opacity duration-300
           ${isOpen ? 'opacity-100' : 'opacity-0 pointer-events-none'}
         `}
-        onClick={handleClose}
+        onClick={isImporting ? undefined : handleClose}
       />
 
       {/* Drawer */}
@@ -202,6 +216,7 @@ export function HoldingsImportDrawer({
             </div>
             <button
               onClick={handleClose}
+              disabled={isImporting}
               className="p-2 rounded-[var(--radius-sm)] text-[var(--text-muted)] hover:bg-[var(--bg-tertiary)] hover:text-[var(--text-primary)] transition-colors"
             >
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -398,18 +413,20 @@ export function HoldingsImportDrawer({
         <div className="px-6 py-4 border-t border-[var(--border-light)] flex items-center justify-between">
           <button
             onClick={handleClear}
+            disabled={isImporting}
             className="px-5 py-2.5 text-sm font-medium rounded-[var(--radius-md)] bg-[var(--bg-secondary)] text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] transition-colors"
           >
             清除
           </button>
           <button
             onClick={handleImport}
-            className="px-6 py-2.5 text-sm font-medium rounded-[var(--radius-md)] bg-[var(--accent-blue)] text-white hover:bg-blue-600 transition-colors flex items-center gap-2"
+            disabled={isImporting}
+            className="px-6 py-2.5 text-sm font-medium rounded-[var(--radius-md)] bg-[var(--accent-blue)] text-white hover:bg-blue-600 transition-colors flex items-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed"
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M12 5v14M5 12l7-7 7 7" />
             </svg>
-            解析并导入
+            {isImporting ? '导入中...' : '解析并导入'}
           </button>
         </div>
       </div>

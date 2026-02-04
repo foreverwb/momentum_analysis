@@ -3,15 +3,13 @@ Broker 管理 API
 Broker Management API Endpoints
 
 提供:
-- Broker 连接状态查询
 - 连接/断开控制
 - 配置管理
 """
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
-from typing import Dict, Optional, Any, List
-from datetime import datetime
+from typing import Optional
 import logging
 
 logger = logging.getLogger(__name__)
@@ -20,27 +18,6 @@ router = APIRouter(prefix="/api/broker", tags=["Broker"])
 
 
 # ==================== Pydantic Models ====================
-
-class BrokerStatusResponse(BaseModel):
-    """Broker 状态响应"""
-    broker: str
-    is_connected: bool
-    last_connected: Optional[str] = None
-    last_error: Optional[str] = None
-    config: Dict[str, Any] = {}
-
-
-class AllBrokerStatusResponse(BaseModel):
-    """所有 Broker 状态响应"""
-    ibkr: BrokerStatusResponse
-    futu: BrokerStatusResponse
-
-
-class ConnectRequest(BaseModel):
-    """连接请求"""
-    host: str = Field("127.0.0.1", description="主机地址")
-    port: int = Field(..., description="端口号")
-    client_id: Optional[int] = Field(None, description="客户端 ID（仅 IBKR）")
 
 
 class ConnectResponse(BaseModel):
@@ -60,83 +37,21 @@ class DisconnectResponse(BaseModel):
 
 class IBKRConfigRequest(BaseModel):
     """IBKR 配置请求"""
-    host: str = Field("127.0.0.1", description="TWS/Gateway 主机地址")
-    port: int = Field(4002, description="端口号 (TWS: 7497, Gateway: 4002)")
-    client_id: int = Field(3, description="客户端 ID")
-    timeout: int = Field(30, description="连接超时（秒）")
+    host: Optional[str] = Field(None, description="TWS/Gateway 主机地址")
+    port: Optional[int] = Field(None, description="端口号 (TWS: 7497, Gateway: 4002)")
+    client_id: Optional[int] = Field(None, description="客户端 ID")
+    timeout: Optional[int] = Field(None, description="连接超时（秒）")
 
 
 class FutuConfigRequest(BaseModel):
     """Futu 配置请求"""
-    host: str = Field("127.0.0.1", description="OpenD 主机地址")
-    port: int = Field(11111, description="端口号")
-    rate_limit: int = Field(10, description="速率限制（请求/分钟）")
+    host: Optional[str] = Field(None, description="OpenD 主机地址")
+    port: Optional[int] = Field(None, description="端口号")
+    market: Optional[str] = Field(None, description="市场代码")
+    rate_limit: Optional[int] = Field(10, description="速率限制（请求/分钟）")
 
 
 # ==================== API Endpoints ====================
-
-@router.get("/status", response_model=AllBrokerStatusResponse)
-async def get_all_broker_status():
-    """
-    获取所有 Broker 连接状态
-    
-    返回 IBKR 和 Futu 的连接状态
-    """
-    try:
-        from app.services.orchestrator import get_orchestrator
-        
-        orchestrator = get_orchestrator()
-        status = orchestrator.get_broker_status()
-        
-        return {
-            'ibkr': status.get('ibkr', {
-                'broker': 'ibkr',
-                'is_connected': False
-            }),
-            'futu': status.get('futu', {
-                'broker': 'futu',
-                'is_connected': False
-            })
-        }
-        
-    except Exception as e:
-        logger.error(f"获取 Broker 状态失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/status/{broker}", response_model=BrokerStatusResponse)
-async def get_broker_status(broker: str):
-    """
-    获取指定 Broker 连接状态
-    
-    参数:
-    - broker: ibkr 或 futu
-    """
-    if broker not in ['ibkr', 'futu']:
-        raise HTTPException(
-            status_code=400, 
-            detail="Invalid broker. Use 'ibkr' or 'futu'"
-        )
-    
-    try:
-        from app.services.orchestrator import get_orchestrator
-        
-        orchestrator = get_orchestrator()
-        status = orchestrator.get_broker_status()
-        
-        broker_status = status.get(broker)
-        if not broker_status:
-            return {
-                'broker': broker,
-                'is_connected': False
-            }
-        
-        return broker_status
-        
-    except Exception as e:
-        logger.error(f"获取 {broker} 状态失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
 
 @router.post("/ibkr/connect", response_model=ConnectResponse)
 async def connect_ibkr(request: Optional[IBKRConfigRequest] = None):
@@ -152,16 +67,23 @@ async def connect_ibkr(request: Optional[IBKRConfigRequest] = None):
         from app.services.orchestrator import get_orchestrator
         
         orchestrator = get_orchestrator()
+        defaults = orchestrator.get_broker_defaults().get("ibkr", {})
         
-        # 使用默认值或请求参数
-        host = request.host if request else '127.0.0.1'
-        port = request.port if request else 4002
-        client_id = request.client_id if request else 3
+        # 使用请求参数；未提供时使用 cfg.yaml 默认值
+        host = request.host if request and request.host else defaults.get("host", "127.0.0.1")
+        port = request.port if request and request.port is not None else defaults.get("port", 4002)
+        client_id = (
+            request.client_id
+            if request and request.client_id is not None
+            else defaults.get("client_id", 3)
+        )
+        timeout = request.timeout if request and request.timeout is not None else defaults.get("timeout", 30)
         
         success = await orchestrator.connect_ibkr(
             host=host,
             port=port,
-            client_id=client_id
+            client_id=client_id,
+            timeout=timeout,
         )
         
         if success:
@@ -219,13 +141,16 @@ async def connect_futu(request: Optional[FutuConfigRequest] = None):
         from app.services.orchestrator import get_orchestrator
         
         orchestrator = get_orchestrator()
+        defaults = orchestrator.get_broker_defaults().get("futu", {})
         
-        host = request.host if request else '127.0.0.1'
-        port = request.port if request else 11111
+        host = request.host if request and request.host else defaults.get("host", "127.0.0.1")
+        port = request.port if request and request.port is not None else defaults.get("port", 11111)
+        market = request.market if request and request.market else defaults.get("market", "US")
         
         success = await orchestrator.connect_futu(
             host=host,
-            port=port
+            port=port,
+            market=market,
         )
         
         if success:
@@ -418,31 +343,39 @@ async def get_default_config():
     """
     获取默认 Broker 配置
     """
+    from app.services.orchestrator import get_orchestrator
+
+    defaults = get_orchestrator().get_broker_defaults()
+    ibkr_defaults = defaults.get("ibkr", {})
+    futu_defaults = defaults.get("futu", {})
+
     return {
         'ibkr': {
-            'host': '127.0.0.1',
+            'host': ibkr_defaults.get("host", "127.0.0.1"),
             'port': {
+                'configured': ibkr_defaults.get("port", 4002),
                 'gateway': 4002,
                 'tws': 7497,
                 'gateway_paper': 4002,
                 'tws_paper': 7497
             },
-            'client_id': 1,
-            'timeout': 30,
+            'client_id': ibkr_defaults.get("client_id", 3),
+            'timeout': ibkr_defaults.get("timeout", 30),
             'notes': [
+                '默认值来自 cfg.yaml（如存在）',
                 'TWS 或 Gateway 必须运行',
-                'API 连接必须在软件中启用',
-                'Paper Trading 使用相同端口'
+                'API 连接必须在软件中启用'
             ]
         },
         'futu': {
-            'host': '127.0.0.1',
-            'port': 11111,
+            'host': futu_defaults.get("host", "127.0.0.1"),
+            'port': futu_defaults.get("port", 11111),
+            'market': futu_defaults.get("market", "US"),
             'rate_limit': 10,
             'notes': [
+                '默认值来自 cfg.yaml（如存在）',
                 'OpenD 必须运行',
-                '需要有效的 Futu 账户',
-                '美股期权需要开通权限'
+                '需要有效的 Futu 账户'
             ]
         }
     }

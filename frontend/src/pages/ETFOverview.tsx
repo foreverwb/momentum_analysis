@@ -8,14 +8,6 @@ interface ETFOverviewProps {
   type: 'sector' | 'industry';
 }
 
-// 趋势向上图标
-const TrendingUpIcon = (
-  <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-    <polyline points="23 6 13.5 15.5 8.5 10.5 1 18"></polyline>
-    <polyline points="17 6 23 6 23 12"></polyline>
-  </svg>
-);
-
 export function ETFOverview({ type }: ETFOverviewProps) {
   const { data: etfs, isLoading, error, refetch } = useETFs(type);
   const [viewMode, setViewMode] = useState<'card' | 'table'>('card');
@@ -57,7 +49,6 @@ export function ETFOverview({ type }: ETFOverviewProps) {
       {/* Page Header - 参考 data_config_etf_panel.html 的设计 */}
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-3">
-          <span className="w-5 h-5 text-blue-600">{TrendingUpIcon}</span>
           <h2 className="text-xl font-bold text-slate-900">{title}</h2>
           <span className="text-sm text-slate-600">
             {filteredETFs.length} 个{type === 'sector' ? '板块' : '行业'}
@@ -133,8 +124,10 @@ export function ETFOverview({ type }: ETFOverviewProps) {
             </thead>
             <tbody>
               {filteredETFs.map((etf) => {
-                const formatDelta = (value: number | null) => {
-                  if (value === null) return { text: '--', className: '' };
+                const formatDelta = (value: number | null | undefined) => {
+                  if (value === null || value === undefined || Number.isNaN(value)) {
+                    return { text: '--', className: '' };
+                  }
                   if (value > 0) return { text: `+${value.toFixed(1)}`, className: 'text-[var(--accent-green)]' };
                   if (value < 0) return { text: `${value.toFixed(1)}`, className: 'text-[var(--accent-red)]' };
                   return { text: '0', className: '' };

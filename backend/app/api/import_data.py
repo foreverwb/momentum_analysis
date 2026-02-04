@@ -48,6 +48,9 @@ def _upsert_imported_data(db: Session, source: str, items: List[Dict[str, Any]])
         ).first()
         if existing:
             existing.data = item
+            existing.date = today
+            # 复用记录时同步刷新导入时间，便于前端按“北京时间 08:00 起算”判定最新状态
+            existing.created_at = datetime.utcnow()
         else:
             db.add(ImportedData(
                 symbol=symbol,
@@ -218,6 +221,14 @@ def validate_and_filter_holdings(holdings: List[Dict[str, Any]]) -> tuple:
     验证并过滤持仓数据
     返回: (有效持仓列表, 跳过的记录详情)
     """
+    def normalize_weight(value: Any) -> Any:
+        if isinstance(value, str):
+            cleaned = value.strip().replace(",", "")
+            if cleaned.endswith("%"):
+                cleaned = cleaned[:-1].strip()
+            return cleaned
+        return value
+
     valid_holdings = []
     skipped = []
     
@@ -237,7 +248,7 @@ def validate_and_filter_holdings(holdings: List[Dict[str, Any]]) -> tuple:
         
         # 验证 Weight
         try:
-            weight_float = float(weight)
+            weight_float = float(normalize_weight(weight))
             if weight_float <= 0:
                 skipped.append({
                     "row": str(row),

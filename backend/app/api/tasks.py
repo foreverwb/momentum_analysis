@@ -10,13 +10,14 @@ from sqlalchemy import func
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime, date as date_type
 import asyncio
+import json
 
 import pandas as pd
 
 from app.models import get_db, Task, ETF, ETFHolding, Stock, PriceHistory, ImportedData, IVData, ScoreSnapshot
 from app.schemas import TaskCreate
 from app.api.etfs import refresh_etf_data
-from app.services.calculators.momentum_pool import calculate_momentum_pool_result
+from app.api.series_utils import build_metric_series, build_sma20_comparison_series
 
 router = APIRouter()
 
@@ -41,6 +42,23 @@ def _parse_coverage(coverage: str) -> Tuple[str, int]:
     if coverage.startswith("weight"):
         return "weight", int(coverage.replace("weight", "") or 70)
     return "top", 20
+
+
+def _normalize_symbols(raw: Any) -> List[str]:
+    if isinstance(raw, list):
+        return [str(item).strip().upper() for item in raw if str(item).strip()]
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [str(item).strip().upper() for item in parsed if str(item).strip()]
+        except Exception:
+            pass
+        return [item.strip().upper() for item in text.split(',') if item.strip()]
+    return []
 
 
 def _load_price_history(db: Session, symbol: str, min_rows: int = 60) -> Optional[pd.DataFrame]:
@@ -150,6 +168,69 @@ async def get_task(task_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Task not found")
     
     return format_task_response(task)
+
+
+@router.get("/{task_id}/trend-comparison", response_model=dict)
+async def get_task_trend_comparison(
+    task_id: int,
+    period: int = Query(20, description="对比周期（交易日）: 5/20/63"),
+    metric: str = Query("relative", description="指标: relative/sma20/return20d/score"),
+    db: Session = Depends(get_db)
+):
+    """
+    获取任务的走势对比数据
+
+    返回:
+    - dates: 日期标签
+    - series: [{symbol, values}]
+    """
+    if period not in (5, 20, 63):
+        raise HTTPException(status_code=400, detail="period must be one of 5, 20, 63")
+    if metric not in ("relative", "sma20", "return20d", "score"):
+        raise HTTPException(status_code=400, detail="metric must be one of relative, sma20, return20d, score")
+
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    symbols = _normalize_symbols(task.etfs)
+    if task.sector:
+        symbols.append(task.sector.upper())
+    if task.base_index:
+        symbols.append(task.base_index.upper())
+    symbols.extend(["SPY", "QQQ"])
+
+    # 去重并保持顺序
+    deduped: List[str] = []
+    for symbol in symbols:
+        if symbol and symbol not in deduped:
+            deduped.append(symbol)
+
+    if metric == "sma20":
+        dates, price_series, sma20_series, deviation_series = build_sma20_comparison_series(db, deduped, period)
+        return {
+            "task_id": task.id,
+            "period": period,
+            "metric": metric,
+            "symbols": deduped,
+            "dates": dates,
+            # 保持向后兼容：series 默认返回可读性更高的偏离度(%)
+            "series": deviation_series,
+            "price_series": price_series,
+            "sma20_series": sma20_series,
+            "deviation_series": deviation_series,
+        }
+
+    dates, series = build_metric_series(db, deduped, period, metric=metric)
+
+    return {
+        "task_id": task.id,
+        "period": period,
+        "metric": metric,
+        "symbols": deduped,
+        "dates": dates,
+        "series": series
+    }
 
 
 @router.post("", response_model=dict)
@@ -330,15 +411,16 @@ async def refresh_momentum_stocks(
             await orchestrator.connect_ibkr()
         except Exception:
             pass
+    ibkr_connected = orchestrator.get_broker_status().get("ibkr", {}).get("is_connected", False)
 
     # 预加载板块价格
     sector_symbol = task.sector.upper() if task.sector else None
     sector_df = None
     if sector_symbol:
         sector_df = _load_price_history(db, sector_symbol)
-        if sector_df is None and orchestrator._ibkr and orchestrator._ibkr.is_connected():
+        if sector_df is None and ibkr_connected:
             try:
-                fetched = orchestrator._ibkr.get_ohlcv_data(sector_symbol, "1 Y")
+                fetched = await orchestrator.get_ohlcv_data(sector_symbol, "1 Y")
                 if fetched is not None and not fetched.empty:
                     _save_price_history(db, sector_symbol, fetched)
                     sector_df = fetched
@@ -389,9 +471,9 @@ async def refresh_momentum_stocks(
         etf = context["etf"]
 
         price_df = _load_price_history(db, ticker)
-        if price_df is None and orchestrator._ibkr and orchestrator._ibkr.is_connected():
+        if price_df is None and ibkr_connected:
             try:
-                fetched = orchestrator._ibkr.get_ohlcv_data(ticker, "1 Y")
+                fetched = await orchestrator.get_ohlcv_data(ticker, "1 Y")
                 if fetched is not None and not fetched.empty:
                     _save_price_history(db, ticker, fetched)
                     price_df = fetched
@@ -406,16 +488,20 @@ async def refresh_momentum_stocks(
         mc_data = _get_latest_import(db, ticker, "marketchameleon")
         iv_data = _get_latest_iv(db, ticker)
 
-        result = calculate_momentum_pool_result(
-            price_df=price_df,
-            sector_df=sector_df,
+        result = await orchestrator.calculate_momentum_pool_score(
+            symbol=ticker,
+            sector_etf=sector_symbol,
             finviz_data=finviz_data,
             mc_data=mc_data,
-            iv_data=iv_data
+            iv_data=iv_data,
+            duration='1 Y',
         )
 
-        if result is None:
-            errors.append({"symbol": ticker, "reason": "calc_failed"})
+        if result is None or result.get("total_score") is None:
+            errors.append({
+                "symbol": ticker,
+                "reason": (result or {}).get("error", "calc_failed")
+            })
             continue
 
         stock = db.query(Stock).filter(Stock.symbol == ticker).first()
@@ -434,9 +520,9 @@ async def refresh_momentum_stocks(
         stock.sector = sector_value
         stock.industry = industry_value
         stock.price = float(price_df["close"].iloc[-1])
-        stock.score_total = result.total_score
-        stock.scores = result.scores
-        stock.metrics = result.metrics
+        stock.score_total = float(result["total_score"])
+        stock.scores = result.get("scores") or {}
+        stock.metrics = result.get("metrics") or {}
         db.add(stock)
         db.flush()
 
@@ -448,13 +534,16 @@ async def refresh_momentum_stocks(
         ).first()
 
         score_breakdown = {
-            "scores": result.scores,
-            "metrics": result.metrics
+            "scores": stock.scores or {},
+            "metrics": stock.metrics or {}
         }
-        thresholds_pass = (result.scores.get("momentum", 0) >= 50 and result.scores.get("trend", 0) >= 50)
+        thresholds_pass = (
+            (stock.scores or {}).get("momentum", 0) >= 50 and
+            (stock.scores or {}).get("trend", 0) >= 50
+        )
 
         if existing_snapshot:
-            existing_snapshot.total_score = result.total_score
+            existing_snapshot.total_score = stock.score_total
             existing_snapshot.score_breakdown = score_breakdown
             existing_snapshot.thresholds_pass = thresholds_pass
         else:
@@ -462,7 +551,7 @@ async def refresh_momentum_stocks(
                 symbol=ticker,
                 symbol_type="stock",
                 date=today,
-                total_score=result.total_score,
+                total_score=stock.score_total,
                 score_breakdown=score_breakdown,
                 thresholds_pass=thresholds_pass
             ))
@@ -473,7 +562,7 @@ async def refresh_momentum_stocks(
 
         updated.append({
             "symbol": ticker,
-            "score": result.total_score,
+            "score": stock.score_total,
             "sector": sector_value,
             "industry": industry_value,
             "weight": holding.weight
