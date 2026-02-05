@@ -742,6 +742,47 @@ export async function getETFHoldingsBySymbol(symbol: string): Promise<Array<{
 }
 
 // ----------------------------------------------------------------------------
+// Market APIs
+// ----------------------------------------------------------------------------
+
+export interface MarketRegimeResponse {
+  status: string;
+  regime_text?: string;
+  spy?: {
+    price: number;
+    sma20: number;
+    sma50: number;
+    dist_to_sma20?: number | null;
+    dist_to_sma50?: number | null;
+    return_20d: number;
+    sma20_slope: number;
+  };
+  vix?: number | null;
+  indicators?: {
+    price_above_sma20?: boolean;
+    price_above_sma50?: boolean;
+    sma20_slope?: number;
+    sma20_slope_positive?: boolean;
+    sma20_above_sma50?: boolean;
+    return_20d?: number;
+    dist_to_sma20?: number | null;
+    dist_to_sma50?: number | null;
+    near_sma50?: boolean | null;
+  };
+  error?: string;
+}
+
+/**
+ * Get market regime (Regime Gate)
+ */
+export async function getMarketRegime(
+  refresh = false
+): Promise<MarketRegimeResponse> {
+  const query = refresh ? '?refresh=true' : '';
+  return fetchApi<MarketRegimeResponse>(`/market/regime${query}`);
+}
+
+// ----------------------------------------------------------------------------
 // Options Data APIs
 // ----------------------------------------------------------------------------
 

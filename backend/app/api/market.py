@@ -9,11 +9,20 @@ Market Data API Endpoints
 - 数据同步
 """
 
-from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
+from fastapi import APIRouter, Query, BackgroundTasks, Depends
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
-from datetime import datetime
+from datetime import datetime, date as date_type
 import logging
+
+from sqlalchemy.orm import Session
+
+from app.models import get_db, MarketRegimeSnapshot
+
+try:
+    import numpy as np
+except Exception:  # pragma: no cover - optional dependency at runtime
+    np = None
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +140,10 @@ ETF_NAMES = {
 # ==================== API Endpoints ====================
 
 @router.get("/regime", response_model=RegimeResponse)
-async def get_market_regime():
+async def get_market_regime(
+    refresh: bool = Query(False, description="是否强制刷新并写入数据库"),
+    db: Session = Depends(get_db)
+):
     """
     获取当前市场环境 (Regime Gate)
     
@@ -142,25 +154,119 @@ async def get_market_regime():
     - vix: VIX 指数
     - indicators: 详细指标
     """
+    def normalize_json(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {k: normalize_json(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [normalize_json(v) for v in value]
+        if np is not None:
+            if isinstance(value, np.generic):
+                return value.item()
+        if isinstance(value, (datetime, date_type)):
+            return value.isoformat()
+        return value
+
+    def serialize_snapshot(snapshot: MarketRegimeSnapshot) -> Dict[str, Any]:
+        return {
+            "status": snapshot.status,
+            "regime_text": normalize_json(snapshot.regime_text),
+            "spy": normalize_json(snapshot.spy),
+            "vix": normalize_json(snapshot.vix),
+            "indicators": normalize_json(snapshot.indicators or {}),
+            "error": normalize_json(snapshot.error)
+        }
+
     try:
+        today = date_type.today()
+
+        if not refresh:
+            existing_snapshot = db.query(MarketRegimeSnapshot).filter(
+                MarketRegimeSnapshot.snapshot_date == today
+            ).first()
+            if existing_snapshot:
+                return serialize_snapshot(existing_snapshot)
+            return {
+                "status": "NO_DATA",
+                "regime_text": None,
+                "spy": None,
+                "vix": None,
+                "indicators": {},
+                "error": "No snapshot for today"
+            }
+
         from app.services.orchestrator import get_orchestrator
-        
+
         orchestrator = get_orchestrator()
-        
+
         # 检查 IBKR 连接
         broker_status = orchestrator.get_broker_status()
         if not broker_status.get('ibkr', {}).get('is_connected', False):
-            # 尝试连接
-            await orchestrator.connect_ibkr()
-        
+            # 尝试连接（失败时不抛出，返回 DISCONNECTED 状态）
+            try:
+                await orchestrator.connect_ibkr()
+            except Exception as exc:
+                logger.warning(f"IBKR 连接失败，返回离线状态: {exc}")
+
         # 获取 Regime 摘要
         result = await orchestrator.get_regime_summary()
-        
-        return result
-        
+
+        # 保底返回，避免抛 500 导致前端 CORS 误报
+        if not isinstance(result, dict) or not result.get('status'):
+            result = {
+                "status": "ERROR",
+                "regime_text": None,
+                "spy": None,
+                "vix": None,
+                "indicators": {},
+                "error": "Regime data unavailable"
+            }
+
+        normalized_result = normalize_json(result)
+
+        # 写入/更新当日快照
+        snapshot = db.query(MarketRegimeSnapshot).filter(
+            MarketRegimeSnapshot.snapshot_date == today
+        ).first()
+
+        payload = {
+            "status": normalized_result.get("status") or "UNKNOWN",
+            "regime_text": normalized_result.get("regime_text"),
+            "spy": normalized_result.get("spy"),
+            "vix": normalized_result.get("vix"),
+            "indicators": normalized_result.get("indicators"),
+            "error": normalized_result.get("error")
+        }
+
+        if snapshot:
+            snapshot.status = payload["status"]
+            snapshot.regime_text = payload["regime_text"]
+            snapshot.spy = payload["spy"]
+            snapshot.vix = payload["vix"]
+            snapshot.indicators = payload["indicators"]
+            snapshot.error = payload["error"]
+            snapshot.updated_at = datetime.utcnow()
+        else:
+            snapshot = MarketRegimeSnapshot(
+                snapshot_date=today,
+                **payload
+            )
+            db.add(snapshot)
+
+        db.commit()
+
+        return normalized_result
+
     except Exception as e:
         logger.error(f"获取 Regime 失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # 不抛异常，返回错误对象，确保前端拿到 CORS headers
+        return {
+            "status": "ERROR",
+            "regime_text": None,
+            "spy": None,
+            "vix": None,
+            "indicators": {},
+            "error": str(e)
+        }
 
 
 @router.get("/etf-rankings", response_model=ETFRankingsResponse)

@@ -225,6 +225,22 @@ class ScoreSnapshot(Base):
     )
 
 
+class MarketRegimeSnapshot(Base):
+    """市场环境每日快照表"""
+    __tablename__ = 'market_regime_snapshots'
+
+    id = Column(Integer, primary_key=True)
+    snapshot_date = Column(Date, nullable=False, unique=True, index=True)
+    status = Column(String(20), nullable=False)
+    regime_text = Column(String(50), nullable=True)
+    spy = Column(JSON, nullable=True)
+    vix = Column(Float, nullable=True)
+    indicators = Column(JSON, nullable=True)
+    error = Column(String(500), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class BrokerStatus(Base):
     """Broker 连接状态表"""
     __tablename__ = 'broker_status'

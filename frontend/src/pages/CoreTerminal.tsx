@@ -3,19 +3,32 @@ import type { ETF } from '../types';
 import * as api from '../services/api';
 
 // ============ 类型定义 ============
-interface MarketRegime {
-  status: 'A' | 'B' | 'C';
-  spy: {
-    price: number;
-    sma20: number;
-    sma50: number;
+type MarketRegimeStatus = 'A' | 'B' | 'C' | 'UNKNOWN' | 'DISCONNECTED' | 'NO_DATA' | 'ERROR';
+
+interface MarketStatus {
+  status?: MarketRegimeStatus;
+  spy?: {
+    price?: number;
+    sma20?: number;
+    sma50?: number;
     return20d?: number;
     sma20Slope?: number;
     distToSma20?: number | null;
     distToSma50?: number | null;
   };
-  vix: number | null;
-  breadth: number;
+  vix?: number | null;
+  breadth?: number;
+}
+
+interface MarketSnapshot {
+  data: MarketStatus | null;
+  source: 'live' | 'cache' | 'none';
+  savedAt?: string | null;
+}
+
+interface StoredMarketSnapshot {
+  savedAt: string;
+  data: MarketStatus;
 }
 
 interface Sector {
@@ -99,57 +112,117 @@ function EditableNumber({ value, onChange, suffix = '%', className = '' }: Edita
   };
 
   return (
-    <div className={`group relative inline-block ${className}`}>
-      <input
-        type="text"
-        value={isEditing ? localValue : displayValue}
-        onChange={(e) => setLocalValue(e.target.value)}
-        onFocus={handleFocus}
-        onBlur={handleBlur}
-        onKeyDown={handleKeyDown}
-        className="
-          w-full text-2xl font-bold text-center bg-transparent border-none outline-none
-          cursor-default
-          group-hover:cursor-text
-          focus:cursor-text
-        "
-        style={{
-          appearance: 'none',
-          WebkitAppearance: 'none',
-          MozAppearance: 'textfield',
-        }}
-      />
-      {/* Hover indicator */}
-      <div className="
-        absolute inset-0 rounded-md border-2 border-transparent
-        group-hover:border-white/30 group-hover:bg-white/5
-        transition-all duration-200 pointer-events-none
-      ">
-        <EditIcon className="absolute top-1 right-1 text-white/60 opacity-0 group-hover:opacity-100 transition-opacity" />
-      </div>
+    <div className={`group relative inline-flex items-center justify-center ${className}`}>
+      {isEditing ? (
+        // Square input during editing - 正方形输入框
+        <input
+          type="text"
+          value={localValue}
+          onChange={(e) => setLocalValue(e.target.value)}
+          onFocus={handleFocus}
+          onBlur={handleBlur}
+          onKeyDown={handleKeyDown}
+          autoFocus
+          className="
+            w-20 h-20 text-2xl font-bold text-center 
+            bg-white/10 border-2 border-white/50 rounded-md
+            outline-none cursor-text
+            focus:border-white/70 focus:bg-white/15
+            transition-all duration-200
+          "
+          style={{
+            appearance: 'none',
+            WebkitAppearance: 'none',
+            MozAppearance: 'textfield',
+          }}
+        />
+      ) : (
+        // Display value with hover effect - 显示状态
+        <div 
+          onClick={handleFocus}
+          className="
+            text-2xl font-bold cursor-pointer
+            hover:bg-white/10 hover:border-2 hover:border-white/30
+            rounded-md px-3 py-2 transition-all duration-200
+            relative min-w-[5rem]
+          "
+        >
+          {displayValue}
+          <EditIcon className="absolute -top-1 -right-1 text-white/60 opacity-0 group-hover:opacity-100 transition-opacity" />
+        </div>
+      )}
     </div>
   );
 }
 
-// ============ 默认数据（无实时数据时展示） ============
-const marketRegime: MarketRegime = {
-  status: 'A',
-  spy: { price: 485.20, sma20: 472.5, sma50: 460.0, return20d: 0.028, sma20Slope: 0.35, distToSma20: 0.027, distToSma50: 0.055 },
-  vix: 14.2,
-  breadth: 68
+
+// ============ 本地快照缓存 ============
+const MARKET_SNAPSHOT_STORAGE_KEY = 'coreTerminal.marketRegimeSnapshot.v1';
+
+const isFiniteNumber = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value);
+
+const normalizeStatus = (value?: string): MarketRegimeStatus | undefined => {
+  if (!value) return undefined;
+  const upper = value.toUpperCase();
+  if (upper === 'A' || upper === 'B' || upper === 'C') return upper as MarketRegimeStatus;
+  if (upper === 'DISCONNECTED') return 'DISCONNECTED';
+  if (upper === 'NO_DATA') return 'NO_DATA';
+  if (upper === 'ERROR') return 'ERROR';
+  if (upper === 'UNKNOWN') return 'UNKNOWN';
+  return 'UNKNOWN';
+};
+
+const hasUsableSpyData = (spy?: MarketStatus['spy']): boolean =>
+  isFiniteNumber(spy?.price) && isFiniteNumber(spy?.sma50);
+
+const loadStoredSnapshot = (): StoredMarketSnapshot | null => {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(MARKET_SNAPSHOT_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    const savedAt = typeof parsed.savedAt === 'string' ? parsed.savedAt : null;
+    const data = parsed.data as MarketStatus | undefined;
+    if (!savedAt || !data) return null;
+    const normalizedData: MarketStatus = {
+      ...data,
+      status: normalizeStatus(data.status),
+    };
+    if (!hasUsableSpyData(normalizedData.spy)) return null;
+    return { savedAt, data: normalizedData };
+  } catch {
+    return null;
+  }
+};
+
+const saveStoredSnapshot = (data: MarketStatus, savedAt: string) => {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.setItem(MARKET_SNAPSHOT_STORAGE_KEY, JSON.stringify({ savedAt, data }));
+  } catch {
+    // Ignore storage errors
+  }
 };
 
 // ============ 辅助函数 ============
-function getRegimeColor(status: 'A' | 'B' | 'C'): string {
+function getRegimeColor(status: MarketRegimeStatus): string {
   if (status === 'A') return 'from-emerald-400 to-green-500';
   if (status === 'B') return 'from-amber-400 to-orange-500';
-  return 'from-red-400 to-rose-500';
+  if (status === 'C') return 'from-red-400 to-rose-500';
+  if (status === 'ERROR') return 'from-rose-400 to-red-500';
+  return 'from-slate-400 to-slate-500';
 }
 
-function getRegimeText(status: 'A' | 'B' | 'C'): string {
+function getRegimeText(status: MarketRegimeStatus): string {
   if (status === 'A') return 'Risk-On 满火力';
   if (status === 'B') return 'Neutral 半火力';
-  return 'Risk-Off 低火力';
+  if (status === 'C') return 'Risk-Off 低火力';
+  if (status === 'DISCONNECTED') return 'IBKR 未连接';
+  if (status === 'NO_DATA') return '暂无快照';
+  if (status === 'ERROR') return '数据异常';
+  return '数据不足';
 }
 
 function getHeatColor(heat: 'high' | 'medium' | 'low'): string {
@@ -272,12 +345,11 @@ export function CoreTerminal() {
   const [sectorLoading, setSectorLoading] = useState(false);
   const [sectorError, setSectorError] = useState<string | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const [marketStatus, setMarketStatus] = useState<{
-    status?: string;
-    spy?: { price?: number; sma20?: number; sma50?: number; return20d?: number; sma20Slope?: number; distToSma20?: number | null; distToSma50?: number | null };
-    vix?: number | null;
-    breadth?: number;
-  } | null>(null);
+  const [marketSnapshot, setMarketSnapshot] = useState<MarketSnapshot>({
+    data: null,
+    source: 'none',
+    savedAt: null,
+  });
   const [marketStatusError, setMarketStatusError] = useState<string | null>(null);
   const [manualInputs, setManualInputs] = useState<{
     price?: string;
@@ -286,6 +358,18 @@ export function CoreTerminal() {
     return20d?: string; // 百分比
     breadth?: string;
   }>({});
+  const marketStatus = marketSnapshot.data;
+
+  useEffect(() => {
+    const cachedSnapshot = loadStoredSnapshot();
+    if (cachedSnapshot) {
+      setMarketSnapshot({
+        data: cachedSnapshot.data,
+        source: 'cache',
+        savedAt: cachedSnapshot.savedAt,
+      });
+    }
+  }, []);
 
   const fetchSectorData = useCallback(async () => {
     setSectorLoading(true);
@@ -389,44 +473,62 @@ export function CoreTerminal() {
     return Number.isNaN(parsed) ? undefined : parsed;
   };
 
-  const baseSpy = marketStatus?.spy || marketRegime.spy;
-  const priceVal = numberFromManual(manualInputs.price) ?? baseSpy.price;
-  const sma20Val = numberFromManual(manualInputs.sma20) ?? baseSpy.sma20;
-  const sma50Val = numberFromManual(manualInputs.sma50) ?? baseSpy.sma50;
+  const baseSpy = marketStatus?.spy;
+  const priceVal = numberFromManual(manualInputs.price) ?? baseSpy?.price;
+  const sma20Val = numberFromManual(manualInputs.sma20) ?? baseSpy?.sma20;
+  const sma50Val = numberFromManual(manualInputs.sma50) ?? baseSpy?.sma50;
   const return20Val = numberFromManual(manualInputs.return20d) !== undefined
     ? Number(manualInputs.return20d) / 100
-    : baseSpy.return20d;
+    : baseSpy?.return20d;
   const dist50Val = percentDiff(priceVal, sma50Val);
+  const canComputeRegime = isFiniteNumber(priceVal) && isFiniteNumber(sma50Val);
 
   const effectiveSpy = {
     price: priceVal,
     sma20: sma20Val,
     sma50: sma50Val,
     return20d: return20Val,
-    sma20Slope: baseSpy.sma20Slope,
+    sma20Slope: baseSpy?.sma20Slope,
     distToSma50: dist50Val,
   };
 
-  const effectiveBreadth = numberFromManual(manualInputs.breadth) ?? marketStatus?.breadth ?? marketRegime.breadth;
+  const effectiveBreadth = numberFromManual(manualInputs.breadth) ?? marketStatus?.breadth;
 
-  const computedStatus = computeRegime({
-    price: effectiveSpy.price,
-    sma50: effectiveSpy.sma50,
-    return20d: effectiveSpy.return20d,
-    sma20Slope: effectiveSpy.sma20Slope,
-    breadth: effectiveBreadth,
-    dist50: effectiveSpy.distToSma50 ?? percentDiff(effectiveSpy.price, effectiveSpy.sma50),
-  });
+  const computedStatus: MarketRegimeStatus = canComputeRegime
+    ? computeRegime({
+        price: effectiveSpy.price,
+        sma50: effectiveSpy.sma50,
+        return20d: effectiveSpy.return20d,
+        sma20Slope: effectiveSpy.sma20Slope,
+        breadth: effectiveBreadth,
+        dist50: effectiveSpy.distToSma50 ?? percentDiff(effectiveSpy.price, effectiveSpy.sma50),
+      })
+    : 'UNKNOWN';
 
   const displayRegime = {
-    status: computedStatus,
+    status: canComputeRegime ? computedStatus : (marketStatus?.status ?? 'UNKNOWN'),
     spy: effectiveSpy,
-    vix: marketStatus?.vix !== undefined ? marketStatus.vix : marketRegime.vix,
+    vix: marketStatus?.vix ?? null,
     breadth: effectiveBreadth,
   };
 
   const dist20 = percentDiff(effectiveSpy.price, effectiveSpy.sma20);
   const dist50 = effectiveSpy.distToSma50 ?? percentDiff(effectiveSpy.price, effectiveSpy.sma50);
+  const hasMarketData = hasUsableSpyData(marketStatus?.spy);
+  const regimeBadge =
+    displayRegime.status === 'A' || displayRegime.status === 'B' || displayRegime.status === 'C'
+      ? displayRegime.status
+      : '--';
+  const marketSnapshotLabel =
+    hasMarketData
+      ? marketSnapshot.source === 'live'
+        ? '实时更新'
+        : marketSnapshot.source === 'cache'
+          ? '缓存快照'
+          : '暂无数据'
+      : canComputeRegime
+        ? '手动输入'
+        : '暂无数据';
 
   const sectorDelta = selectedSectorETF?.delta?.delta5d ?? selectedSectorETF?.delta?.delta3d ?? null;
   const sectorTrendLevel = getTrendLevel(sectorDelta, selectedSectorETF?.score);
@@ -439,34 +541,100 @@ export function CoreTerminal() {
     ? `${sectorName} · ${sectorName.replace('板块', '')} Sector`
     : '暂无板块数据';
 
-  const handleRefresh = async () => {
-    setIsRefreshing(true);
+  const fetchMarketRegime = useCallback(async (refresh = false, showSpinner = false) => {
+    if (showSpinner) {
+      setIsRefreshing(true);
+    }
     setMarketStatusError(null);
-    fetchSectorData();
+    if (refresh) {
+      fetchSectorData();
+    }
     try {
-      const response = await api.getMarketRegime();
-      const spy = (response.spy || {}) as any;
-      const indicators = (response.indicators || {}) as any;
-      setMarketStatus({
-        status: response.status,
-        spy: {
-          price: spy.price,
-          sma20: spy.sma20,
-          sma50: spy.sma50,
-          distToSma50: spy.dist_to_sma50 ?? indicators.dist_to_sma50 ?? percentDiff(spy.price, spy.sma50),
-          return20d: spy.return_20d ?? indicators.return_20d,
-          sma20Slope: spy.sma20_slope ?? indicators.sma20_slope,
-        },
-        vix: response.vix ?? null,
-        breadth: (response as any).breadth,
-      });
+      const response = await api.getMarketRegime(refresh);
+      const spy = response?.spy ?? null;
+      const indicators = (response?.indicators || {}) as any;
+      const nextSnapshot: MarketStatus = {
+        status: normalizeStatus(response?.status),
+        spy: spy
+          ? {
+              price: spy.price,
+              sma20: spy.sma20,
+              sma50: spy.sma50,
+              distToSma20: spy.dist_to_sma20 ?? indicators.dist_to_sma20 ?? percentDiff(spy.price, spy.sma20),
+              distToSma50: spy.dist_to_sma50 ?? indicators.dist_to_sma50 ?? percentDiff(spy.price, spy.sma50),
+              return20d: spy.return_20d ?? indicators.return_20d,
+              sma20Slope: spy.sma20_slope ?? indicators.sma20_slope,
+            }
+          : undefined,
+        vix: response?.vix ?? null,
+        breadth: (response as any)?.breadth,
+      };
+
+      if (hasUsableSpyData(nextSnapshot.spy)) {
+        const savedAt = new Date().toISOString();
+        setMarketSnapshot({
+          data: nextSnapshot,
+          source: 'live',
+          savedAt,
+        });
+        saveStoredSnapshot(nextSnapshot, savedAt);
+      } else {
+        const statusText = normalizeStatus(response?.status);
+        const cachedSnapshot = loadStoredSnapshot();
+        const fallbackMessage = response?.error
+          ?? (statusText === 'DISCONNECTED'
+            ? cachedSnapshot
+              ? 'IBKR 未连接，已显示缓存快照'
+              : 'IBKR 未连接，暂无可用快照'
+            : statusText === 'NO_DATA'
+              ? '今日暂无快照'
+              : 'Regime 数据不可用');
+        setMarketStatusError(fallbackMessage);
+        setMarketSnapshot((prev) => {
+          if (prev.data && hasUsableSpyData(prev.data.spy)) {
+            return prev;
+          }
+          if (cachedSnapshot) {
+            return {
+              data: cachedSnapshot.data,
+              source: 'cache',
+              savedAt: cachedSnapshot.savedAt,
+            };
+          }
+          return {
+            data: nextSnapshot,
+            source: 'live',
+            savedAt: prev.savedAt ?? null,
+          };
+        });
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : '刷新失败';
-      setMarketStatusError(message);
+      const cachedSnapshot = loadStoredSnapshot();
+      setMarketStatusError(cachedSnapshot ? `${message}，已显示缓存快照` : message);
+      setMarketSnapshot((prev) => {
+        if (prev.data && hasUsableSpyData(prev.data.spy)) {
+          return prev;
+        }
+        if (cachedSnapshot) {
+          return {
+            data: cachedSnapshot.data,
+            source: 'cache',
+            savedAt: cachedSnapshot.savedAt,
+          };
+        }
+        return prev;
+      });
     } finally {
-      setIsRefreshing(false);
+      if (showSpinner) {
+        setIsRefreshing(false);
+      }
     }
-  };
+  }, [fetchSectorData]);
+
+  useEffect(() => {
+    fetchMarketRegime(false, false);
+  }, [fetchMarketRegime]);
 
   return (
     <div>
@@ -478,7 +646,7 @@ export function CoreTerminal() {
           <span className="text-sm text-slate-500">实时市场状态监控</span>
         </div>
         <button
-          onClick={handleRefresh}
+          onClick={() => fetchMarketRegime(true, true)}
           className="px-4 py-2 text-sm font-medium rounded-sm bg-blue-600 text-white hover:bg-blue-700 transition-colors flex items-center gap-2"
         >
           <RefreshIcon className={isRefreshing ? 'animate-spin' : ''} />
@@ -497,11 +665,11 @@ export function CoreTerminal() {
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-4">
             <div className="w-16 h-16 bg-white/30 rounded-xl flex items-center justify-center backdrop-blur-sm">
-              <span className="text-3xl font-bold">{displayRegime.status}</span>
+              <span className="text-3xl font-bold">{regimeBadge}</span>
             </div>
             <div>
               <h2 className="text-2xl font-bold mb-1">{getRegimeText(displayRegime.status)}</h2>
-              <p className="text-white/90 text-sm">市场环境评估 · {marketStatus ? '实时更新' : '今日更新'}</p>
+              <p className="text-white/90 text-sm">市场环境评估 · {marketSnapshotLabel}</p>
             </div>
           </div>
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 lg:gap-6">

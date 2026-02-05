@@ -359,7 +359,7 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
     def _get_price_data_impl(self, symbol: str, duration: str = '1 Y') -> Optional[pd.DataFrame]:
         if not self.is_connected():
             logger.warning(
-                "ibkr_hist_close",
+                f"IBKR - {symbol}: ✗ 获取收盘价失败 (未连接)",
                 broker="ibkr",
                 op="hist_close",
                 symbol=symbol,
@@ -393,6 +393,15 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
                 )
 
                 if not bars:
+                    logger.warning(
+                        f"IBKR - {symbol}: ✗ 获取收盘价失败 (无数据)",
+                        broker="ibkr",
+                        op="hist_close",
+                        symbol=symbol,
+                        duration=duration,
+                        status="empty",
+                        bars=0,
+                    )
                     details["status"] = "empty"
                     details["bars"] = 0
                     return None
@@ -403,8 +412,29 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
                 details["bars"] = len(df)
                 details["start"] = _format_date(df['date'].iloc[0])
                 details["end"] = _format_date(df['date'].iloc[-1])
+                
+                # 优化日志输出: 显示获取的数据范围
+                logger.info(
+                    f"IBKR - {symbol}: ✓ 获取收盘价 ({len(df)} 天, {details['start']} → {details['end']})",
+                    broker="ibkr",
+                    op="hist_close",
+                    symbol=symbol,
+                    duration=duration,
+                    bars=len(df),
+                    start=details['start'],
+                    end=details['end'],
+                )
                 return df
-        except Exception:
+        except Exception as e:
+            logger.error(
+                f"IBKR - {symbol}: ✗ 获取收盘价异常 ({str(e)})",
+                broker="ibkr",
+                op="hist_close",
+                symbol=symbol,
+                duration=duration,
+                status="error",
+                error=str(e),
+            )
             return None
     
     def get_ohlcv_data(self, symbol: str, duration: str = '1 Y') -> Optional[pd.DataFrame]:
@@ -423,7 +453,7 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
     def _get_ohlcv_data_impl(self, symbol: str, duration: str = '1 Y') -> Optional[pd.DataFrame]:
         if not self.is_connected():
             logger.warning(
-                "ibkr_hist_ohlcv",
+                f"IBKR - {symbol}: ✗ 获取 OHLCV 失败 (未连接)",
                 broker="ibkr",
                 op="hist_ohlcv",
                 symbol=symbol,
@@ -457,6 +487,15 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
                 )
 
                 if not bars:
+                    logger.warning(
+                        f"IBKR - {symbol}: ✗ 获取 OHLCV 失败 (无数据)",
+                        broker="ibkr",
+                        op="hist_ohlcv",
+                        symbol=symbol,
+                        duration=duration,
+                        status="empty",
+                        bars=0,
+                    )
                     details["status"] = "empty"
                     details["bars"] = 0
                     return None
@@ -466,8 +505,29 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
                 details["bars"] = len(df)
                 details["start"] = _format_date(df['date'].iloc[0])
                 details["end"] = _format_date(df['date'].iloc[-1])
+                
+                # 优化日志输出: 显示获取的数据范围和数据类型
+                logger.info(
+                    f"IBKR - {symbol}: ✓ 获取 OHLCV 数据 ({len(df)} 天, {details['start']} → {details['end']})",
+                    broker="ibkr",
+                    op="hist_ohlcv",
+                    symbol=symbol,
+                    duration=duration,
+                    bars=len(df),
+                    start=details['start'],
+                    end=details['end'],
+                )
                 return df
-        except Exception:
+        except Exception as e:
+            logger.error(
+                f"IBKR - {symbol}: ✗ 获取 OHLCV 异常 ({str(e)})",
+                broker="ibkr",
+                op="hist_ohlcv",
+                symbol=symbol,
+                duration=duration,
+                status="error",
+                error=str(e),
+            )
             return None
     
     def get_current_price(self, symbol: str) -> Optional[float]:
@@ -526,13 +586,20 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
         df = self.get_ohlcv_data(symbol, '1 Y')
         
         if df is None or df.empty:
+            logger.warning(
+                f"IBKR - {symbol}: ✗ 无法计算52周高低点 (无数据)",
+                broker="ibkr",
+                op="52w_high_low",
+                symbol=symbol,
+                status="empty",
+            )
             return None
         
         high_52w = df['high'].max()
         low_52w = df['low'].min()
         current = df['close'].iloc[-1]
         
-        return {
+        result = {
             'symbol': symbol,
             'high_52w': high_52w,
             'low_52w': low_52w,
@@ -540,6 +607,24 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
             'pct_from_high': (current - high_52w) / high_52w * 100,
             'pct_from_low': (current - low_52w) / low_52w * 100,
         }
+        
+        # 优化日志输出: 显示52周高低点信息
+        logger.info(
+            f"IBKR - {symbol}: ✓ 52周高低点计算完成\n"
+            f" - 当前价格: ${current:.2f}\n"
+            f" - 52周最高: ${high_52w:.2f} (距离: {result['pct_from_high']:+.1f}%)\n"
+            f" - 52周最低: ${low_52w:.2f} (距离: {result['pct_from_low']:+.1f}%)",
+            broker="ibkr",
+            op="52w_high_low",
+            symbol=symbol,
+            current=current,
+            high_52w=high_52w,
+            low_52w=low_52w,
+            pct_from_high=result['pct_from_high'],
+            pct_from_low=result['pct_from_low'],
+        )
+        
+        return result
     
     # ==================== 相对动量计算 ====================
     
@@ -625,7 +710,7 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
             }
         """
         logger.info(
-            "calc_relmom",
+            f"IBKR - {sector_symbol}: 开始计算相对动量 (vs {benchmark})",
             broker="ibkr",
             op="relmom",
             symbol=sector_symbol,
@@ -640,7 +725,7 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
         if sector_df is None:
             elapsed_ms = (perf_counter() - start_ts) * 1000
             logger.warning(
-                "calc_relmom",
+                f"IBKR - {sector_symbol}: ✗ 相对动量计算失败 (标的数据为空)",
                 broker="ibkr",
                 op="relmom",
                 symbol=sector_symbol,
@@ -657,7 +742,7 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
         if spy_df is None:
             elapsed_ms = (perf_counter() - start_ts) * 1000
             logger.warning(
-                "calc_relmom",
+                f"IBKR - {sector_symbol}: ✗ 相对动量计算失败 (基准数据为空)",
                 broker="ibkr",
                 op="relmom",
                 symbol=sector_symbol,
@@ -704,22 +789,32 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
                 result['description'] = '强势，显著跑赢大盘'
             elif rel_mom > 0.02:
                 result['strength'] = 'MODERATE_STRONG'
-                result['description'] = '较强，略微跑赢大盘'
+                result['description'] = '较强,略微跑赢大盘'
             elif rel_mom > -0.02:
                 result['strength'] = 'NEUTRAL'
-                result['description'] = '中性，与大盘同步'
+                result['description'] = '中性,与大盘同步'
             elif rel_mom > -0.05:
                 result['strength'] = 'MODERATE_WEAK'
-                result['description'] = '较弱，略微跑输大盘'
+                result['description'] = '较弱,略微跑输大盘'
             else:
                 result['strength'] = 'WEAK'
-                result['description'] = '弱势，显著跑输大盘'
+                result['description'] = '弱势,显著跑输大盘'
 
         elapsed_ms = (perf_counter() - start_ts) * 1000
         relmom = result.get("RelMom")
         relmom_str = f"{relmom:.4f}" if relmom is not None else "N/A"
+        rs = result.get("RS")
+        rs_str = f"{rs:.4f}" if rs is not None else "N/A"
+        
+        # 优化日志输出: 显示完整的相对动量计算结果
         logger.info(
-            "calc_relmom",
+            f"IBKR - {sector_symbol}: ✓ 相对动量计算完成\n"
+            f" - 相对强度 RS: {rs_str}\n"
+            f" - RS 变化: 5D={result.get('RS_5D', 'N/A'):+.2%}, "
+            f"20D={result.get('RS_20D', 'N/A'):+.2%}, "
+            f"63D={result.get('RS_63D', 'N/A'):+.2%}\n"
+            f" - 相对动量 RelMom: {relmom_str} [{result.get('strength', 'N/A')}]\n"
+            f" - 计算耗时: {elapsed_ms:.0f}ms",
             broker="ibkr",
             op="relmom",
             symbol=sector_symbol,
@@ -752,60 +847,66 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
         total = len(symbols)
         success = 0
         start_ts = time.time()
+        
+        logger.info(
+            f"IBKR - 开始批量计算相对动量 (共 {total} 个标的)",
+            broker="ibkr",
+            op="batch_relmom",
+            total=total,
+            benchmark=benchmark,
+        )
 
         for idx, symbol in enumerate(symbols, start=1):
+            logger.info(
+                f"IBKR - [{idx}/{total}] {symbol}: 计算中...",
+                broker="ibkr",
+                op="batch_relmom",
+                symbol=symbol,
+                progress=f"{idx}/{total}",
+            )
+            
             result = self.analyze_sector_vs_spy(symbol, benchmark)
             if result:
                 results.append(result)
                 success += 1
-
-                # 获取计算结果
-                relmom = result.get("RelMom")
-                rs = result.get("RS")
-                rs_5d = result.get("RS_5D")
-                rs_20d = result.get("RS_20D")
-                rs_63d = result.get("RS_63D")
-                high_52w = result.get("high_52w")
-                low_52w = result.get("low_52w")
-                current_price = result.get("sector_price")
-
-                # 格式化输出值
-                relmom_str = f"{relmom:.4f}" if relmom is not None else "N/A"
-                rs_str = f"{rs:.4f}" if rs is not None else "N/A"
-                rs_5d_str = f"{rs_5d:+.2%}" if rs_5d is not None else "N/A"
-                rs_20d_str = f"{rs_20d:+.2%}" if rs_20d is not None else "N/A"
-                rs_63d_str = f"{rs_63d:+.2%}" if rs_63d is not None else "N/A"
-
-                # 52周高低点格式化
-                if high_52w and low_52w and current_price:
-                    week52_str = f"高${high_52w:.2f} 低${low_52w:.2f} 当前${current_price:.2f}"
-                else:
-                    week52_str = "N/A"
-
-                # IBKR 深度优化格式打印（多行易读）
-                ibkr_block = "\n".join([
-                    f"IBKR- [{idx}/{total}] {symbol}",
-                    " - 历史价格(OHLCV): ✓ 获取成功",
-                    f" - 52周高低点: {week52_str}",
-                    f" - 相对强度 RS: {rs_str} (5D:{rs_5d_str}, 20D:{rs_20d_str}, 63D:{rs_63d_str})",
-                    f" - 相对动量 RelMom: {relmom_str} [{result.get('strength', 'N/A')}]",
-                    " - SMA 均线计算: ✓ 完成",
-                    "---",
-                ])
-                logger.info(ibkr_block)
             else:
-                logger.warning(f"IBKR - [{idx}/{total}] {symbol}: ✗ 数据获取失败")
+                logger.warning(
+                    f"IBKR - [{idx}/{total}] {symbol}: ✗ 计算失败",
+                    broker="ibkr",
+                    op="batch_relmom",
+                    symbol=symbol,
+                    status="failed",
+                )
+            
             time.sleep(0.5)  # 避免请求过快
 
+        elapsed = (time.time() - start_ts) / 60.0
+        
         if not results:
-            elapsed = (time.time() - start_ts) / 60.0
-            logger.info(f"IBKR - 批量计算完成: {success}/{total} 成功, 耗时 {elapsed:.1f}分钟")
+            logger.warning(
+                f"IBKR - 批量计算完成: {success}/{total} 成功, 耗时 {elapsed:.1f}分钟 (全部失败)",
+                broker="ibkr",
+                op="batch_relmom",
+                success=success,
+                total=total,
+                elapsed_min=elapsed,
+                status="all_failed",
+            )
             return pd.DataFrame()
 
         df = pd.DataFrame(results)
         df = df.sort_values('RelMom', ascending=False)
-        elapsed = (time.time() - start_ts) / 60.0
-        logger.info(f"IBKR - 批量计算完成: {success}/{total} 成功, 耗时 {elapsed:.1f}分钟")
+        
+        logger.info(
+            f"IBKR - 批量计算完成: {success}/{total} 成功, 耗时 {elapsed:.1f}分钟",
+            broker="ibkr",
+            op="batch_relmom",
+            success=success,
+            total=total,
+            elapsed_min=elapsed,
+            status="completed",
+        )
+        
         return df
     
     # ==================== VIX 数据 ====================
@@ -822,7 +923,7 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
     def _get_vix_impl(self) -> Optional[float]:
         if not self.is_connected():
             logger.warning(
-                "ibkr_vix",
+                "IBKR - VIX: ✗ 获取失败 (未连接)",
                 broker="ibkr",
                 op="vix",
                 status="fail",
@@ -856,7 +957,7 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
                 if not bars:
                     details["status"] = "empty"
                     logger.warning(
-                        "ibkr_vix",
+                        "IBKR - VIX: ✗ 获取失败 (无历史数据)",
                         broker="ibkr",
                         op="vix",
                         status="no_data",
@@ -870,7 +971,7 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
                 if vix_value is None or vix_value <= 0:
                     details["status"] = "empty"
                     logger.warning(
-                        "ibkr_vix",
+                        f"IBKR - VIX: ✗ 获取失败 (无效值: {vix_value})",
                         broker="ibkr",
                         op="vix",
                         status="invalid_value",
@@ -880,10 +981,20 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
 
                 details["value"] = float(vix_value)
                 details["date"] = _format_date(bars[-1].date)
+                
+                # 优化日志输出: 显示 VIX 值和日期
+                logger.info(
+                    f"IBKR - VIX: ✓ 获取成功 (值: {vix_value:.2f}, 日期: {details['date']})",
+                    broker="ibkr",
+                    op="vix",
+                    value=float(vix_value),
+                    date=details['date'],
+                )
+                
                 return float(vix_value)
         except Exception as e:
             logger.error(
-                "ibkr_vix",
+                f"IBKR - VIX: ✗ 获取异常 ({str(e)})",
                 broker="ibkr",
                 op="vix",
                 status="error",
@@ -916,6 +1027,12 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
             
         df = self.get_ohlcv_data('SPY', '1 Y')
         if df is None:
+            logger.warning(
+                "IBKR - SPY: ✗ 无法计算 SMA (无数据)",
+                broker="ibkr",
+                op="spy_sma",
+                status="empty",
+            )
             return None
         
         result = {
@@ -946,6 +1063,29 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
             result['return_20d'] = (df['close'].iloc[-1] - df['close'].iloc[-21]) / df['close'].iloc[-21]
         else:
             result['return_20d'] = None
+        
+        # 优化日志输出: 显示 SPY 价格和 SMA 信息
+        sma_status = []
+        for period in sma_periods:
+            sma_val = result.get(f'sma{period}')
+            above = result.get(f'price_above_sma{period}')
+            if sma_val and above is not None:
+                indicator = "✓" if above else "✗"
+                sma_status.append(f"SMA{period}:{indicator}(${sma_val:.2f})")
+        
+        logger.info(
+            f"IBKR - SPY: ✓ 价格和均线计算完成\n"
+            f" - 当前价格: ${result['price']:.2f}\n"
+            f" - 均线状态: {' '.join(sma_status)}\n"
+            f" - 20日收益率: {result.get('return_20d', 0):+.2%}",
+            broker="ibkr",
+            op="spy_sma",
+            price=result['price'],
+            sma20=result.get('sma20'),
+            sma50=result.get('sma50'),
+            sma200=result.get('sma200'),
+            return_20d=result.get('return_20d'),
+        )
         
         return result
 
