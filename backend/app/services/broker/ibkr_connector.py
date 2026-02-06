@@ -404,6 +404,11 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
                     )
                     details["status"] = "empty"
                     details["bars"] = 0
+                    details["summary"] = "\n".join([
+                        f"IBKR - {symbol}: ✗ 获取收盘价失败",
+                        " - 原因: 无历史数据",
+                        "---",
+                    ])
                     return None
 
                 df = _util.df(bars)
@@ -412,10 +417,20 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
                 details["bars"] = len(df)
                 details["start"] = _format_date(df['date'].iloc[0])
                 details["end"] = _format_date(df['date'].iloc[-1])
+                latest_close = float(df[symbol].iloc[-1])
+                details["latest_close"] = latest_close
+                details["latest_date"] = details["end"]
+                details["summary"] = "\n".join([
+                    f"IBKR - {symbol}: ✓ 获取收盘价",
+                    f" - 最新收盘价: {latest_close:.2f} ({details['end']})",
+                    f" - 数据范围: {len(df)} 天, {details['start']} → {details['end']}",
+                    "---",
+                ])
                 
                 # 优化日志输出: 显示获取的数据范围
                 logger.info(
-                    f"IBKR - {symbol}: ✓ 获取收盘价 ({len(df)} 天, {details['start']} → {details['end']})",
+                    f"IBKR - {symbol}: ✓ 获取收盘价 (最新: {latest_close:.2f} @ {details['end']}, "
+                    f"{len(df)} 天, {details['start']} → {details['end']})",
                     broker="ibkr",
                     op="hist_close",
                     symbol=symbol,
@@ -423,6 +438,8 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
                     bars=len(df),
                     start=details['start'],
                     end=details['end'],
+                    latest_close=latest_close,
+                    latest_date=details['end'],
                 )
                 return df
         except Exception as e:
@@ -498,6 +515,11 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
                     )
                     details["status"] = "empty"
                     details["bars"] = 0
+                    details["summary"] = "\n".join([
+                        f"IBKR - {symbol}: ✗ 获取 OHLCV 失败",
+                        " - 原因: 无历史数据",
+                        "---",
+                    ])
                     return None
 
                 df = _util.df(bars)
@@ -505,10 +527,25 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
                 details["bars"] = len(df)
                 details["start"] = _format_date(df['date'].iloc[0])
                 details["end"] = _format_date(df['date'].iloc[-1])
+                latest_row = df.iloc[-1]
+                latest_close = float(latest_row["close"])
+                latest_volume = int(latest_row["volume"]) if pd.notna(latest_row["volume"]) else None
+                details["latest_close"] = latest_close
+                details["latest_volume"] = latest_volume
+                details["latest_date"] = details["end"]
+                volume_str = f"{latest_volume}" if latest_volume is not None else "N/A"
+                details["summary"] = "\n".join([
+                    f"IBKR - {symbol}: ✓ 获取 OHLCV",
+                    f" - 最新收盘价: {latest_close:.2f} ({details['end']})",
+                    f" - 最新成交量: {volume_str}",
+                    f" - 数据范围: {len(df)} 天, {details['start']} → {details['end']}",
+                    "---",
+                ])
                 
                 # 优化日志输出: 显示获取的数据范围和数据类型
                 logger.info(
-                    f"IBKR - {symbol}: ✓ 获取 OHLCV 数据 ({len(df)} 天, {details['start']} → {details['end']})",
+                    f"IBKR - {symbol}: ✓ 获取 OHLCV 数据 (最新收盘: {latest_close:.2f} @ {details['end']}, "
+                    f"{len(df)} 天, {details['start']} → {details['end']})",
                     broker="ibkr",
                     op="hist_ohlcv",
                     symbol=symbol,
@@ -516,6 +553,8 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
                     bars=len(df),
                     start=details['start'],
                     end=details['end'],
+                    latest_close=latest_close,
+                    latest_date=details['end'],
                 )
                 return df
         except Exception as e:
@@ -963,6 +1002,11 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
                         status="no_data",
                         reason="no_historical_bars",
                     )
+                    details["summary"] = "\n".join([
+                        "IBKR - VIX: ✗ 获取失败",
+                        " - 原因: 无历史数据",
+                        "---",
+                    ])
                     return None
 
                 # Get the most recent close price
@@ -977,10 +1021,21 @@ class IBKRConnectorReal(BrokerConnector, PriceDataMixin):
                         status="invalid_value",
                         value=vix_value,
                     )
+                    details["summary"] = "\n".join([
+                        "IBKR - VIX: ✗ 获取失败",
+                        f" - 原因: 无效值 {vix_value}",
+                        "---",
+                    ])
                     return None
 
                 details["value"] = float(vix_value)
                 details["date"] = _format_date(bars[-1].date)
+                details["summary"] = "\n".join([
+                    "IBKR - VIX: ✓ 获取成功",
+                    f" - 值: {float(vix_value):.2f}",
+                    f" - 日期: {details['date']}",
+                    "---",
+                ])
                 
                 # 优化日志输出: 显示 VIX 值和日期
                 logger.info(

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
-from typing import List
+from typing import Any, List
 
 import structlog
 
@@ -59,7 +60,32 @@ def _get_pre_chain() -> List[structlog.types.Processor]:
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
         structlog.processors.UnicodeDecoder(),
+        _decode_unicode_escapes,
     ]
+
+
+_UNICODE_ESCAPE_RE = re.compile(r"(\\u[0-9a-fA-F]{4}|\\U[0-9a-fA-F]{8}|\\x[0-9a-fA-F]{2})")
+
+
+def _decode_unicode_escapes(_logger, _name, event_dict: dict) -> dict:
+    def _decode(value: Any) -> Any:
+        if isinstance(value, str):
+            if not _UNICODE_ESCAPE_RE.search(value):
+                return value
+            try:
+                decoded = value.encode("utf-8").decode("unicode_escape")
+            except Exception:
+                return value
+            return decoded
+        if isinstance(value, dict):
+            return {k: _decode(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_decode(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(_decode(v) for v in value)
+        return value
+
+    return _decode(event_dict)
 
 
 def configure_logging() -> None:
@@ -112,6 +138,7 @@ def configure_logging() -> None:
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
             structlog.processors.UnicodeDecoder(),
+            _decode_unicode_escapes,
             structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
         ],
         context_class=dict,

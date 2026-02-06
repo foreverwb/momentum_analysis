@@ -78,7 +78,7 @@ const EditIcon = ({ className = '' }: { className?: string }) => (
   </svg>
 );
 
-// ============ 可编辑数字组件 ============
+// ============ 可编辑数字组件 - FIXED VERSION ============
 interface EditableNumberProps {
   value: number | undefined;
   onChange: (value: string) => void;
@@ -114,7 +114,7 @@ function EditableNumber({ value, onChange, suffix = '%', className = '' }: Edita
   return (
     <div className={`group relative inline-flex items-center justify-center ${className}`}>
       {isEditing ? (
-        // Square input during editing - 正方形输入框
+        // Input with fixed dimensions to prevent layout shift
         <input
           type="text"
           value={localValue}
@@ -124,11 +124,11 @@ function EditableNumber({ value, onChange, suffix = '%', className = '' }: Edita
           onKeyDown={handleKeyDown}
           autoFocus
           className="
-            w-20 h-20 text-2xl font-bold text-center 
+            w-20 h-10 text-2xl font-bold text-center 
             bg-white/10 border-2 border-white/50 rounded-md
             outline-none cursor-text
             focus:border-white/70 focus:bg-white/15
-            transition-all duration-200
+            transition-colors duration-200
           "
           style={{
             appearance: 'none',
@@ -137,14 +137,15 @@ function EditableNumber({ value, onChange, suffix = '%', className = '' }: Edita
           }}
         />
       ) : (
-        // Display value with hover effect - 显示状态
+        // Display with same fixed dimensions - prevents shift on focus
         <div 
           onClick={handleFocus}
           className="
-            text-2xl font-bold cursor-pointer
-            hover:bg-white/10 hover:border-2 hover:border-white/30
-            rounded-md px-3 py-2 transition-all duration-200
-            relative min-w-[5rem]
+            w-20 h-10 text-2xl font-bold cursor-pointer
+            flex items-center justify-center
+            hover:bg-white/10 border-2 border-transparent hover:border-white/30
+            rounded-md transition-colors duration-200
+            relative
           "
         >
           {displayValue}
@@ -640,17 +641,12 @@ export function CoreTerminal() {
     <div>
       {/* 页面标题和刷新按钮 */}
       <div className="flex items-center justify-between mb-6">
-        <div className="flex items-center gap-3">
-          <span className="text-xl">🚀</span>
-          <h1 className="text-xl font-semibold text-slate-900">核心终端</h1>
-          <span className="text-sm text-slate-500">实时市场状态监控</span>
-        </div>
         <button
           onClick={() => fetchMarketRegime(true, true)}
           className="px-4 py-2 text-sm font-medium rounded-sm bg-blue-600 text-white hover:bg-blue-700 transition-colors flex items-center gap-2"
         >
-          <RefreshIcon className={isRefreshing ? 'animate-spin' : ''} />
-          Refresh Index
+          {isRefreshing ? <RefreshIcon className="animate" /> : ''}
+          Refresh
         </button>
       </div>
       {/* 显示错误信息 */}
@@ -660,7 +656,7 @@ export function CoreTerminal() {
         </div>
       )}
 
-      {/* Regime Gate 状态卡 - 渐变背景大卡片 */}
+      {/* Regime Gate 状态卡 - 渐变背景大卡片 - FIXED GRID */}
       <div className={`mb-6 p-6 rounded-2xl bg-gradient-to-r ${getRegimeColor(displayRegime.status)} shadow-xl text-white`}>
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-4">
@@ -672,7 +668,8 @@ export function CoreTerminal() {
               <p className="text-white/90 text-sm">市场环境评估 · {marketSnapshotLabel}</p>
             </div>
           </div>
-          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 lg:gap-6">
+          {/* FIXED: Better horizontal alignment with consistent spacing */}
+          <div className="grid grid-cols-6 gap-6 items-center">
             <div className="text-center">
               <div className="text-sm text-white/80 mb-1">$SPY</div>
               <div className="text-2xl font-bold">${displayRegime.spy?.price !== undefined ? displayRegime.spy.price.toFixed(2) : 'N/A'}</div>

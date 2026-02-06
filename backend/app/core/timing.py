@@ -19,9 +19,19 @@ def timed(log, event: str, **fields: object) -> Iterator[Dict[str, object]]:
         yield details
     except Exception:
         elapsed_ms = (perf_counter() - start) * 1000
-        log.exception(event, status="fail", elapsed_ms=elapsed_ms, **details)
+        event_override = details.pop("event_override", None)
+        summary = details.pop("summary", None)
+        event_text = event_override if isinstance(event_override, str) and event_override else event
+        if isinstance(summary, str) and summary:
+            event_text = f"{event_text}\n{summary}"
+        log.exception(event_text, status="fail", elapsed_ms=elapsed_ms, **details)
         raise
     else:
         elapsed_ms = (perf_counter() - start) * 1000
         status = details.pop("status", "ok")
-        log.info(event, status=status, elapsed_ms=elapsed_ms, **details)
+        event_override = details.pop("event_override", None)
+        summary = details.pop("summary", None)
+        event_text = event_override if isinstance(event_override, str) and event_override else event
+        if isinstance(summary, str) and summary:
+            event_text = f"{event_text}\n{summary}"
+        log.info(event_text, status=status, elapsed_ms=elapsed_ms, **details)
