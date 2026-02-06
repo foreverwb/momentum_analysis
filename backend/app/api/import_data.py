@@ -218,6 +218,14 @@ def validate_and_filter_holdings(holdings: List[Dict[str, Any]]) -> tuple:
     验证并过滤持仓数据
     返回: (有效持仓列表, 跳过的记录详情)
     """
+    def normalize_weight(value: Any) -> Any:
+        if isinstance(value, str):
+            cleaned = value.strip().replace(",", "")
+            if cleaned.endswith("%"):
+                cleaned = cleaned[:-1].strip()
+            return cleaned
+        return value
+
     valid_holdings = []
     skipped = []
     
@@ -237,7 +245,7 @@ def validate_and_filter_holdings(holdings: List[Dict[str, Any]]) -> tuple:
         
         # 验证 Weight
         try:
-            weight_float = float(weight)
+            weight_float = float(normalize_weight(weight))
             if weight_float <= 0:
                 skipped.append({
                     "row": str(row),

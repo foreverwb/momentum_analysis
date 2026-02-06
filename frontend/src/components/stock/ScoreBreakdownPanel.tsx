@@ -2,12 +2,14 @@ import React from 'react';
 
 interface ScoreBreakdownPanelProps {
   title: string;
-  icon: string;
+  icon: string | null;
   score: number | string | null | undefined;
   weight: string;  // 如 "40%"
   breakdown: Record<string, number | string | null | undefined>;  // 各项得分
   data: Record<string, unknown>;       // 原始数据
   description?: string;
+  compact?: boolean;
+  className?: string;
 }
 
 export function ScoreBreakdownPanel({
@@ -17,7 +19,9 @@ export function ScoreBreakdownPanel({
   weight,
   breakdown,
   data,
-  description
+  description,
+  compact = false,
+  className = '',
 }: ScoreBreakdownPanelProps) {
   const getScoreColor = (score: number): string => {
     if (score >= 60) return 'var(--accent-green)';
@@ -92,13 +96,17 @@ export function ScoreBreakdownPanel({
   const scoreDisplay = scoreValue === null ? '--' : scoreValue.toFixed(1);
 
   return (
-    <div className="bg-[var(--bg-primary)] border border-[var(--border-light)] rounded-[var(--radius-lg)] p-6 mb-6">
+    <div
+      className={`bg-[var(--bg-primary)] border border-[var(--border-light)] rounded-[var(--radius-lg)] ${
+        compact ? 'p-4' : 'p-6'
+      } ${compact ? '' : 'mb-6'} ${className}`}
+    >
       {/* Header */}
-      <div className="flex items-center justify-between mb-6 pb-4 border-b border-[var(--border-light)]">
+      <div className={`flex items-center justify-between ${compact ? 'mb-4 pb-3' : 'mb-6 pb-4'} border-b border-[var(--border-light)]`}>
         <div className="flex items-center gap-3">
-          <span className="text-2xl">{icon}</span>
+          <span className={compact ? 'text-xl' : 'text-2xl'}>{icon}</span>
           <div>
-            <h3 className="text-lg font-semibold text-[var(--text-primary)]">
+            <h3 className={`${compact ? 'text-base' : 'text-lg'} font-semibold text-[var(--text-primary)]`}>
               {title}
             </h3>
             {description && (
@@ -113,7 +121,7 @@ export function ScoreBreakdownPanel({
             权重: {weight}
           </div>
           <div 
-            className="text-4xl font-bold"
+            className={`${compact ? 'text-3xl' : 'text-4xl'} font-bold`}
             style={{ color: scoreColor }}
           >
             {scoreDisplay}
@@ -123,11 +131,11 @@ export function ScoreBreakdownPanel({
 
       {/* Score Breakdown Table */}
       {Object.keys(breakdown).length > 0 && (
-        <div className="mb-6">
+        <div className={compact ? 'mb-4' : 'mb-6'}>
           <h4 className="text-sm font-semibold text-[var(--text-secondary)] mb-3">
             评分细分
           </h4>
-          <div className="space-y-2">
+          <div className="space-y-1">
             {Object.entries(breakdown).map(([key, itemScore]) => {
               const numericScore = toNumber(itemScore);
               const clampedScore = numericScore === null
@@ -135,30 +143,18 @@ export function ScoreBreakdownPanel({
                 : Math.min(100, Math.max(0, numericScore));
               const scoreClass = numericScore === null ? 'text-[var(--text-muted)]' : getScoreColorClass(clampedScore);
               const displayScore = numericScore === null ? '--' : Math.round(clampedScore).toString();
-              const barColor = numericScore === null ? 'var(--text-muted)' : getScoreColor(clampedScore);
 
               return (
                 <div 
                   key={key}
-                  className="flex items-center justify-between py-2 px-3 bg-[var(--bg-secondary)] rounded-lg"
+                  className={`flex items-center justify-between ${compact ? 'py-1' : 'py-1.5'} px-3 rounded-lg`}
                 >
                   <span className="text-sm text-[var(--text-primary)]">
                     {formatMetricLabel(key)}
                   </span>
-                  <div className="flex items-center gap-3">
-                    <div className="w-24 h-2 bg-[var(--bg-tertiary)] rounded-full overflow-hidden">
-                      <div
-                        className="h-full transition-all duration-300"
-                        style={{
-                          width: `${clampedScore}%`,
-                          backgroundColor: barColor
-                        }}
-                      />
-                    </div>
-                    <span className={`text-sm font-semibold w-12 text-right ${scoreClass}`}>
-                      {displayScore}
-                    </span>
-                  </div>
+                  <span className={`text-sm font-semibold ${scoreClass}`}>
+                    {displayScore}
+                  </span>
                 </div>
               );
             })}
@@ -172,11 +168,11 @@ export function ScoreBreakdownPanel({
           <h4 className="text-sm font-semibold text-[var(--text-secondary)] mb-3">
             原始数据
           </h4>
-          <div className="grid grid-cols-2 gap-3">
+          <div className={`grid ${compact ? 'grid-cols-1' : 'grid-cols-2'} gap-2`}>
             {Object.entries(data).map(([key, value]) => (
               <div 
                 key={key}
-                className="flex items-center justify-between py-2 px-3 border border-[var(--border-light)] rounded-lg"
+                className={`flex items-center justify-between ${compact ? 'py-1' : 'py-1.5'} px-3 rounded-lg`}
               >
                 <span className="text-xs text-[var(--text-muted)]">
                   {formatMetricLabel(key)}

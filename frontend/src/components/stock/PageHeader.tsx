@@ -40,24 +40,10 @@ export function PageHeader({
   if (viewMode === 'detail') {
     return (
       <div className="flex items-center gap-3 mb-6">
-        <button
-          onClick={onBack}
-          className="
-            flex items-center gap-2 px-3 py-2
-            text-sm text-[var(--text-secondary)]
-            hover:text-[var(--text-primary)]
-            hover:bg-[var(--bg-secondary)]
-            rounded-[var(--radius-md)]
-            transition-all
-          "
-        >
-          <span>←</span>
-          <span>返回列表</span>
-        </button>
         <div className="w-px h-6 bg-[var(--border-light)]" />
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2" onClick={onBack}>
           <h1 className="text-xl font-semibold text-[var(--text-primary)]">
-            {selectedStock || '股票详情'}
+            {'←  ' + selectedStock || '股票详情'}
           </h1>
         </div>
       </div>
@@ -68,23 +54,8 @@ export function PageHeader({
   if (viewMode === 'compare') {
     return (
       <div className="flex items-center gap-3 mb-6">
-        <button
-          onClick={onBack}
-          className="
-            flex items-center gap-2 px-3 py-2
-            text-sm text-[var(--text-secondary)]
-            hover:text-[var(--text-primary)]
-            hover:bg-[var(--bg-secondary)]
-            rounded-[var(--radius-md)]
-            transition-all
-          "
-        >
-          <span>←</span>
-          <span>返回列表</span>
-        </button>
         <div className="w-px h-6 bg-[var(--border-light)]" />
-        <div className="flex items-center gap-2">
-          <span className="text-xl">⚖️</span>
+        <div className="flex items-center gap-2" onClick={onBack}>
           <h1 className="text-xl font-semibold text-[var(--text-primary)]">
             股票对比分析
           </h1>

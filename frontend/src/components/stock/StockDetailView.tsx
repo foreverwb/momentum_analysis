@@ -1,10 +1,3 @@
-// ============================================================================
-// 修复文件: frontend/src/components/stock/StockDetailView.tsx
-// 修复内容:
-// 1. 添加期权覆盖Tab（参考momentum-radar-complete.html）
-// 2. 修复数据显示问题
-// ============================================================================
-
 import React, { useState } from 'react';
 import { useStockDetail } from '../../hooks/useData';
 import type { StockDetail } from '../../types';
@@ -92,7 +85,6 @@ export function StockDetailView({ symbol, onBack }: StockDetailViewProps) {
           >
             四维评分详情
           </button>
-          {/* 新增：期权覆盖Tab */}
           <button
             className={`px-6 py-3 text-sm font-medium transition-colors ${
               activeTab === 'options'
@@ -362,12 +354,11 @@ function BreakdownTab({ stock }: { stock: StockDetail }) {
   const { momentum, technical, volume, options } = stock.scoreBreakdown;
 
   return (
-    <div className="space-y-6">
+    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
       {/* Price Momentum */}
       {momentum && (
         <ScoreBreakdownPanel
           title="价格动能"
-          icon="📈"
           score={momentum.score}
           weight="42.25%"
           breakdown={momentum.data.score_breakdown || {}}
@@ -377,6 +368,7 @@ function BreakdownTab({ stock }: { stock: StockDetail }) {
             rs_20d: momentum.data.rs_20d,
           }}
           description="基于短期和中期价格表现的动能评估"
+          compact
         />
       )}
 
@@ -384,7 +376,6 @@ function BreakdownTab({ stock }: { stock: StockDetail }) {
       {technical && (
         <ScoreBreakdownPanel
           title="趋势结构"
-          icon="〰️"
           score={technical.score}
           weight="22.75%"
           breakdown={technical.data.score_breakdown || {}}
@@ -397,6 +388,7 @@ function BreakdownTab({ stock }: { stock: StockDetail }) {
             dist_from_52w_high: technical.data.dist_from_52w_high,
           }}
           description="基于技术指标和均线系统的趋势评估"
+          compact
         />
       )}
 
@@ -404,7 +396,6 @@ function BreakdownTab({ stock }: { stock: StockDetail }) {
       {volume && (
         <ScoreBreakdownPanel
           title="量价确认"
-          icon="📊"
           score={volume.score}
           weight="15%"
           breakdown={{}}
@@ -414,6 +405,7 @@ function BreakdownTab({ stock }: { stock: StockDetail }) {
             volume_ratio: volume.data.volume_ratio,
           }}
           description="基于成交量变化的确认信号"
+          compact
         />
       )}
 
@@ -421,7 +413,6 @@ function BreakdownTab({ stock }: { stock: StockDetail }) {
       {options && (
         <ScoreBreakdownPanel
           title="期权覆盖"
-          icon="🛡️"
           score={options.score}
           weight="20%"
           breakdown={{}}
@@ -434,6 +425,7 @@ function BreakdownTab({ stock }: { stock: StockDetail }) {
             open_interest: options.data.open_interest,
           }}
           description="基于期权市场活动和波动率的风险评估"
+          compact
         />
       )}
     </div>
