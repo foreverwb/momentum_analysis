@@ -3,7 +3,7 @@ import React, { useEffect, useCallback } from 'react';
 interface ModalProps {
   isOpen: boolean;
   onClose: () => void;
-  title: string;
+  title: React.ReactNode;
   subtitle?: string;
   size?: 'default' | 'small';
   children: React.ReactNode;

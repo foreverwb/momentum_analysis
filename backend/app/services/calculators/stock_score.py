@@ -227,6 +227,9 @@ class StockScoreCalculator:
         """
         从 Finviz 数据计算技术评分
         
+        注意: Finviz 的 SMA20/SMA50/SMA200 字段是「价格相对均线偏离」
+        （deviation），不是均线绝对价格。
+        
         Args:
             finviz_data: Finviz 解析后的数据字典
         
@@ -234,49 +237,56 @@ class StockScoreCalculator:
             dict: {'score': float, 'data': dict}
         """
         try:
-            price = finviz_data.get('price', 0)
-            sma20 = finviz_data.get('sma20', 0)
-            sma50 = finviz_data.get('sma50', 0)
-            sma200 = finviz_data.get('sma200', 0)
+            price = finviz_data.get('price')
+            sma20_dev = finviz_data.get('sma20')
+            sma50_dev = finviz_data.get('sma50')
+            sma200_dev = finviz_data.get('sma200')
             rsi = finviz_data.get('rsi', 50)
-            high_52w = finviz_data.get('week52_high', 0)
+            high_52w = finviz_data.get('week52_high')
             
             score = 0
             score_breakdown = {}
             
-            # 1. Price > SMA50
-            if price and sma50 and price > sma50:
+            # 1. Price > SMA50 (deviation > 0)
+            price_above_sma50 = sma50_dev is not None and sma50_dev > 0
+            if price_above_sma50:
                 score += 20
                 score_breakdown['price_above_sma50'] = 20
             else:
                 score_breakdown['price_above_sma50'] = 0
             
-            # 2. Price > SMA200
-            if price and sma200 and price > sma200:
+            # 2. Price > SMA200 (deviation > 0)
+            price_above_sma200 = sma200_dev is not None and sma200_dev > 0
+            if price_above_sma200:
                 score += 20
                 score_breakdown['price_above_sma200'] = 20
             else:
                 score_breakdown['price_above_sma200'] = 0
             
-            # 3. SMA20 > SMA50
-            if sma20 and sma50 and sma20 > sma50:
+            # 3. 短中期偏离关系: SMA20 deviation > SMA50 deviation
+            sma20_above_sma50 = (
+                sma20_dev is not None and
+                sma50_dev is not None and
+                sma20_dev > sma50_dev
+            )
+            if sma20_above_sma50:
                 score += 20
                 score_breakdown['sma20_above_sma50'] = 20
             else:
                 score_breakdown['sma20_above_sma50'] = 0
             
             # 4. RSI 40-70
-            if rsi and 40 <= rsi <= 70:
+            if rsi is not None and 40 <= rsi <= 70:
                 score += 20
                 score_breakdown['rsi_healthy'] = 20
-            elif rsi and 30 <= rsi <= 80:
+            elif rsi is not None and 30 <= rsi <= 80:
                 score += 10
                 score_breakdown['rsi_healthy'] = 10
             else:
                 score_breakdown['rsi_healthy'] = 0
             
             # 5. 距离52周高点
-            if price and high_52w:
+            if price is not None and high_52w is not None and high_52w > 0:
                 dist = (price - high_52w) / high_52w
                 if dist > -0.15:
                     score += 20
@@ -293,12 +303,20 @@ class StockScoreCalculator:
                 'score': score,
                 'data': {
                     'price': price,
-                    'sma20': sma20,
-                    'sma50': sma50,
-                    'sma200': sma200,
+                    # 明确语义：以下字段均为价格相对均线的偏离（deviation）
+                    'sma20_dev': sma20_dev,
+                    'sma50_dev': sma50_dev,
+                    'sma200_dev': sma200_dev,
+                    # 兼容旧字段名，值仍为 deviation
+                    'sma20': sma20_dev,
+                    'sma50': sma50_dev,
+                    'sma200': sma200_dev,
                     'rsi': rsi,
                     'week52_high': high_52w,
-                    'price_above_sma50': price > sma50 if price and sma50 else False,
+                    'price_above_sma50': price_above_sma50,
+                    'price_above_sma200': price_above_sma200,
+                    'sma20_above_sma50': sma20_above_sma50,
+                    'sma_fields_are_deviation': True,
                     'score_breakdown': score_breakdown,
                     'source': 'finviz'
                 }
@@ -560,39 +578,141 @@ class StockScoreCalculator:
             dict: {'score': float, 'data': dict}
         """
         try:
-            if not mc_data:
-                return {'score': 50, 'data': {'source': 'default'}}
-            
-            heat_score = mc_data.get('heat_score', 50)
-            risk_score = mc_data.get('risk_score', 50)
-            heat_type = mc_data.get('heat_type', 'NORMAL')
-            
-            # 基于 HeatScore 和 RiskScore 综合评分
-            if heat_type == 'TREND_HEAT':
-                # 趋势热：热度高+风险适中
-                score = 80 + min(20, (heat_score - 70) * 0.5)
-            elif heat_score > 70:
-                if risk_score < 80:
-                    score = 80 + min(20, (heat_score - 70) * 0.5)
-                else:
-                    # 高热度但高风险（可能有事件）
-                    score = 60
-            elif heat_score > 50:
-                score = 50 + (heat_score - 50)
-            else:
-                score = heat_score
-            
+            from ..parsers.mc_parser import (
+                calculate_positioning_score_from_iv,
+                calculate_term_score,
+                normalize_heat_type,
+                to_legacy_heat_type,
+            )
+
+            payload = mc_data or {}
+
+            def _safe_float(value, default=None):
+                try:
+                    if value is None:
+                        return default
+                    return float(value)
+                except (TypeError, ValueError):
+                    return default
+
+            iv_data = None
+            if self.futu and hasattr(self.futu, "is_connected") and self.futu.is_connected():
+                try:
+                    iv_result = self.futu.fetch_iv_terms([symbol], log_progress=False, log_fetch_summary=False)
+                    iv_data = iv_result.get(symbol)
+                except TypeError:
+                    iv_result = self.futu.fetch_iv_terms([symbol])
+                    iv_data = iv_result.get(symbol)
+                except Exception as exc:
+                    logger.warning(f"获取 {symbol} 期权 IV 数据失败: {exc}")
+
+            heat_score = _safe_float(payload.get('heat_score'), 50.0)
+            risk_score = _safe_float(payload.get('risk_score'), 50.0)
+            confidence_penalty = _safe_float(payload.get('confidence_penalty'), 50.0)
+            base_heat_type = normalize_heat_type(payload.get('heat_type'))
+            put_pct = _safe_float(payload.get('put_pct'))
+
+            iv30 = None
+            iv60 = None
+            iv90 = None
+            if iv_data is not None:
+                iv30 = _safe_float(getattr(iv_data, 'iv30', None) if hasattr(iv_data, 'iv30') else iv_data.get('iv30'))
+                iv60 = _safe_float(getattr(iv_data, 'iv60', None) if hasattr(iv_data, 'iv60') else iv_data.get('iv60'))
+                iv90 = _safe_float(getattr(iv_data, 'iv90', None) if hasattr(iv_data, 'iv90') else iv_data.get('iv90'))
+
+            slope = _safe_float(payload.get('slope'))
+            if slope is None and iv30 is not None and iv90 is not None:
+                slope = iv30 - iv90
+
+            delta_slope = _safe_float(payload.get('delta_slope'))
+            if delta_slope is None:
+                slope_mc = _safe_float(payload.get('slope_mc'))
+                if slope is not None and slope_mc is not None:
+                    delta_slope = slope - slope_mc
+
+            term_score = _safe_float(payload.get('term_score'))
+            if term_score is None and iv30 is not None and iv60 is not None and iv90 is not None:
+                term_score = calculate_term_score(iv30, iv60, iv90, delta_slope=delta_slope)
+            if term_score is None:
+                term_score = 50.0
+
+            positioning_score = _safe_float(payload.get('positioning_score'))
+            positioning_inputs = None
+            if positioning_score is None and iv_data is not None:
+                positioning_score, positioning_inputs = calculate_positioning_score_from_iv(iv_data)
+            if positioning_score is None:
+                positioning_score = 50.0
+
+            iv30_chg = _safe_float(payload.get('iv30_chg_pct'))
+            if iv30_chg is None:
+                iv30_chg = _safe_float(payload.get('iv_change'))
+            earnings_near = bool(payload.get('earnings_near', False))
+            trend_gate_pass = bool(payload.get('trend_gate_pass', positioning_score >= 55))
+            price_not_strong = bool(payload.get('price_not_strong', (not trend_gate_pass) or (slope is None or slope > 0)))
+            risk_score_rising = bool(iv30_chg is not None and iv30_chg > 0)
+
+            event_heat = heat_score >= 70 and (risk_score >= 85 or earnings_near)
+            trend_heat = heat_score >= 70 and risk_score < 80 and trend_gate_pass
+            hedge_heat = bool(
+                put_pct is not None and
+                put_pct >= 60 and
+                risk_score >= 75 and
+                risk_score_rising and
+                price_not_strong
+            )
+
+            overlay_label = base_heat_type if base_heat_type in {'trend', 'event', 'hedge', 'normal'} else 'normal'
+            score_adjustment = 0.0
+            position_suggestion = 'hold'
+            if event_heat:
+                overlay_label = 'event'
+                score_adjustment = -18.0
+                position_suggestion = 'reduce_exposure'
+            elif trend_heat:
+                overlay_label = 'trend'
+                score_adjustment = 10.0
+                position_suggestion = 'trend_confirmed'
+            elif hedge_heat:
+                overlay_label = 'hedge'
+                score_adjustment = -8.0
+                position_suggestion = 'stay_defensive'
+
+            directional_confidence = max(0.0, 100.0 - confidence_penalty)
+            base_score = (
+                0.35 * heat_score +
+                0.25 * term_score +
+                0.30 * positioning_score +
+                0.10 * directional_confidence
+            )
+            risk_penalty = max(0.0, risk_score - 70.0) * 0.45
+            score = max(0.0, min(100.0, base_score - risk_penalty + score_adjustment))
+
             return {
-                'score': min(100, round(score, 2)),
+                'score': round(score, 2),
                 'data': {
-                    'heat_score': heat_score,
-                    'risk_score': risk_score,
-                    'heat_type': heat_type,
-                    'ivr': mc_data.get('ivr'),
-                    'source': 'marketchameleon'
+                    'heat_score': round(heat_score, 2),
+                    'risk_score': round(risk_score, 2),
+                    'confidence_penalty': round(confidence_penalty, 2),
+                    'directional_confidence': round(directional_confidence, 2),
+                    'heat_type': overlay_label,
+                    'heat_type_legacy': to_legacy_heat_type(overlay_label),
+                    'overlay_label': overlay_label,
+                    'position_suggestion': position_suggestion,
+                    'score_adjustment': score_adjustment,
+                    'risk_penalty': round(risk_penalty, 2),
+                    'term_score': round(term_score, 2),
+                    'slope': round(slope, 4) if slope is not None else None,
+                    'delta_slope': round(delta_slope, 4) if delta_slope is not None else None,
+                    'positioning_score': round(positioning_score, 2),
+                    'ivr': payload.get('ivr'),
+                    'iv30_futu': iv30,
+                    'iv60_futu': iv60,
+                    'iv90_futu': iv90,
+                    'positioning_inputs': positioning_inputs,
+                    'source': 'marketchameleon+futu' if iv_data is not None else 'marketchameleon'
                 }
             }
-            
+
         except Exception as e:
             logger.error(f"计算 {symbol} 期权评分失败: {e}")
             return {'score': 50, 'data': None}

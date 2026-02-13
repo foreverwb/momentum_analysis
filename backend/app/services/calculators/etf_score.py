@@ -1,248 +1,341 @@
 """
 ETF 综合评分计算器
-整合多数据源计算 ETF 综合评分
 
-评分体系:
-- 相对动量 (RelMom): 45%
-- 趋势质量: 25%
-- 广度/参与度: 20%
-- 期权确认: 10%
-
-硬性门槛:
-- Price > SMA50
-- RS_20D > 0
-- Breadth > 50%
-
-数据源:
-- IBKR: 价格数据、RelMom
-- Futu: IV 数据
-- Finviz: 广度指标
-- MarketChameleon: HeatScore
+升级点：
+1) 先计算 raw_features，再在 batch 内做横截面 winsorize + rank percentile 标准化
+2) 输出 raw_features / normalized_features / breakdown，增强可解释性
+3) 缺失模块自动按比例重分配权重，避免 NO_DATA 直接拉低总分
+4) 支持权重 preset（balanced / aggressive_short_term）
 """
 
-from typing import Dict, List, Optional, Any
+from __future__ import annotations
+
 from dataclasses import dataclass, asdict
 import logging
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 
+def _safe_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clip(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _quantile(values: List[float], q: float) -> Optional[float]:
+    if not values:
+        return None
+    sorted_values = sorted(float(v) for v in values)
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    q = _clip(float(q), 0.0, 1.0)
+    pos = q * (len(sorted_values) - 1)
+    lo = int(pos)
+    hi = min(len(sorted_values) - 1, lo + 1)
+    weight = pos - lo
+    return sorted_values[lo] * (1 - weight) + sorted_values[hi] * weight
+
+
+def _winsorize_value_map(
+    value_map: Dict[str, Optional[float]],
+    limits: Tuple[float, float] = (0.05, 0.95),
+) -> Dict[str, Optional[float]]:
+    valid_items = {k: float(v) for k, v in value_map.items() if v is not None}
+    if not valid_items:
+        return {k: None for k in value_map}
+
+    lower_q, upper_q = limits
+    values = list(valid_items.values())
+    lower = _quantile(values, lower_q)
+    upper = _quantile(values, upper_q)
+    if lower is None or upper is None:
+        return {k: valid_items.get(k) for k in value_map}
+
+    winsorized: Dict[str, Optional[float]] = {}
+    for key, raw_value in value_map.items():
+        if raw_value is None:
+            winsorized[key] = None
+        else:
+            winsorized[key] = _clip(float(raw_value), lower, upper)
+    return winsorized
+
+
+def rank_percentile_normalize(
+    value_map: Dict[str, Optional[float]],
+    winsorize_limits: Tuple[float, float] = (0.05, 0.95),
+) -> Dict[str, Optional[float]]:
+    """
+    对横截面 raw 值做 winsorize 后的 rank percentile 标准化，输出 0..100。
+    缺失值返回 None。
+    """
+    winsorized = _winsorize_value_map(value_map, limits=winsorize_limits)
+    valid_values = [v for v in winsorized.values() if v is not None]
+    n = len(valid_values)
+
+    if n == 0:
+        return {k: None for k in value_map}
+    if n == 1:
+        # 单样本时避免虚高，给中性分。
+        return {k: (50.0 if winsorized.get(k) is not None else None) for k in value_map}
+
+    normalized: Dict[str, Optional[float]] = {}
+    for key, current in winsorized.items():
+        if current is None:
+            normalized[key] = None
+            continue
+        count_less = sum(1 for v in valid_values if v < current)
+        count_equal = sum(1 for v in valid_values if v == current)
+        # mid-rank percentile
+        rank_position = count_less + 0.5 * max(0, count_equal - 1)
+        percentile = (rank_position / (n - 1)) * 100.0
+        normalized[key] = round(_clip(percentile, 0.0, 100.0), 2)
+
+    return normalized
+
+
 @dataclass
 class ScoreResult:
-    """单项评分结果"""
     score: float
     data: Optional[Dict[str, Any]] = None
-    
-    def to_dict(self) -> Dict:
-        return {
-            'score': self.score,
-            'data': self.data
-        }
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"score": self.score, "data": self.data}
 
 
 @dataclass
 class ThresholdResult:
-    """门槛检查结果"""
     all_pass: bool
     details: Dict[str, str]
-    
-    def to_dict(self) -> Dict:
-        return {
-            'all_pass': self.all_pass,
-            'details': self.details
-        }
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"all_pass": self.all_pass, "details": self.details}
 
 
 @dataclass
 class ETFScoreResult:
-    """ETF 综合评分结果"""
     symbol: str
     total_score: float
     thresholds_pass: bool
     thresholds: Dict[str, str]
     breakdown: Dict[str, Any]
     weights: Dict[str, float]
-    
-    def to_dict(self) -> Dict:
+
+    def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
 class ETFScoreCalculator:
     """
-    ETF 综合评分计算器
-    
-    整合多数据源计算 ETF 综合评分:
-    1. 相对动量 (45%) - IBKR
-    2. 趋势质量 (25%) - IBKR + 本地计算
-    3. 广度/参与度 (20%) - Finviz
-    4. 期权确认 (10%) - Futu + MarketChameleon
-    
-    使用示例:
-    ```python
-    # ibkr_data 需提供 get_price_data/get_ohlcv_data/get_current_price/get_vix 接口
-    ibkr_data = ...
-    
-    calc = ETFScoreCalculator(ibkr_data)
-    result = calc.calculate_composite_score('XLK', 'SPY')
-    
-    print(f"总分: {result['total_score']}")
-    print(f"门槛通过: {result['thresholds_pass']}")
-    
-    # 若对象实现了连接生命周期，可按需断开
-    ```
+    ETF 综合评分计算器（短周期 2-6 周风格）.
     """
-    
-    # 权重配置
+
+    # 兼容旧测试：保留 class-level WEIGHTS 且和为 1
     WEIGHTS = {
-        'rel_mom': 0.45,        # 相对动量
-        'trend_quality': 0.25,  # 趋势质量
-        'breadth': 0.20,        # 广度/参与度
-        'options_confirm': 0.10 # 期权确认
+        'rel_mom': 0.45,
+        'trend_quality': 0.25,
+        'breadth': 0.20,
+        'options_confirm': 0.10,
     }
-    
-    # 硬性门槛配置
+
+    WEIGHT_PRESETS = {
+        # 与历史口径一致
+        'balanced': {
+            'module_weights': WEIGHTS,
+        },
+        # 短周期激进追趋势
+        'aggressive_short_term': {
+            'price_rs': 0.55,
+            'breadth': 0.20,
+            'options_confirm': 0.25,
+        },
+    }
+
+    DEFAULT_PRESET = 'balanced'
+    DEFAULT_PRICE_RS_ALPHA = 0.65
+    DEFAULT_WINSORIZE_LIMITS = (0.05, 0.95)
+
+    BREADTH_RAW_WEIGHTS = {
+        'pct_above_sma50': 0.50,
+        'pct_above_sma20': 0.30,
+        'pct_near_52w_high': 0.20,
+    }
+
     THRESHOLDS = {
         'price_above_sma50': True,
         'rs_20d_positive': True,
-        'breadth_min': 0.50
+        'breadth_min': 0.50,
     }
-    
-    def __init__(self, ibkr, futu=None):
-        """
-        初始化 ETF 评分计算器
-        
-        Args:
-            ibkr: IBKR 数据对象（需提供价格相关接口）
-            futu: FutuConnector 实例（可选）
-        """
+
+    def __init__(
+        self,
+        ibkr=None,
+        futu=None,
+        weight_preset: str = DEFAULT_PRESET,
+        price_rs_alpha: float = DEFAULT_PRICE_RS_ALPHA,
+        winsorize_limits: Tuple[float, float] = DEFAULT_WINSORIZE_LIMITS,
+    ):
         self.ibkr = ibkr
         self.futu = futu
-    
-    def calculate_rel_mom_score(self, symbol: str, benchmark: str = 'SPY') -> Dict:
-        """
-        计算相对动量分数 (权重: 45%)
-        
-        数据源: IBKR
-        
-        评分逻辑:
-        - RelMom 值范围映射 [-0.1, 0.15] -> [0, 100]
-        - RelMom > 0.05: 强势
-        - RelMom > 0: 中性偏强
-        - RelMom < 0: 弱势
-        
-        Args:
-            symbol: ETF 代码
-            benchmark: 基准指数 (默认 SPY)
-        
-        Returns:
-            dict: {'score': float, 'data': dict}
-        """
+        self.weight_preset = (
+            weight_preset
+            if weight_preset in self.WEIGHT_PRESETS
+            else self.DEFAULT_PRESET
+        )
+        self.price_rs_alpha = _clip(float(price_rs_alpha), 0.0, 1.0)
+        self.winsorize_limits = winsorize_limits
+
+    def _resolve_effective_weights(self) -> Dict[str, float]:
+        preset = self.WEIGHT_PRESETS[self.weight_preset]
+        module_weights = preset.get('module_weights')
+        if isinstance(module_weights, dict):
+            return dict(module_weights)
+
+        price_rs = float(preset.get('price_rs', 0.70))
+        breadth = float(preset.get('breadth', 0.20))
+        options_confirm = float(preset.get('options_confirm', 0.10))
+
+        rel_mom = price_rs * self.price_rs_alpha
+        trend_quality = price_rs * (1.0 - self.price_rs_alpha)
+
+        effective = {
+            'rel_mom': rel_mom,
+            'trend_quality': trend_quality,
+            'breadth': breadth,
+            'options_confirm': options_confirm,
+        }
+        total = sum(effective.values())
+        if total <= 0:
+            return dict(self.WEIGHTS)
+        return {k: round(v / total, 6) for k, v in effective.items()}
+
+    @staticmethod
+    def _map_rel_mom_absolute(rel_mom: Optional[float]) -> float:
+        if rel_mom is None:
+            return 0.0
+        # 历史兼容映射（仅用于单维原始值展示）
+        score = (float(rel_mom) + 0.1) / 0.25 * 100.0
+        return round(_clip(score, 0.0, 100.0), 2)
+
+    def _fetch_iv_map(self, symbols: Iterable[str]) -> Dict[str, Any]:
+        symbols = [str(s).upper() for s in symbols]
+        if not symbols or self.futu is None:
+            return {}
         try:
+            if hasattr(self.futu, "is_connected") and not self.futu.is_connected():
+                return {}
+            return self.futu.fetch_iv_terms(symbols, log_progress=False, log_fetch_summary=False)
+        except TypeError:
+            # 兼容旧签名（无 log_* 参数）
+            try:
+                return self.futu.fetch_iv_terms(symbols)
+            except Exception as exc:
+                logger.warning(f"批量获取 IV 数据失败: {exc}")
+                return {}
+        except Exception as exc:
+            logger.warning(f"批量获取 IV 数据失败: {exc}")
+            return {}
+
+    @staticmethod
+    def _extract_field(payload: Any, field_name: str) -> Optional[float]:
+        if payload is None:
+            return None
+        if hasattr(payload, field_name):
+            return _safe_float(getattr(payload, field_name))
+        if isinstance(payload, dict):
+            return _safe_float(payload.get(field_name))
+        return None
+
+    def calculate_rel_mom_score(self, symbol: str, benchmark: str = 'SPY') -> Dict[str, Any]:
+        try:
+            if self.ibkr is None:
+                return {'score': 0.0, 'raw_score': None, 'data': None}
+
             result = self.ibkr.analyze_sector_vs_spy(symbol, benchmark)
-            
             if not result:
-                logger.warning(f"无法获取 {symbol} 的 RelMom 数据")
-                return {'score': 0, 'data': None}
-            
-            # RelMom 值转换为 0-100 分数
-            # 假设 RelMom 范围 [-0.1, 0.15] 映射到 [0, 100]
-            rel_mom = result.get('RelMom', 0) or 0
-            
-            # 线性映射: -0.1 -> 0, 0.15 -> 100
-            score = (rel_mom + 0.1) / 0.25 * 100
-            score = min(100, max(0, score))
-            
+                return {'score': 0.0, 'raw_score': None, 'data': None}
+
+            rel_mom_raw = _safe_float(result.get('RelMom'))
+            abs_score = self._map_rel_mom_absolute(rel_mom_raw)
+
             return {
-                'score': round(score, 2),
+                'score': abs_score,
+                'raw_score': rel_mom_raw,
                 'data': {
                     'RS': result.get('RS'),
                     'RS_5D': result.get('RS_5D'),
                     'RS_20D': result.get('RS_20D'),
                     'RS_63D': result.get('RS_63D'),
-                    'RelMom': result.get('RelMom'),
+                    'RelMom': rel_mom_raw,
                     'strength': result.get('strength', 'NEUTRAL'),
-                    'description': result.get('description', '')
-                }
+                    'description': result.get('description', ''),
+                    'rel_mom_raw': rel_mom_raw,
+                },
             }
-            
-        except Exception as e:
-            logger.error(f"计算 {symbol} RelMom 分数失败: {e}")
-            return {'score': 0, 'data': None}
-    
-    def calculate_trend_quality_score(self, symbol: str) -> Dict:
-        """
-        计算趋势质量分数 (权重: 25%)
-        
-        数据源: IBKR + 本地计算
-        
-        评分项 (每项25分):
-        1. Price > SMA50 (+25分)
-        2. SMA20 > SMA50 (+25分)
-        3. SMA20 Slope > 0 (+25分)
-        4. Max Drawdown 20D > -10% (+25分)
-        
-        Args:
-            symbol: ETF 代码
-        
-        Returns:
-            dict: {'score': float, 'data': dict}
-        """
+        except Exception as exc:
+            logger.error(f"计算 {symbol} RelMom 分数失败: {exc}")
+            return {'score': 0.0, 'raw_score': None, 'data': None}
+
+    def calculate_trend_quality_score(self, symbol: str) -> Dict[str, Any]:
         from .technical import calculate_sma, calculate_sma_slope, calculate_max_drawdown
-        
+
         try:
-            # 获取价格数据 (需要100天来计算50日均线)
+            if self.ibkr is None:
+                return {'score': 0.0, 'raw_score': None, 'data': None}
+
             price_df = self.ibkr.get_price_data(symbol, duration='100 D')
-            
             if price_df is None or len(price_df) < 50:
-                logger.warning(f"数据不足，无法计算 {symbol} 趋势质量")
-                return {'score': 0, 'data': None}
-            
+                return {'score': 0.0, 'raw_score': None, 'data': None}
+
             prices = price_df[symbol]
-            
-            # 计算均线
             sma20 = calculate_sma(prices, 20)
             sma50 = calculate_sma(prices, 50)
-            
-            current_price = prices.iloc[-1]
-            current_sma20 = sma20.iloc[-1]
-            current_sma50 = sma50.iloc[-1]
-            
-            # 评分项
+
+            current_price = float(prices.iloc[-1])
+            current_sma20 = float(sma20.iloc[-1])
+            current_sma50 = float(sma50.iloc[-1])
             price_above_sma50 = current_price > current_sma50
             sma20_above_sma50 = current_sma20 > current_sma50
-            sma20_slope = calculate_sma_slope(sma20, period=5)
-            max_dd = calculate_max_drawdown(prices, 20)
-            
-            # 计算分数 (每项25分)
-            score = 0
-            score_breakdown = {}
-            
+            sma20_slope = float(calculate_sma_slope(sma20, period=5))
+            max_dd = float(calculate_max_drawdown(prices, 20))
+
+            score = 0.0
+            score_breakdown: Dict[str, float] = {}
             if price_above_sma50:
-                score += 25
-                score_breakdown['price_above_sma50'] = 25
+                score += 25.0
+                score_breakdown['price_above_sma50'] = 25.0
             else:
-                score_breakdown['price_above_sma50'] = 0
-            
+                score_breakdown['price_above_sma50'] = 0.0
+
             if sma20_above_sma50:
-                score += 25
-                score_breakdown['sma20_above_sma50'] = 25
+                score += 25.0
+                score_breakdown['sma20_above_sma50'] = 25.0
             else:
-                score_breakdown['sma20_above_sma50'] = 0
-            
+                score_breakdown['sma20_above_sma50'] = 0.0
+
             if sma20_slope > 0:
-                score += 25
-                score_breakdown['sma20_slope_positive'] = 25
+                score += 25.0
+                score_breakdown['sma20_slope_positive'] = 25.0
             else:
-                score_breakdown['sma20_slope_positive'] = 0
-            
-            if max_dd > -0.10:  # 回撤大于 -10%（即回撤不超过10%）
-                score += 25
-                score_breakdown['drawdown_acceptable'] = 25
+                score_breakdown['sma20_slope_positive'] = 0.0
+
+            if max_dd > -0.10:
+                score += 25.0
+                score_breakdown['drawdown_acceptable'] = 25.0
             else:
-                score_breakdown['drawdown_acceptable'] = 0
-            
+                score_breakdown['drawdown_acceptable'] = 0.0
+
+            score = round(_clip(score, 0.0, 100.0), 2)
             return {
                 'score': score,
+                'raw_score': score,
                 'data': {
                     'price': round(current_price, 2),
                     'sma20': round(current_sma20, 2),
@@ -251,352 +344,471 @@ class ETFScoreCalculator:
                     'sma20_above_sma50': sma20_above_sma50,
                     'sma20_slope': round(sma20_slope, 4),
                     'max_drawdown_20d': round(max_dd, 4),
-                    'score_breakdown': score_breakdown
-                }
+                    'score_breakdown': score_breakdown,
+                    'trend_quality_raw': score,
+                },
             }
-            
-        except Exception as e:
-            logger.error(f"计算 {symbol} 趋势质量分数失败: {e}")
-            return {'score': 0, 'data': None}
-    
+        except Exception as exc:
+            logger.error(f"计算 {symbol} 趋势质量分数失败: {exc}")
+            return {'score': 0.0, 'raw_score': None, 'data': None}
+
     def calculate_breadth_score(
-        self, 
-        etf_symbol: str, 
-        holdings_data: List[Dict] = None
-    ) -> Dict:
-        """
-        计算广度/参与度分数 (权重: 20%)
-        
-        数据源: Finviz 导入数据
-        
-        评分逻辑:
-        - 基于 %Above50DMA 计算分数
-        - 80%+ 以上 = 100分
-        - 50% = 50分
-        - 线性映射
-        
-        Args:
-            etf_symbol: ETF 代码
-            holdings_data: ETF 持仓的 Finviz 数据列表
-        
-        Returns:
-            dict: {'score': float, 'data': dict}
-        """
+        self,
+        etf_symbol: str,
+        holdings_data: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
         if not holdings_data:
-            logger.warning(f"无 Finviz 数据，跳过 {etf_symbol} 广度计算")
-            return {'score': 0, 'data': None}
-        
+            return {'score': 0.0, 'raw_score': None, 'data': None}
+
         try:
             from ..parsers.finviz_parser import calculate_breadth_metrics
-            
+
             breadth = calculate_breadth_metrics(holdings_data)
-            
-            # 基于 %Above50DMA 计算分数
-            pct_above_50 = breadth.get('pct_above_sma50', 0)
-            
-            # 线性映射：0% -> 0分, 100% -> 100分
-            score = min(100, pct_above_50 * 100)
-            
+            pct_above_50 = _safe_float(breadth.get('pct_above_sma50')) or 0.0
+            pct_above_20 = _safe_float(breadth.get('pct_above_sma20')) or 0.0
+            pct_near_52w_high = _safe_float(breadth.get('pct_near_52w_high')) or 0.0
+
+            breadth_raw = (
+                self.BREADTH_RAW_WEIGHTS['pct_above_sma50'] * pct_above_50 +
+                self.BREADTH_RAW_WEIGHTS['pct_above_sma20'] * pct_above_20 +
+                self.BREADTH_RAW_WEIGHTS['pct_near_52w_high'] * pct_near_52w_high
+            ) * 100.0
+            breadth_raw = round(_clip(breadth_raw, 0.0, 100.0), 2)
+
             return {
-                'score': round(score, 2),
+                'score': breadth_raw,
+                'raw_score': breadth_raw,
                 'data': {
-                    'pct_above_sma20': round(breadth.get('pct_above_sma20', 0), 4),
-                    'pct_above_sma50': round(breadth.get('pct_above_sma50', 0), 4),
-                    'pct_above_sma200': round(breadth.get('pct_above_sma200', 0), 4),
-                    'pct_near_52w_high': round(breadth.get('pct_near_52w_high', 0), 4),
-                    'pct_near_52w_low': round(breadth.get('pct_near_52w_low', 0), 4),
-                    'total_count': breadth.get('total_count', 0)
-                }
+                    'pct_above_sma20': round(pct_above_20, 4),
+                    'pct_above_sma50': round(pct_above_50, 4),
+                    'pct_above_sma200': round(_safe_float(breadth.get('pct_above_sma200')) or 0.0, 4),
+                    'pct_near_52w_high': round(pct_near_52w_high, 4),
+                    'pct_near_52w_low': round(_safe_float(breadth.get('pct_near_52w_low')) or 0.0, 4),
+                    'total_count': breadth.get('total_count', 0),
+                    'breadth_raw': breadth_raw,
+                    'breadth_raw_weights': dict(self.BREADTH_RAW_WEIGHTS),
+                },
             }
-            
-        except Exception as e:
-            logger.error(f"计算 {etf_symbol} 广度分数失败: {e}")
-            return {'score': 0, 'data': None}
-    
+        except Exception as exc:
+            logger.error(f"计算 {etf_symbol} 广度分数失败: {exc}")
+            return {'score': 0.0, 'raw_score': None, 'data': None}
+
     def calculate_options_confirm_score(
-        self, 
-        symbol: str, 
-        mc_data: Dict = None
-    ) -> Dict:
-        """
-        计算期权确认分数 (权重: 10%)
-        
-        数据源: 富途 IV + MarketChameleon HeatScore
-        
-        评分逻辑:
-        - HeatScore > 70 且 RiskScore < 80: 高分 (80+)
-        - HeatScore > 50: 中等分 (50-80)
-        - HeatScore < 50: 低分
-        
-        Args:
-            symbol: ETF 代码
-            mc_data: MarketChameleon 导入数据
-        
-        Returns:
-            dict: {'score': float, 'data': dict}
-        """
-        score_components = {}
-        
+        self,
+        symbol: str,
+        mc_data: Optional[Dict[str, Any]] = None,
+        iv_data: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        from ..parsers.mc_parser import (
+            calculate_positioning_score_from_iv,
+            calculate_term_score,
+            normalize_heat_type,
+            to_legacy_heat_type,
+        )
+
+        components: Dict[str, Any] = {}
         try:
-            # 1. 从富途获取 IV 数据
-            if self.futu and self.futu.is_connected():
+            if iv_data is None and self.futu is not None:
                 try:
+                    if hasattr(self.futu, "is_connected") and self.futu.is_connected():
+                        iv_result = self.futu.fetch_iv_terms([symbol], log_progress=False, log_fetch_summary=False)
+                        iv_data = iv_result.get(symbol)
+                except TypeError:
                     iv_result = self.futu.fetch_iv_terms([symbol])
-                    if symbol in iv_result:
-                        iv_data = iv_result[symbol]
-                        score_components['iv30'] = iv_data.iv30
-                        score_components['iv60'] = iv_data.iv60
-                        score_components['iv90'] = iv_data.iv90
-                        score_components['total_oi'] = iv_data.total_oi
-                except Exception as e:
-                    logger.warning(f"获取 {symbol} IV 数据失败: {e}")
-            
-            # 2. 从 MarketChameleon 导入数据获取 HeatScore
-            if mc_data:
-                score_components['heat_score'] = mc_data.get('heat_score', 50)
-                score_components['risk_score'] = mc_data.get('risk_score', 50)
-                score_components['ivr'] = mc_data.get('ivr', 50)
-                score_components['heat_type'] = mc_data.get('heat_type', 'NORMAL')
-            
-            # 综合计算
-            heat = score_components.get('heat_score', 50)
-            risk = score_components.get('risk_score', 50)
-            
-            # 热度高且风险适中为佳
-            if heat > 70 and risk < 80:
-                # 高热度 + 适中风险 = 高分
-                score = 80 + min(20, (heat - 70) * 0.5)
-            elif heat > 50:
-                # 中等热度
-                score = 50 + (heat - 50) * 0.5
-            else:
-                # 低热度
-                score = heat * 0.5
-            
+                    iv_data = iv_result.get(symbol)
+                except Exception as exc:
+                    logger.warning(f"获取 {symbol} 富途 IV 失败: {exc}")
+
+            heat_score = _safe_float((mc_data or {}).get('heat_score'))
+            risk_score = _safe_float((mc_data or {}).get('risk_score'))
+            confidence_penalty = _safe_float((mc_data or {}).get('confidence_penalty'))
+            base_heat_type = normalize_heat_type((mc_data or {}).get('heat_type'))
+            put_pct = _safe_float((mc_data or {}).get('put_pct'))
+
+            heat_score = 50.0 if heat_score is None else _clip(heat_score, 0.0, 100.0)
+            risk_score = 50.0 if risk_score is None else _clip(risk_score, 0.0, 100.0)
+            confidence_penalty = 50.0 if confidence_penalty is None else _clip(confidence_penalty, 0.0, 100.0)
+
+            iv30 = self._extract_field(iv_data, 'iv30')
+            iv60 = self._extract_field(iv_data, 'iv60')
+            iv90 = self._extract_field(iv_data, 'iv90')
+            slope = _safe_float((mc_data or {}).get('slope'))
+            if slope is None and iv30 is not None and iv90 is not None:
+                slope = iv30 - iv90
+
+            delta_slope = _safe_float((mc_data or {}).get('delta_slope'))
+            if delta_slope is None:
+                slope_mc = _safe_float((mc_data or {}).get('slope_mc'))
+                if slope is not None and slope_mc is not None:
+                    delta_slope = slope - slope_mc
+
+            term_score = _safe_float((mc_data or {}).get('term_score'))
+            if term_score is None and all(v is not None for v in (iv30, iv60, iv90)):
+                term_score = calculate_term_score(iv30, iv60, iv90, delta_slope=delta_slope)
+            term_score = 50.0 if term_score is None else _clip(term_score, 0.0, 100.0)
+
+            positioning_score = _safe_float((mc_data or {}).get('positioning_score'))
+            positioning_details = None
+            if positioning_score is None and iv_data is not None:
+                positioning_score, positioning_details = calculate_positioning_score_from_iv(iv_data)
+            positioning_score = 50.0 if positioning_score is None else _clip(positioning_score, 0.0, 100.0)
+
+            iv30_chg = _safe_float((mc_data or {}).get('iv30_chg_pct'))
+            if iv30_chg is None:
+                iv30_chg = _safe_float((mc_data or {}).get('iv_change'))
+            earnings_near = bool((mc_data or {}).get('earnings_near', False))
+            trend_gate_pass = bool((mc_data or {}).get('trend_gate_pass', positioning_score >= 55))
+            price_not_strong = bool((mc_data or {}).get('price_not_strong', (not trend_gate_pass) or (slope is None or slope > 0)))
+            risk_score_rising = bool(iv30_chg is not None and iv30_chg > 0)
+
+            event_heat = heat_score >= 70 and (risk_score >= 85 or earnings_near)
+            trend_heat = heat_score >= 70 and risk_score < 80 and trend_gate_pass
+            hedge_heat = bool(
+                put_pct is not None and
+                put_pct >= 60 and
+                risk_score >= 75 and
+                risk_score_rising and
+                price_not_strong
+            )
+
+            overlay_label = base_heat_type if base_heat_type in {'trend', 'event', 'hedge', 'normal'} else 'normal'
+            score_adjustment = 0.0
+            position_suggestion = 'hold'
+
+            if event_heat:
+                overlay_label = 'event'
+                score_adjustment = -18.0
+                position_suggestion = 'reduce_exposure'
+            elif trend_heat:
+                overlay_label = 'trend'
+                score_adjustment = +10.0
+                position_suggestion = 'trend_confirmed'
+            elif hedge_heat:
+                overlay_label = 'hedge'
+                score_adjustment = -8.0
+                position_suggestion = 'stay_defensive'
+
+            directional_confidence = 100.0 - confidence_penalty
+            base_score = (
+                0.35 * heat_score +
+                0.25 * term_score +
+                0.30 * positioning_score +
+                0.10 * directional_confidence
+            )
+            risk_penalty = max(0.0, risk_score - 70.0) * 0.45
+            raw_score = _clip(base_score - risk_penalty + score_adjustment, 0.0, 100.0)
+            raw_score = round(raw_score, 2)
+
+            components.update({
+                'heat_score': round(heat_score, 2),
+                'risk_score': round(risk_score, 2),
+                'confidence_penalty': round(confidence_penalty, 2),
+                'directional_confidence': round(directional_confidence, 2),
+                'term_score': round(term_score, 2),
+                'slope': round(slope, 4) if slope is not None else None,
+                'delta_slope': round(delta_slope, 4) if delta_slope is not None else None,
+                'positioning_score': round(positioning_score, 2),
+                'overlay_label': overlay_label,
+                'heat_type': overlay_label,
+                'heat_type_legacy': to_legacy_heat_type(overlay_label),
+                'position_suggestion': position_suggestion,
+                'score_adjustment': score_adjustment,
+                'risk_penalty': round(risk_penalty, 2),
+                'base_score': round(base_score, 2),
+                'event_heat': event_heat,
+                'trend_heat': trend_heat,
+                'source': 'mc+futu' if iv_data is not None else 'mc',
+                'raw_score': raw_score,
+            })
+
+            if iv30 is not None:
+                components['iv30_futu'] = iv30
+            if iv60 is not None:
+                components['iv60_futu'] = iv60
+            if iv90 is not None:
+                components['iv90_futu'] = iv90
+            if positioning_details:
+                components['positioning_inputs'] = positioning_details
+
             return {
-                'score': min(100, round(score, 2)),
-                'data': score_components
+                'score': raw_score,
+                'raw_score': raw_score,
+                'data': components,
             }
-            
-        except Exception as e:
-            logger.error(f"计算 {symbol} 期权确认分数失败: {e}")
-            return {'score': 50, 'data': None}  # 默认中性分数
-    
+        except Exception as exc:
+            logger.error(f"计算 {symbol} 期权确认分数失败: {exc}")
+            return {
+                'score': 50.0,
+                'raw_score': None,
+                'data': {'overlay_label': 'normal', 'position_suggestion': 'hold'},
+            }
+
     def check_thresholds(
-        self, 
-        rel_mom_data: Dict, 
-        trend_data: Dict, 
-        breadth_data: Dict
-    ) -> Dict:
-        """
-        检查硬性门槛
-        
-        门槛:
-        1. Price > SMA50 (必须)
-        2. RS_20D > 0 (必须)
-        3. Breadth > 50% (必须)
-        
-        Args:
-            rel_mom_data: RelMom 评分结果
-            trend_data: 趋势质量评分结果
-            breadth_data: 广度评分结果
-        
-        Returns:
-            dict: {'all_pass': bool, 'details': dict}
-        """
-        results = {}
+        self,
+        rel_mom_data: Dict[str, Any],
+        trend_data: Dict[str, Any],
+        breadth_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        results: Dict[str, str] = {}
         all_pass = True
-        
-        # 1. Price > SMA50
-        if trend_data and trend_data.get('data'):
-            price_above_sma50 = trend_data['data'].get('price_above_sma50', False)
-            results['price_above_sma50'] = 'PASS' if price_above_sma50 else 'FAIL'
-            if not price_above_sma50:
-                all_pass = False
-        else:
-            results['price_above_sma50'] = 'NO_DATA'
+
+        trend_payload = (trend_data or {}).get('data') or {}
+        rel_payload = (rel_mom_data or {}).get('data') or {}
+        breadth_payload = (breadth_data or {}).get('data') or {}
+
+        price_above_sma50 = bool(trend_payload.get('price_above_sma50'))
+        results['price_above_sma50'] = 'PASS' if price_above_sma50 else 'FAIL'
+        if not price_above_sma50:
             all_pass = False
-        
-        # 2. RS_20D > 0
-        if rel_mom_data and rel_mom_data.get('data'):
-            rs_20d = rel_mom_data['data'].get('RS_20D', 0) or 0
-            results['rs_20d_positive'] = 'PASS' if rs_20d > 0 else 'FAIL'
-            if rs_20d <= 0:
-                all_pass = False
-        else:
+
+        rs_20d = _safe_float(rel_payload.get('RS_20D'))
+        if rs_20d is None:
             results['rs_20d_positive'] = 'NO_DATA'
             all_pass = False
-        
-        # 3. Breadth > 50%
-        if breadth_data and breadth_data.get('data'):
-            pct_above_50 = breadth_data['data'].get('pct_above_sma50', 0)
-            results['breadth_above_50'] = 'PASS' if pct_above_50 >= 0.5 else 'FAIL'
-            if pct_above_50 < 0.5:
-                all_pass = False
         else:
-            # 如果没有广度数据，不强制失败
+            rs_pass = rs_20d > 0
+            results['rs_20d_positive'] = 'PASS' if rs_pass else 'FAIL'
+            if not rs_pass:
+                all_pass = False
+
+        pct_above_50 = _safe_float(breadth_payload.get('pct_above_sma50'))
+        if pct_above_50 is None:
             results['breadth_above_50'] = 'NO_DATA'
-        
-        return {
-            'all_pass': all_pass,
-            'details': results
+        else:
+            breadth_pass = pct_above_50 >= self.THRESHOLDS['breadth_min']
+            results['breadth_above_50'] = 'PASS' if breadth_pass else 'FAIL'
+            if not breadth_pass:
+                all_pass = False
+
+        return {'all_pass': all_pass, 'details': results}
+
+    def _compose_total_score(
+        self,
+        normalized_features: Dict[str, Optional[float]],
+        base_weights: Dict[str, float],
+    ) -> Tuple[float, Dict[str, float]]:
+        available_items = {
+            key: value
+            for key, value in normalized_features.items()
+            if value is not None and key in base_weights
         }
-    
+        if not available_items:
+            return 0.0, {}
+
+        total_available_weight = sum(base_weights[key] for key in available_items)
+        if total_available_weight <= 0:
+            return 0.0, {}
+
+        redistributed = {
+            key: base_weights[key] / total_available_weight
+            for key in available_items
+        }
+        total_score = sum(available_items[key] * redistributed[key] for key in available_items)
+        return round(_clip(total_score, 0.0, 100.0), 2), redistributed
+
+    def _build_symbol_modules(
+        self,
+        symbol: str,
+        benchmark: str,
+        holdings_data: Optional[List[Dict[str, Any]]],
+        mc_data: Optional[Dict[str, Any]],
+        iv_data: Optional[Any],
+    ) -> Dict[str, Any]:
+        rel_mom = self.calculate_rel_mom_score(symbol, benchmark)
+        trend = self.calculate_trend_quality_score(symbol)
+        breadth = self.calculate_breadth_score(symbol, holdings_data)
+        options = self.calculate_options_confirm_score(symbol, mc_data=mc_data, iv_data=iv_data)
+
+        raw_features = {
+            'rel_mom_raw': rel_mom.get('raw_score'),
+            'trend_quality_raw': trend.get('raw_score'),
+            'breadth_raw': breadth.get('raw_score'),
+            'options_raw': options.get('raw_score'),
+        }
+        return {
+            'modules': {
+                'rel_mom': rel_mom,
+                'trend_quality': trend,
+                'breadth': breadth,
+                'options_confirm': options,
+            },
+            'raw_features': raw_features,
+        }
+
     def calculate_composite_score(
         self,
         symbol: str,
         benchmark: str = 'SPY',
-        holdings_data: List[Dict] = None,
-        mc_data: Dict = None
-    ) -> Dict:
-        """
-        计算 ETF 综合评分
-        
-        整合所有评分模块，返回完整评分结果
-        
-        Args:
-            symbol: ETF 代码
-            benchmark: 基准指数 (默认 SPY)
-            holdings_data: ETF 持仓的 Finviz 数据
-            mc_data: MarketChameleon 期权数据
-        
-        Returns:
-            dict: 完整评分结果
-            {
-                'symbol': str,
-                'total_score': float,
-                'thresholds_pass': bool,
-                'thresholds': dict,
-                'breakdown': dict,
-                'weights': dict
-            }
-        """
-        logger.info(f"开始计算 {symbol} 综合评分...")
-        
-        # 1. 计算各模块分数
-        rel_mom = self.calculate_rel_mom_score(symbol, benchmark)
-        trend = self.calculate_trend_quality_score(symbol)
-        breadth = self.calculate_breadth_score(symbol, holdings_data)
-        options = self.calculate_options_confirm_score(symbol, mc_data)
-        
-        # 2. 检查硬性门槛
-        thresholds = self.check_thresholds(rel_mom, trend, breadth)
-        
-        # 3. 计算综合分
-        total_score = (
-            self.WEIGHTS['rel_mom'] * rel_mom['score'] +
-            self.WEIGHTS['trend_quality'] * trend['score'] +
-            self.WEIGHTS['breadth'] * breadth['score'] +
-            self.WEIGHTS['options_confirm'] * options['score']
+        holdings_data: Optional[List[Dict[str, Any]]] = None,
+        mc_data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        # 复用 batch 流程，单样本时 normalize=50（中性），保证结构一致。
+        results = self.batch_calculate_scores(
+            symbols=[symbol],
+            benchmark=benchmark,
+            holdings_map={symbol: holdings_data or []},
+            mc_map={symbol: mc_data or {}},
         )
-        
-        result = {
+        if results:
+            return results[0]
+
+        effective_weights = self._resolve_effective_weights()
+        return {
             'symbol': symbol,
-            'total_score': round(total_score, 2),
-            'thresholds_pass': thresholds['all_pass'],
-            'thresholds': thresholds['details'],
-            'breakdown': {
-                'rel_mom': rel_mom,
-                'trend_quality': trend,
-                'breadth': breadth,
-                'options_confirm': options
+            'total_score': 0.0,
+            'thresholds_pass': False,
+            'thresholds': {
+                'price_above_sma50': 'NO_DATA',
+                'rs_20d_positive': 'NO_DATA',
+                'breadth_above_50': 'NO_DATA',
             },
-            'weights': self.WEIGHTS
+            'breakdown': {
+                'rel_mom': {'score': 0.0, 'data': None},
+                'trend_quality': {'score': 0.0, 'data': None},
+                'breadth': {'score': 0.0, 'data': None},
+                'options_confirm': {'score': 0.0, 'data': None},
+                'raw_features': {},
+                'normalized_features': {},
+                'weight_allocation': {},
+            },
+            'weights': effective_weights,
+            'weight_preset': self.weight_preset,
+            'price_rs_alpha': self.price_rs_alpha,
         }
-        
-        logger.info(
-            f"✅ {symbol} 综合评分: {total_score:.2f}, "
-            f"门槛通过: {thresholds['all_pass']}"
-        )
-        
-        return result
-    
+
     def batch_calculate_scores(
         self,
         symbols: List[str],
         benchmark: str = 'SPY',
-        holdings_map: Dict[str, List[Dict]] = None,
-        mc_map: Dict[str, Dict] = None
-    ) -> List[Dict]:
-        """
-        批量计算多个 ETF 的综合评分
-        
-        Args:
-            symbols: ETF 代码列表
-            benchmark: 基准指数
-            holdings_map: {symbol: [holdings_data]} 映射
-            mc_map: {symbol: mc_data} 映射
-        
-        Returns:
-            List[dict]: 评分结果列表，按总分降序排列
-        """
+        holdings_map: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+        mc_map: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
         holdings_map = holdings_map or {}
         mc_map = mc_map or {}
-        
-        results = []
-        
+        symbols = [str(s).upper() for s in symbols if str(s).strip()]
+        if not symbols:
+            return []
+
+        iv_map = self._fetch_iv_map(symbols)
+        effective_weights = self._resolve_effective_weights()
+
+        symbol_payloads: Dict[str, Dict[str, Any]] = {}
         for symbol in symbols:
             try:
-                result = self.calculate_composite_score(
+                symbol_payloads[symbol] = self._build_symbol_modules(
                     symbol=symbol,
                     benchmark=benchmark,
                     holdings_data=holdings_map.get(symbol),
-                    mc_data=mc_map.get(symbol)
+                    mc_data=mc_map.get(symbol),
+                    iv_data=iv_map.get(symbol),
                 )
-                results.append(result)
-            except Exception as e:
-                logger.error(f"计算 {symbol} 评分失败: {e}")
+            except Exception as exc:
+                logger.error(f"计算 {symbol} 原始特征失败: {exc}")
                 continue
-        
-        # 按总分降序排列
-        results.sort(key=lambda x: x['total_score'], reverse=True)
-        
+
+        # 横截面标准化
+        rel_mom_map = {
+            symbol: payload['raw_features'].get('rel_mom_raw')
+            for symbol, payload in symbol_payloads.items()
+        }
+        trend_map = {
+            symbol: payload['raw_features'].get('trend_quality_raw')
+            for symbol, payload in symbol_payloads.items()
+        }
+        breadth_map = {
+            symbol: payload['raw_features'].get('breadth_raw')
+            for symbol, payload in symbol_payloads.items()
+        }
+        options_map = {
+            symbol: payload['raw_features'].get('options_raw')
+            for symbol, payload in symbol_payloads.items()
+        }
+
+        rel_mom_norm = rank_percentile_normalize(rel_mom_map, winsorize_limits=self.winsorize_limits)
+        trend_norm = rank_percentile_normalize(trend_map, winsorize_limits=self.winsorize_limits)
+        breadth_norm = rank_percentile_normalize(breadth_map, winsorize_limits=self.winsorize_limits)
+        options_norm = rank_percentile_normalize(options_map, winsorize_limits=self.winsorize_limits)
+
+        results: List[Dict[str, Any]] = []
+        for symbol, payload in symbol_payloads.items():
+            modules = payload['modules']
+            raw_features = payload['raw_features']
+            normalized_features = {
+                'rel_mom_normalized': rel_mom_norm.get(symbol),
+                'trend_quality_normalized': trend_norm.get(symbol),
+                'breadth_normalized': breadth_norm.get(symbol),
+                'options_normalized': options_norm.get(symbol),
+            }
+            normalized_by_module = {
+                'rel_mom': normalized_features['rel_mom_normalized'],
+                'trend_quality': normalized_features['trend_quality_normalized'],
+                'breadth': normalized_features['breadth_normalized'],
+                'options_confirm': normalized_features['options_normalized'],
+            }
+
+            total_score, redistributed_weights = self._compose_total_score(
+                normalized_features=normalized_by_module,
+                base_weights=effective_weights,
+            )
+
+            # 模块 score 用 normalized 分数（保持旧字段结构兼容）
+            rel_mom_module = dict(modules['rel_mom'])
+            trend_module = dict(modules['trend_quality'])
+            breadth_module = dict(modules['breadth'])
+            options_module = dict(modules['options_confirm'])
+
+            rel_mom_module['score'] = round(rel_mom_norm.get(symbol) or 0.0, 2)
+            trend_module['score'] = round(trend_norm.get(symbol) or 0.0, 2)
+            breadth_module['score'] = round(breadth_norm.get(symbol) or 0.0, 2)
+            options_module['score'] = round(options_norm.get(symbol) or 0.0, 2)
+
+            thresholds = self.check_thresholds(
+                rel_mom_data=rel_mom_module,
+                trend_data=trend_module,
+                breadth_data=breadth_module,
+            )
+
+            result = {
+                'symbol': symbol,
+                'total_score': total_score,
+                'thresholds_pass': thresholds['all_pass'],
+                'thresholds': thresholds['details'],
+                'breakdown': {
+                    'rel_mom': rel_mom_module,
+                    'trend_quality': trend_module,
+                    'breadth': breadth_module,
+                    'options_confirm': options_module,
+                    'raw_features': raw_features,
+                    'normalized_features': normalized_features,
+                    'weight_allocation': {
+                        key: round(value, 6) for key, value in redistributed_weights.items()
+                    },
+                },
+                'weights': effective_weights,
+                'weight_preset': self.weight_preset,
+                'price_rs_alpha': self.price_rs_alpha,
+            }
+            results.append(result)
+
+        results.sort(key=lambda item: item.get('total_score', 0.0), reverse=True)
         return results
-    
+
     def get_top_etfs(
         self,
         symbols: List[str],
         top_n: int = 5,
-        must_pass_thresholds: bool = True
-    ) -> List[Dict]:
-        """
-        获取评分最高的 Top N ETF
-        
-        Args:
-            symbols: ETF 代码列表
-            top_n: 返回数量
-            must_pass_thresholds: 是否必须通过门槛
-        
-        Returns:
-            List[dict]: Top N ETF 评分结果
-        """
+        must_pass_thresholds: bool = True,
+    ) -> List[Dict[str, Any]]:
         all_results = self.batch_calculate_scores(symbols)
-        
         if must_pass_thresholds:
-            # 只保留通过门槛的
-            filtered = [r for r in all_results if r['thresholds_pass']]
-        else:
-            filtered = all_results
-        
-        return filtered[:top_n]
+            all_results = [item for item in all_results if item.get('thresholds_pass')]
+        return all_results[:top_n]
 
 
-# 便捷函数
 def create_etf_calculator(ibkr, futu=None) -> ETFScoreCalculator:
-    """
-    创建 ETF 评分计算器的工厂函数
-    
-    Args:
-        ibkr: IBKR 数据对象（需提供价格相关接口）
-        futu: FutuConnector 实例（可选）
-    
-    Returns:
-        ETFScoreCalculator 实例
-    """
     return ETFScoreCalculator(ibkr=ibkr, futu=futu)
 
 
-# 板块 ETF 列表
 SECTOR_ETFS = [
     'XLK',   # Technology
     'XLF',   # Financials
@@ -611,7 +823,7 @@ SECTOR_ETFS = [
     'XLC',   # Communication Services
 ]
 
-# 行业 ETF 列表
+
 INDUSTRY_ETFS = [
     'SOXX',  # Semiconductors
     'IGV',   # Software

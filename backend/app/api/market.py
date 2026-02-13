@@ -9,17 +9,18 @@ Market Data API Endpoints
 - 数据同步
 """
 
-from fastapi import APIRouter, Query, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
-from datetime import datetime, date as date_type
+from datetime import datetime, date as date_type, timedelta, timezone
 import asyncio
 import logging
 import math
 
+from sqlalchemy import and_, func
 from sqlalchemy.orm import Session
 
-from app.models import get_db, MarketRegimeSnapshot, PriceHistory
+from app.models import ETF, ETFHolding, IVData, MarketRegimeSnapshot, PriceHistory, get_db
 
 try:
     import numpy as np
@@ -63,6 +64,7 @@ class RegimeResponse(BaseModel):
     status: str = Field(..., description="状态码: A/B/C/UNKNOWN")
     regime_text: Optional[str] = Field(None, description="环境描述: RISK_ON/NEUTRAL/RISK_OFF")
     spy: Optional[SPYData] = None
+    qqq: Optional[SPYData] = None
     vix: Optional[float] = None
     indicators: Optional[RegimeIndicators] = None
     error: Optional[str] = None
@@ -112,6 +114,18 @@ class SyncResponse(BaseModel):
     success_count: int
 
 
+class PriceFreshnessRequest(BaseModel):
+    """价格新鲜度请求"""
+    symbols: List[str]
+
+
+class PriceFreshnessResponse(BaseModel):
+    """价格新鲜度响应"""
+    stale: List[str]
+    fresh: List[str]
+    sync_date: str
+
+
 # ==================== ETF 名称映射 ====================
 
 ETF_NAMES = {
@@ -152,6 +166,56 @@ def _normalize_symbol_list(symbols: List[str]) -> List[str]:
     return deduped
 
 
+def _expand_with_related_etfs(db: Session, symbols: List[str]) -> List[str]:
+    """
+    将股票代码扩展为“股票 + 最新持仓中关联的行业/板块 ETF”。
+
+    说明:
+    - 仅依赖 ETFHolding 最新快照，不依赖 Stock.sector 字段，避免详情页遗漏关联 ETF。
+    - 返回顺序保持“原 symbols 在前，新增 ETF 依附其后”。
+    """
+    normalized = _normalize_symbol_list(symbols)
+    if not normalized:
+        return []
+
+    latest_dates = db.query(
+        ETFHolding.etf_symbol.label("etf_symbol"),
+        func.max(ETFHolding.data_date).label("max_date"),
+    ).group_by(ETFHolding.etf_symbol).subquery()
+
+    rows = (
+        db.query(ETFHolding.ticker, ETFHolding.etf_symbol)
+        .join(
+            latest_dates,
+            and_(
+                ETFHolding.etf_symbol == latest_dates.c.etf_symbol,
+                ETFHolding.data_date == latest_dates.c.max_date,
+            ),
+        )
+        .join(ETF, ETF.symbol == ETFHolding.etf_symbol)
+        .filter(
+            ETF.type.in_(["sector", "industry"]),
+            ETFHolding.ticker.in_(normalized),
+        )
+        .all()
+    )
+
+    related: Dict[str, set] = {}
+    for ticker, etf_symbol in rows:
+        stock_symbol = str(ticker or "").strip().upper()
+        etf = str(etf_symbol or "").strip().upper()
+        if not stock_symbol or not etf:
+            continue
+        related.setdefault(stock_symbol, set()).add(etf)
+
+    expanded = list(normalized)
+    for stock_symbol in normalized:
+        for etf in sorted(related.get(stock_symbol, set())):
+            if etf not in expanded:
+                expanded.append(etf)
+    return expanded
+
+
 def _to_finite_float(value: Any) -> Optional[float]:
     if value is None:
         return None
@@ -170,6 +234,13 @@ def _to_non_negative_int(value: Any) -> Optional[int]:
         return None
     if parsed < 0:
         return 0
+    return int(parsed)
+
+
+def _to_int_or_none(value: Any) -> Optional[int]:
+    parsed = _to_finite_float(value)
+    if parsed is None:
+        return None
     return int(parsed)
 
 
@@ -195,6 +266,47 @@ def _normalize_price_row_date(value: Any) -> Optional[date_type]:
             except ValueError:
                 return None
     return None
+
+
+def _normalize_datetime(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value
+        try:
+            return value.astimezone(timezone.utc).replace(tzinfo=None)
+        except Exception:
+            return value.replace(tzinfo=None)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        normalized = text.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed
+        try:
+            return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        except Exception:
+            return parsed.replace(tzinfo=None)
+    return None
+
+
+def _get_beijing_sync_boundary() -> Dict[str, Any]:
+    now_utc = datetime.utcnow()
+    now_beijing = now_utc + timedelta(hours=8)
+    boundary_beijing = now_beijing.replace(hour=8, minute=0, second=0, microsecond=0)
+    if now_beijing < boundary_beijing:
+        boundary_beijing -= timedelta(days=1)
+    return {
+        "boundary_utc": boundary_beijing - timedelta(hours=8),
+        "boundary_date": boundary_beijing.date(),
+        "sync_date": boundary_beijing.date().isoformat(),
+    }
 
 
 def _upsert_price_history(
@@ -259,8 +371,10 @@ async def _persist_price_history_for_symbol(
     db: Session,
     orchestrator: Any,
     symbol: str,
+    df: Any = None,
 ) -> Dict[str, int]:
-    df = await orchestrator.get_ohlcv_data(symbol, "1 Y")
+    if df is None:
+        df = await orchestrator.get_ohlcv_data(symbol, "1 Y")
     if df is None or getattr(df, "empty", True):
         raise ValueError(f"empty price history for {symbol}")
 
@@ -286,6 +400,153 @@ async def _persist_price_history_for_symbol(
     stats = _upsert_price_history(db, symbol, parsed_rows, source="ibkr")
     db.commit()
     return stats
+
+
+def _upsert_iv_data_for_symbol(
+    db: Session,
+    symbol: str,
+    payload: Dict[str, Any],
+    snapshot_date: date_type,
+    source: str = "futu",
+) -> str:
+    normalized_symbol = symbol.upper().strip()
+    if not normalized_symbol:
+        raise ValueError("symbol is required")
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be dict")
+
+    mapped_payload = {
+        "iv7": _to_finite_float(payload.get("iv7")),
+        "iv30": _to_finite_float(payload.get("iv30")),
+        "iv60": _to_finite_float(payload.get("iv60")),
+        "iv90": _to_finite_float(payload.get("iv90")),
+        "total_oi": _to_int_or_none(payload.get("total_oi")),
+        "delta_oi_1d": _to_int_or_none(payload.get("delta_oi_1d")),
+        "oi_bucket_0_7": _to_int_or_none(payload.get("oi_bucket_0_7")),
+        "oi_bucket_8_30": _to_int_or_none(payload.get("oi_bucket_8_30")),
+        "oi_bucket_31_90": _to_int_or_none(payload.get("oi_bucket_31_90")),
+        "call_oi_bucket_0_7": _to_int_or_none(payload.get("call_oi_bucket_0_7")),
+        "call_oi_bucket_8_30": _to_int_or_none(payload.get("call_oi_bucket_8_30")),
+        "call_oi_bucket_31_90": _to_int_or_none(payload.get("call_oi_bucket_31_90")),
+        "put_oi_bucket_0_7": _to_int_or_none(payload.get("put_oi_bucket_0_7")),
+        "put_oi_bucket_8_30": _to_int_or_none(payload.get("put_oi_bucket_8_30")),
+        "put_oi_bucket_31_90": _to_int_or_none(payload.get("put_oi_bucket_31_90")),
+        "net_delta_oi_0_7": _to_int_or_none(payload.get("net_delta_oi_0_7")),
+        "net_delta_oi_8_30": _to_int_or_none(payload.get("net_delta_oi_8_30")),
+        "net_delta_oi_31_90": _to_int_or_none(payload.get("net_delta_oi_31_90")),
+        "call_delta_oi_0_7": _to_int_or_none(payload.get("call_delta_oi_0_7")),
+        "call_delta_oi_8_30": _to_int_or_none(payload.get("call_delta_oi_8_30")),
+        "call_delta_oi_31_90": _to_int_or_none(payload.get("call_delta_oi_31_90")),
+        "put_delta_oi_0_7": _to_int_or_none(payload.get("put_delta_oi_0_7")),
+        "put_delta_oi_8_30": _to_int_or_none(payload.get("put_delta_oi_8_30")),
+        "put_delta_oi_31_90": _to_int_or_none(payload.get("put_delta_oi_31_90")),
+    }
+
+    existing = (
+        db.query(IVData)
+        .filter(
+            IVData.symbol == normalized_symbol,
+            IVData.date == snapshot_date,
+        )
+        .first()
+    )
+
+    if existing is not None:
+        for field, field_value in mapped_payload.items():
+            setattr(existing, field, field_value)
+        existing.source = source
+        existing.created_at = datetime.utcnow()
+        return "updated"
+
+    db.add(
+        IVData(
+            symbol=normalized_symbol,
+            date=snapshot_date,
+            source=source,
+            **mapped_payload,
+        )
+    )
+    return "inserted"
+
+
+def _compute_sma(closes: List[float], period: int) -> Optional[float]:
+    if len(closes) < period:
+        return None
+    return sum(closes[-period:]) / period
+
+
+def _compute_return_20d(closes: List[float]) -> Optional[float]:
+    if len(closes) < 21:
+        return None
+    base = closes[-21]
+    if base == 0:
+        return None
+    return (closes[-1] - base) / base
+
+
+def _compute_sma20_slope(closes: List[float]) -> Optional[float]:
+    if len(closes) < 25:
+        return None
+    sma_today = sum(closes[-20:]) / 20
+    sma_5d_ago = sum(closes[-25:-5]) / 20
+    return (sma_today - sma_5d_ago) / 5
+
+
+def _build_symbol_snapshot_from_price_history(
+    db: Session,
+    symbol: str,
+) -> Optional[Dict[str, Any]]:
+    normalized_symbol = symbol.upper().strip()
+    if not normalized_symbol:
+        return None
+
+    rows_desc = (
+        db.query(PriceHistory)
+        .filter(
+            PriceHistory.symbol == normalized_symbol,
+            PriceHistory.close.isnot(None),
+        )
+        .order_by(PriceHistory.date.desc())
+        .limit(130)
+        .all()
+    )
+    if not rows_desc:
+        return None
+
+    closes = [float(row.close) for row in reversed(rows_desc) if row.close is not None]
+    if len(closes) < 50:
+        return None
+
+    latest = rows_desc[0]
+    latest_price = float(latest.close) if latest.close is not None else None
+    sma20 = _compute_sma(closes, 20)
+    sma50 = _compute_sma(closes, 50)
+    return_20d = _compute_return_20d(closes)
+    sma20_slope = _compute_sma20_slope(closes)
+
+    if (
+        latest_price is None
+        or sma20 is None
+        or sma50 is None
+        or return_20d is None
+        or sma20_slope is None
+    ):
+        return None
+
+    dist_to_sma20 = (latest_price - sma20) / sma20 if sma20 != 0 else None
+    dist_to_sma50 = (latest_price - sma50) / sma50 if sma50 != 0 else None
+
+    return {
+        "symbol": normalized_symbol,
+        "price": latest_price,
+        "sma20": float(sma20),
+        "sma50": float(sma50),
+        "dist_to_sma20": dist_to_sma20,
+        "dist_to_sma50": dist_to_sma50,
+        "return_20d": float(return_20d),
+        "sma20_slope": float(sma20_slope),
+        "date": latest.date.isoformat() if latest.date is not None else None,
+    }
 
 
 # ==================== API Endpoints ====================
@@ -320,6 +581,12 @@ async def get_market_regime(
     def normalize_regime_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         normalized_payload = normalize_json(payload if isinstance(payload, dict) else {})
 
+        def normalize_index_payload(index_payload: Any) -> Optional[Dict[str, Any]]:
+            required_index_fields = {"price", "sma20", "sma50", "return_20d", "sma20_slope"}
+            if not isinstance(index_payload, dict) or not required_index_fields.issubset(index_payload):
+                return None
+            return index_payload
+
         indicators = normalized_payload.get("indicators")
         required_indicator_fields = {
             "price_above_sma20",
@@ -332,15 +599,14 @@ async def get_market_regime(
         if not isinstance(indicators, dict) or not required_indicator_fields.issubset(indicators):
             indicators = None
 
-        spy = normalized_payload.get("spy")
-        required_spy_fields = {"price", "sma20", "sma50", "return_20d", "sma20_slope"}
-        if not isinstance(spy, dict) or not required_spy_fields.issubset(spy):
-            spy = None
+        spy = normalize_index_payload(normalized_payload.get("spy"))
+        qqq = normalize_index_payload(normalized_payload.get("qqq"))
 
         return {
             "status": normalized_payload.get("status") or "UNKNOWN",
             "regime_text": normalized_payload.get("regime_text"),
             "spy": spy,
+            "qqq": qqq,
             "vix": normalized_payload.get("vix"),
             "indicators": indicators,
             "error": normalized_payload.get("error"),
@@ -351,10 +617,43 @@ async def get_market_regime(
             "status": snapshot.status,
             "regime_text": normalize_json(snapshot.regime_text),
             "spy": normalize_json(snapshot.spy),
+            "qqq": None,
             "vix": normalize_json(snapshot.vix),
             "indicators": normalize_json(snapshot.indicators),
             "error": normalize_json(snapshot.error)
         })
+
+    async def fetch_symbol_snapshot(
+        orchestrator: Any,
+        symbol: str,
+        db_session: Session,
+    ) -> Optional[Dict[str, Any]]:
+        normalized_symbol = symbol.upper().strip()
+        if not normalized_symbol:
+            return None
+
+        try:
+            payload = await asyncio.wait_for(
+                orchestrator.get_spy_data(normalized_symbol, sma_periods=[20, 50]),
+                timeout=REGIME_SUMMARY_TIMEOUT_SECONDS,
+            )
+            normalized = normalize_regime_payload(
+                {"status": "UNKNOWN", normalized_symbol.lower(): payload}
+            ).get(normalized_symbol.lower())
+            if isinstance(normalized, dict):
+                return normalized
+        except Exception as exc:
+            logger.warning(f"获取 {normalized_symbol} 快照失败: {exc}")
+
+        fallback_payload = _build_symbol_snapshot_from_price_history(db_session, normalized_symbol)
+        normalized_fallback = normalize_regime_payload(
+            {"status": "UNKNOWN", normalized_symbol.lower(): fallback_payload}
+        ).get(normalized_symbol.lower())
+        if isinstance(normalized_fallback, dict):
+            logger.info(f"使用本地 PriceHistory 降级构建 {normalized_symbol} 快照")
+            return normalized_fallback
+
+        return None
 
     try:
         today = date_type.today()
@@ -364,11 +663,26 @@ async def get_market_regime(
                 MarketRegimeSnapshot.snapshot_date == today
             ).first()
             if existing_snapshot:
-                return serialize_snapshot(existing_snapshot)
+                payload = serialize_snapshot(existing_snapshot)
+                try:
+                    from app.services.orchestrator import get_orchestrator
+
+                    orchestrator = get_orchestrator()
+                    broker_status = orchestrator.get_broker_status()
+                    if not broker_status.get('ibkr', {}).get('is_connected', False):
+                        try:
+                            await orchestrator.connect_ibkr()
+                        except Exception as exc:
+                            logger.warning(f"IBKR 连接失败，无法补充 QQQ 快照: {exc}")
+                    payload["qqq"] = await fetch_symbol_snapshot(orchestrator, "QQQ", db)
+                except Exception as exc:
+                    logger.warning(f"补充 QQQ 快照失败: {exc}")
+                return payload
             return {
                 "status": "NO_DATA",
                 "regime_text": None,
                 "spy": None,
+                "qqq": None,
                 "vix": None,
                 "indicators": None,
                 "error": "No snapshot for today"
@@ -402,6 +716,7 @@ async def get_market_regime(
                 "status": "ERROR",
                 "regime_text": None,
                 "spy": None,
+                "qqq": None,
                 "vix": None,
                 "indicators": None,
                 "error": f"Regime calculation timeout ({REGIME_SUMMARY_TIMEOUT_SECONDS}s)",
@@ -413,12 +728,15 @@ async def get_market_regime(
                 "status": "ERROR",
                 "regime_text": None,
                 "spy": None,
+                "qqq": None,
                 "vix": None,
                 "indicators": None,
                 "error": "Regime data unavailable"
             }
 
         normalized_result = normalize_regime_payload(result)
+        if normalized_result.get("qqq") is None:
+            normalized_result["qqq"] = await fetch_symbol_snapshot(orchestrator, "QQQ", db)
 
         # 写入/更新当日快照
         snapshot = db.query(MarketRegimeSnapshot).filter(
@@ -438,7 +756,12 @@ async def get_market_regime(
         else:
             snapshot = MarketRegimeSnapshot(
                 snapshot_date=today,
-                **payload
+                status=payload["status"],
+                regime_text=payload["regime_text"],
+                spy=payload["spy"],
+                vix=payload["vix"],
+                indicators=payload["indicators"],
+                error=payload["error"],
             )
             db.add(snapshot)
 
@@ -453,6 +776,7 @@ async def get_market_regime(
             "status": "ERROR",
             "regime_text": None,
             "spy": None,
+            "qqq": None,
             "vix": None,
             "indicators": None,
             "error": str(e)
@@ -538,10 +862,75 @@ async def get_market_snapshot():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/price-freshness", response_model=PriceFreshnessResponse)
+async def check_price_freshness(
+    request: PriceFreshnessRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    检查给定 symbol 的价格数据是否满足当前“北京时间 08:00 日切窗口”。
+
+    判定规则:
+    - 若最新 PriceHistory.date >= boundary_date，则视为 fresh
+    - 否则若最新 PriceHistory.created_at >= boundary_utc，则视为 fresh
+    - 其余视为 stale
+    """
+    try:
+        normalized_symbols = _normalize_symbol_list(request.symbols)
+        boundary = _get_beijing_sync_boundary()
+        boundary_utc: datetime = boundary["boundary_utc"]
+        boundary_date: date_type = boundary["boundary_date"]
+        sync_date: str = boundary["sync_date"]
+
+        if not normalized_symbols:
+            return PriceFreshnessResponse(stale=[], fresh=[], sync_date=sync_date)
+
+        latest_rows = (
+            db.query(
+                PriceHistory.symbol,
+                func.max(PriceHistory.date).label("latest_date"),
+                func.max(PriceHistory.created_at).label("latest_created_at"),
+            )
+            .filter(
+                PriceHistory.symbol.in_(normalized_symbols),
+                PriceHistory.source == "ibkr",
+            )
+            .group_by(PriceHistory.symbol)
+            .all()
+        )
+
+        fresh_symbol_set = set()
+        for row in latest_rows:
+            symbol_name = str(row.symbol or "").strip().upper()
+            if not symbol_name:
+                continue
+            latest_date = _normalize_price_row_date(row.latest_date)
+            latest_created_at = _normalize_datetime(row.latest_created_at)
+
+            has_fresh_by_date = latest_date is not None and latest_date >= boundary_date
+            has_fresh_by_time = (
+                latest_created_at is not None and latest_created_at >= boundary_utc
+            )
+            if has_fresh_by_date or has_fresh_by_time:
+                fresh_symbol_set.add(symbol_name)
+
+        fresh_symbols = [symbol for symbol in normalized_symbols if symbol in fresh_symbol_set]
+        stale_symbols = [symbol for symbol in normalized_symbols if symbol not in fresh_symbol_set]
+
+        return PriceFreshnessResponse(
+            stale=stale_symbols,
+            fresh=fresh_symbols,
+            sync_date=sync_date,
+        )
+
+    except Exception as e:
+        logger.error(f"价格新鲜度检查失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/sync", response_model=SyncResponse)
 async def sync_market_data(
     request: SyncRequest,
-    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
     """
@@ -559,38 +948,62 @@ async def sync_market_data(
         orchestrator = get_orchestrator()
         
         normalized_symbols = _normalize_symbol_list(request.symbols)
+        expanded_price_symbols = (
+            _expand_with_related_etfs(db, normalized_symbols)
+            if request.sync_type in ['price', 'all'] and normalized_symbols
+            else normalized_symbols
+        )
+        if expanded_price_symbols != normalized_symbols:
+            logger.info(
+                "market_sync_symbols_expanded requested=%s expanded=%s",
+                normalized_symbols,
+                expanded_price_symbols,
+            )
 
         results = {
             'status': 'success',
             'synced': [],
             'failed': [],
-            'total': len(normalized_symbols),
+            'total': len(expanded_price_symbols if request.sync_type in ['price', 'all'] else normalized_symbols),
             'success_count': 0
         }
         
         # 同步价格数据
-        if request.sync_type in ['price', 'all'] and normalized_symbols:
+        if request.sync_type in ['price', 'all'] and expanded_price_symbols:
             broker_status = orchestrator.get_broker_status()
             if not broker_status.get('ibkr', {}).get('is_connected', False):
                 await orchestrator.connect_ibkr()
             
-            price_result = await orchestrator.sync_price_data(normalized_symbols)
+            price_result = await orchestrator.sync_price_data(expanded_price_symbols)
             raw_synced = _normalize_symbol_list(price_result.get('synced', []))
             raw_failed = _normalize_symbol_list(price_result.get('failed', []))
+            skipped_fresh = set(_normalize_symbol_list(price_result.get('skipped_fresh', [])))
+            raw_frames = (
+                price_result.get('price_frames', {})
+                if isinstance(price_result.get('price_frames', {}), dict)
+                else {}
+            )
             results['failed'].extend(raw_failed)
 
             for symbol in raw_synced:
                 if symbol in raw_failed:
                     continue
+                if symbol in skipped_fresh and raw_frames.get(symbol) is None:
+                    # 会话去重命中且无新增数据时，复用已有 DB 结果，不重复拉取。
+                    results['synced'].append(symbol)
+                    continue
                 try:
-                    await _persist_price_history_for_symbol(db, orchestrator, symbol)
+                    await _persist_price_history_for_symbol(
+                        db,
+                        orchestrator,
+                        symbol,
+                        df=raw_frames.get(symbol),
+                    )
                     results['synced'].append(symbol)
                 except Exception as persist_error:
                     db.rollback()
                     logger.warning(
-                        "market_sync_persist_failed",
-                        symbol=symbol,
-                        error=str(persist_error),
+                        f"market_sync_persist_failed symbol={symbol} error={persist_error}",
                     )
                     if symbol not in results['failed']:
                         results['failed'].append(symbol)
@@ -602,10 +1015,60 @@ async def sync_market_data(
                 await orchestrator.connect_futu()
             
             iv_result = await orchestrator.sync_iv_data(normalized_symbols)
-            # IV 同步结果合并
-            for symbol in iv_result.get('synced', []):
-                if symbol not in results['synced']:
-                    results['synced'].append(symbol)
+            iv_synced = _normalize_symbol_list(iv_result.get('synced', []))
+            iv_failed = _normalize_symbol_list(iv_result.get('failed', []))
+            iv_payload = iv_result.get('data', {}) if isinstance(iv_result.get('data', {}), dict) else {}
+
+            results['failed'].extend(iv_failed)
+
+            iv_success_candidates: List[str] = []
+            snapshot_date = date_type.today()
+            for symbol in iv_synced:
+                payload = iv_payload.get(symbol)
+                if not isinstance(payload, dict):
+                    if symbol not in results['failed']:
+                        results['failed'].append(symbol)
+                    logger.warning(
+                        "market_sync_iv_payload_missing symbol=%s",
+                        symbol,
+                    )
+                    continue
+
+                try:
+                    _upsert_iv_data_for_symbol(
+                        db=db,
+                        symbol=symbol,
+                        payload=payload,
+                        snapshot_date=snapshot_date,
+                        source="futu",
+                    )
+                    iv_success_candidates.append(symbol)
+                except Exception as persist_error:
+                    db.rollback()
+                    logger.warning(
+                        "market_sync_iv_persist_failed symbol=%s error=%s",
+                        symbol,
+                        persist_error,
+                    )
+                    if symbol not in results['failed']:
+                        results['failed'].append(symbol)
+
+            if iv_success_candidates:
+                try:
+                    db.commit()
+                    for symbol in iv_success_candidates:
+                        if symbol not in results['synced']:
+                            results['synced'].append(symbol)
+                except Exception as commit_error:
+                    db.rollback()
+                    logger.warning(
+                        "market_sync_iv_commit_failed symbols=%s error=%s",
+                        iv_success_candidates,
+                        commit_error,
+                    )
+                    for symbol in iv_success_candidates:
+                        if symbol not in results['failed']:
+                            results['failed'].append(symbol)
         
         # 去重，保持顺序
         results['synced'] = _normalize_symbol_list(results['synced'])
@@ -695,7 +1158,7 @@ async def get_spy_data():
 
 
 @router.get("/symbol/{symbol}")
-async def get_market_symbol_data(symbol: str):
+async def get_market_symbol_data(symbol: str, db: Session = Depends(get_db)):
     """
     获取任意指数/ETF 数据（如 SPY、QQQ）
     """
@@ -704,13 +1167,22 @@ async def get_market_symbol_data(symbol: str):
         if not normalized_symbol:
             raise HTTPException(status_code=400, detail="symbol is required")
 
+        # 优先读取本地 PriceHistory 快照，避免页面访问触发 IBKR 自动连接。
+        local_snapshot = _build_symbol_snapshot_from_price_history(db, normalized_symbol)
+        if isinstance(local_snapshot, dict):
+            return local_snapshot
+
         from app.services.orchestrator import get_orchestrator
 
         orchestrator = get_orchestrator()
-
         broker_status = orchestrator.get_broker_status()
         if not broker_status.get('ibkr', {}).get('is_connected', False):
-            await orchestrator.connect_ibkr()
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"{normalized_symbol} local snapshot unavailable and IBKR is not connected"
+                ),
+            )
 
         symbol_data = await orchestrator.get_spy_data(normalized_symbol)
         if symbol_data is None:

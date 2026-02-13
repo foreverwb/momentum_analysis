@@ -5,7 +5,7 @@ interface ETFImportModalProps {
   isOpen: boolean;
   onClose: () => void;
   etfSymbol: string;
-  onImport: (data: ETFImportData) => void;
+  onImport: (data: ETFImportData) => Promise<void> | void;
 }
 
 export interface ETFImportData {
@@ -22,8 +22,9 @@ export function ETFImportModal({
   const [source, setSource] = useState<'finviz' | 'marketchameleon'>('finviz');
   const [jsonData, setJsonData] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [isImporting, setIsImporting] = useState(false);
 
-  const handleImport = () => {
+  const handleImport = async () => {
     try {
       if (jsonData.trim()) {
         JSON.parse(jsonData);
@@ -32,14 +33,19 @@ export function ETFImportModal({
         return;
       }
       setError(null);
-      onImport({ source, jsonData });
+      setIsImporting(true);
+      await onImport({ source, jsonData });
       handleClose();
-    } catch {
-      setError('JSON 格式错误，请检查输入');
+    } catch (e) {
+      const fallback = '导入失败，请检查 JSON 数据或校验规则';
+      setError(e instanceof Error && e.message ? e.message : fallback);
+    } finally {
+      setIsImporting(false);
     }
   };
 
   const handleClose = () => {
+    if (isImporting) return;
     setJsonData('');
     setError(null);
     setSource('finviz');
@@ -63,12 +69,16 @@ export function ETFImportModal({
       footer={
         <button
           onClick={handleImport}
-          className="w-full py-3 text-sm font-medium rounded-[var(--radius-md)] bg-[var(--accent-blue)] text-white hover:bg-blue-600 transition-colors flex items-center justify-center gap-2"
+          disabled={isImporting}
+          className={`
+            w-full py-3 text-sm font-medium rounded-[var(--radius-md)] text-white transition-colors flex items-center justify-center gap-2
+            ${isImporting ? 'bg-blue-400 cursor-not-allowed' : 'bg-[var(--accent-blue)] hover:bg-blue-600'}
+          `}
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <path d="M12 19V5M5 12l7 7 7-7" />
           </svg>
-          导入数据
+          {isImporting ? '导入中...' : '导入数据'}
         </button>
       }
     >
@@ -78,6 +88,7 @@ export function ETFImportModal({
         <div className="grid grid-cols-2 gap-3">
           <button
             onClick={() => setSource('finviz')}
+            disabled={isImporting}
             className={`
               p-4 text-left rounded-[var(--radius-md)] cursor-pointer transition-all
               ${source === 'finviz'
@@ -90,6 +101,7 @@ export function ETFImportModal({
           </button>
           <button
             onClick={() => setSource('marketchameleon')}
+            disabled={isImporting}
             className={`
               p-4 text-left rounded-[var(--radius-md)] cursor-pointer transition-all
               ${source === 'marketchameleon'
@@ -112,6 +124,7 @@ export function ETFImportModal({
             setJsonData(e.target.value);
             setError(null);
           }}
+          disabled={isImporting}
           placeholder="粘贴 JSON 数据"
           className={`
             w-full h-48 px-4 py-3 bg-[var(--bg-secondary)] border rounded-[var(--radius-md)] text-sm font-mono resize-none

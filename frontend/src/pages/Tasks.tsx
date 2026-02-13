@@ -1,18 +1,41 @@
 import React, { useState } from 'react';
-import { useTasks, useCreateTask, useDeleteTask } from '../hooks/useData';
+import { useNavigate, useParams } from 'react-router-dom';
+import { useTasks, useTask, useCreateTask, useUpdateTask, useDeleteTask } from '../hooks/useData';
 import { TaskCard, TaskDetail } from '../components/task';
 import { LoadingState, ErrorMessage, Button } from '../components/common';
 import { CreateTaskModal } from '../components/modal';
 import type { CreateTaskData } from '../components/modal';
-import type { Task } from '../types';
+import type { Task, CreateTaskInput } from '../types';
+
+function buildMomentumDetailRoute(symbol: string): string {
+  const normalized = symbol.trim().toUpperCase();
+  return `/momentum/${encodeURIComponent(normalized).replace(/\./g, '%2E')}`;
+}
 
 export function Tasks() {
+  const navigate = useNavigate();
+  const { taskId: routeTaskId } = useParams<{ taskId?: string }>();
+  const normalizedTaskId = routeTaskId?.trim() || null;
+  const isDetailRoute = Boolean(normalizedTaskId);
+
   const { data: tasks, isLoading, error, refetch } = useTasks();
+  const {
+    data: routeTask,
+    isLoading: isTaskLoading,
+    error: taskError,
+    refetch: refetchTask,
+  } = useTask(normalizedTaskId);
   const createTaskMutation = useCreateTask();
+  const updateTaskMutation = useUpdateTask();
   const deleteTaskMutation = useDeleteTask();
   
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
-  const [selectedTask, setSelectedTask] = useState<Task | null>(null);
+  const [renamingTaskId, setRenamingTaskId] = useState<number | null>(null);
+
+  const selectedTask =
+    isDetailRoute
+      ? routeTask || tasks?.find((task) => String(task.id) === normalizedTaskId) || null
+      : null;
 
   const handleCreateTask = () => {
     setIsCreateModalOpen(true);
@@ -23,6 +46,7 @@ export function Tasks() {
       title: taskData.title,
       type: taskData.type,
       baseIndex: taskData.baseIndex,
+      baseIndices: taskData.baseIndices,
       sector: taskData.sector ?? undefined,
       etfs: taskData.etfs,
     });
@@ -30,11 +54,12 @@ export function Tasks() {
   };
 
   const handleViewTask = (task: Task) => {
-    setSelectedTask(task);
+    if (!task?.id) return;
+    navigate(`/tracking/${task.id}`);
   };
 
   const handleBackToList = () => {
-    setSelectedTask(null);
+    navigate('/tracking');
   };
 
   const handleDeleteTask = async (task: Task) => {
@@ -49,6 +74,70 @@ export function Tasks() {
     }
   };
 
+  const handleRenameTask = async (task: Task, newTitle: string) => {
+    if (!task?.id) return;
+    const normalizedTitle = newTitle.trim();
+    if (!normalizedTitle) {
+      alert('任务名称不能为空');
+      return;
+    }
+
+    const payload: CreateTaskInput = {
+      title: normalizedTitle,
+      type: task.type,
+      baseIndex:
+        task.baseIndices && task.baseIndices.length > 0
+          ? task.baseIndices.join(',')
+          : task.baseIndex,
+      sector: task.sector,
+      etfs: task.etfs || [],
+    };
+
+    setRenamingTaskId(task.id);
+    try {
+      const updatedTask = await updateTaskMutation.mutateAsync({
+        id: task.id,
+        input: payload,
+      });
+      if (normalizedTaskId && String(updatedTask.id) === normalizedTaskId) {
+        void refetchTask();
+      }
+    } catch (err) {
+      console.error('修改任务名称失败', err);
+      alert('修改名称失败，请稍后重试');
+      throw err;
+    } finally {
+      setRenamingTaskId(null);
+    }
+  };
+
+  if (isDetailRoute) {
+    if (isTaskLoading && !selectedTask) {
+      return <LoadingState message="正在加载监控任务详情..." />;
+    }
+
+    if (taskError) {
+      return <ErrorMessage error={taskError} onRetry={refetchTask} />;
+    }
+
+    if (!selectedTask) {
+      return (
+        <ErrorMessage
+          error={new Error(`未找到任务 ID: ${normalizedTaskId}`)}
+          onRetry={refetchTask}
+        />
+      );
+    }
+
+    return (
+      <TaskDetail
+        task={selectedTask}
+        onBack={handleBackToList}
+        onViewStockDetail={(symbol) => navigate(buildMomentumDetailRoute(symbol))}
+      />
+    );
+  }
+
   if (isLoading) {
     return <LoadingState message="正在加载监控任务..." />;
   }
@@ -57,12 +146,6 @@ export function Tasks() {
     return <ErrorMessage error={error} onRetry={refetch} />;
   }
 
-  // Show task detail view
-  if (selectedTask) {
-    return <TaskDetail task={selectedTask} onBack={handleBackToList} />;
-  }
-
-  // Show task list view
   return (
     <div>
       {/* Page Header */}
@@ -89,6 +172,8 @@ export function Tasks() {
               key={task.id}
               task={task}
               onClick={() => handleViewTask(task)}
+              onRename={(newTitle) => handleRenameTask(task, newTitle)}
+              renaming={renamingTaskId === task.id}
               onDelete={() => handleDeleteTask(task)}
               deleting={deleteTaskMutation.isPending}
             />

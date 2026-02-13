@@ -13,12 +13,13 @@ from fastapi import APIRouter, HTTPException, File, UploadFile, Form, Depends, Q
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 from datetime import datetime, date
 import json
 import csv
 import io
 import logging
+import re
 
 from app.models import (
     get_db, ETF, ETFHolding, HoldingsUploadLog, ImportedData,
@@ -28,6 +29,8 @@ from app.models import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/import", tags=["Import"])
+_COVERAGE_PATTERN = re.compile(r"^(top|weight)(\d+)$", re.IGNORECASE)
+_SHARE_CLASS_ALIAS_PATTERN = re.compile(r"^([A-Z][A-Z0-9]{0,5})[.-]([A-Z])$")
 
 
 def _upsert_imported_data(db: Session, source: str, items: List[Dict[str, Any]]) -> int:
@@ -40,14 +43,19 @@ def _upsert_imported_data(db: Session, source: str, items: List[Dict[str, Any]])
         symbol = item.get("symbol") if isinstance(item, dict) else None
         if not symbol:
             continue
-        symbol = symbol.upper()
+        normalized_symbol = _normalize_symbol(symbol)
+        if not normalized_symbol:
+            continue
+        symbol = _canonical_symbol_key(normalized_symbol)
+        payload = dict(item) if isinstance(item, dict) else {}
+        payload["symbol"] = symbol
         existing = db.query(ImportedData).filter(
             ImportedData.symbol == symbol,
             ImportedData.date == today,
             ImportedData.source == source
         ).first()
         if existing:
-            existing.data = item
+            existing.data = payload
             existing.date = today
             # 复用记录时同步刷新导入时间，便于前端按“北京时间 08:00 起算”判定最新状态
             existing.created_at = datetime.utcnow()
@@ -56,7 +64,7 @@ def _upsert_imported_data(db: Session, source: str, items: List[Dict[str, Any]])
                 symbol=symbol,
                 date=today,
                 source=source,
-                data=item
+                data=payload
             ))
         count += 1
     return count
@@ -67,7 +75,7 @@ def _upsert_imported_data(db: Session, source: str, items: List[Dict[str, Any]])
 class FinvizImportRequest(BaseModel):
     """Finviz 数据导入请求"""
     etf_symbol: str = Field(..., description="关联的 ETF 代码")
-    coverage: str = Field("top20", description="覆盖范围: top10/top15/top20/top25/top30")
+    coverage: str = Field("top20", description="覆盖范围: top10/top15/top20/top25/top30/weight60..weight85/all")
     data: List[Dict[str, Any]] = Field(..., description="Finviz 数据列表")
 
 
@@ -80,10 +88,13 @@ class FinvizImportResponse(BaseModel):
     breadth_metrics: Dict[str, Any]
     validation: Dict[str, Any]
     statistics: Optional[Dict[str, Any]] = None
+    symbol_alias_mappings: Optional[List[str]] = None
 
 
 class MCImportRequest(BaseModel):
     """MarketChameleon 数据导入请求"""
+    etf_symbol: Optional[str] = Field(None, description="关联 ETF 代码（可选，提供时会进行覆盖范围校验）")
+    coverage: Optional[str] = Field(None, description="覆盖范围（可选，提供时会进行覆盖范围校验，支持 all）")
     symbols: List[str] = Field(default=[], description="股票代码列表（可选，自动从数据中提取）")
     data: List[Dict[str, Any]] = Field(..., description="MarketChameleon 数据列表")
 
@@ -130,6 +141,218 @@ class HoldingsUploadResponse(BaseModel):
 
 
 # ==================== 辅助函数 ====================
+
+def _normalize_symbol(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().upper()
+    if not text:
+        return None
+    return text if is_valid_ticker(text) else None
+
+
+def _canonical_symbol_key(symbol: str) -> str:
+    normalized = str(symbol or "").strip().upper()
+    matched = _SHARE_CLASS_ALIAS_PATTERN.match(normalized)
+    if not matched:
+        return normalized
+    return f"{matched.group(1)}.{matched.group(2)}"
+
+
+def _parse_coverage_selection(coverage: str) -> Tuple[str, int]:
+    text = str(coverage or "").strip().lower()
+    if text == "all":
+        return "all", 0
+    matched = _COVERAGE_PATTERN.match(text)
+    if not matched:
+        raise HTTPException(
+            status_code=400,
+            detail=f"覆盖范围格式无效: {coverage}。支持示例: top10, top20, weight70, weight85, all"
+        )
+    coverage_type = matched.group(1).lower()
+    coverage_value = int(matched.group(2))
+    if coverage_value <= 0:
+        raise HTTPException(status_code=400, detail=f"覆盖范围值必须大于 0: {coverage}")
+    return coverage_type, coverage_value
+
+
+def _pick_coverage_symbols(
+    db: Session,
+    etf_symbol: str,
+    coverage: str
+) -> List[str]:
+    normalized_etf = str(etf_symbol or "").strip().upper()
+    if not normalized_etf:
+        raise HTTPException(status_code=400, detail="etf_symbol 不能为空")
+
+    coverage_type, coverage_value = _parse_coverage_selection(coverage)
+
+    latest_date = db.query(func.max(ETFHolding.data_date)).filter(
+        ETFHolding.etf_symbol == normalized_etf
+    ).scalar()
+    if not latest_date:
+        raise HTTPException(
+            status_code=400,
+            detail=f"ETF {normalized_etf} 没有可用持仓数据，无法校验覆盖范围 {coverage}"
+        )
+
+    holdings = db.query(ETFHolding).filter(
+        ETFHolding.etf_symbol == normalized_etf,
+        ETFHolding.data_date == latest_date
+    ).order_by(ETFHolding.weight.desc()).all()
+
+    if not holdings:
+        raise HTTPException(
+            status_code=400,
+            detail=f"ETF {normalized_etf} 在 {latest_date} 没有持仓记录，无法校验覆盖范围 {coverage}"
+        )
+
+    if coverage_type == "all":
+        selected = holdings
+    elif coverage_type == "top":
+        selected = holdings[:coverage_value]
+    else:
+        selected = []
+        total_weight = 0.0
+        for holding in holdings:
+            selected.append(holding)
+            total_weight += float(holding.weight or 0.0)
+            if total_weight >= coverage_value:
+                break
+
+    symbols: List[str] = []
+    seen = set()
+    for holding in selected:
+        ticker = _normalize_symbol(getattr(holding, "ticker", None))
+        if not ticker or ticker in seen:
+            continue
+        seen.add(ticker)
+        symbols.append(ticker)
+
+    if not symbols:
+        raise HTTPException(
+            status_code=400,
+            detail=f"覆盖范围 {coverage} 未匹配到任何标的，无法导入"
+        )
+    return symbols
+
+
+def _extract_import_symbols(
+    rows: List[Dict[str, Any]],
+    symbol_keys: List[str]
+) -> List[str]:
+    ordered_keys: List[str] = []
+    for key in symbol_keys + ["Ticker", "ticker", "Symbol", "symbol"]:
+        if key not in ordered_keys:
+            ordered_keys.append(key)
+
+    symbols: List[str] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        symbol_value = None
+        for key in ordered_keys:
+            if key in item:
+                symbol_value = item.get(key)
+                break
+        symbol = _normalize_symbol(symbol_value)
+        if symbol:
+            symbols.append(symbol)
+    return symbols
+
+
+def _format_symbol_list(symbols: List[str], max_items: int = 12) -> str:
+    if len(symbols) <= max_items:
+        return ", ".join(symbols)
+    return f"{', '.join(symbols[:max_items])} 等{len(symbols)}只"
+
+
+def _assert_import_symbols_match(
+    source_label: str,
+    etf_symbol: str,
+    coverage: str,
+    expected_symbols: List[str],
+    imported_symbols: List[str],
+    required_field_hint: str
+) -> Tuple[List[str], List[str]]:
+    if not imported_symbols:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{source_label} 导入数据未识别到标的代码，请确认包含字段: {required_field_hint}"
+        )
+
+    expected = list(dict.fromkeys(expected_symbols))
+    expected_by_key: Dict[str, str] = {}
+    for symbol in expected:
+        key = _canonical_symbol_key(symbol)
+        if key and key not in expected_by_key:
+            expected_by_key[key] = symbol
+
+    resolved_imported: List[str] = []
+    alias_mappings: List[str] = []
+    for symbol in imported_symbols:
+        key = _canonical_symbol_key(symbol)
+        resolved = expected_by_key.get(key, key)
+        resolved_imported.append(resolved)
+        raw_normalized = str(symbol).strip().upper()
+        if raw_normalized and resolved and raw_normalized != resolved:
+            alias_mappings.append(f"{raw_normalized} -> {resolved}")
+
+    imported_counts: Dict[str, int] = {}
+    for symbol in resolved_imported:
+        imported_counts[symbol] = imported_counts.get(symbol, 0) + 1
+    duplicate_symbols = sorted([symbol for symbol, count in imported_counts.items() if count > 1])
+    if duplicate_symbols:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{source_label} 导入数据存在重复标的: {', '.join(duplicate_symbols)}"
+        )
+
+    imported = list(dict.fromkeys(resolved_imported))
+    expected_set = set(expected)
+    imported_set = set(imported)
+    missing = [symbol for symbol in expected if symbol not in imported_set]
+    extra = [symbol for symbol in imported if symbol not in expected_set]
+
+    if len(imported) != len(expected) or missing or extra:
+        mismatch_details: List[str] = []
+        if len(imported) != len(expected):
+            mismatch_details.append(f"数量不一致（期望 {len(expected)}，实际 {len(imported)}）")
+        if missing:
+            mismatch_details.append(f"缺少: {_format_symbol_list(missing)}")
+        if extra:
+            mismatch_details.append(f"多出: {_format_symbol_list(extra)}")
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{source_label} 覆盖范围校验失败（{etf_symbol} / {coverage}）："
+                + "；".join(mismatch_details)
+            )
+        )
+
+    deduped_alias_mappings = list(dict.fromkeys(alias_mappings))
+    return imported, deduped_alias_mappings
+
+
+def _validate_import_rows_by_coverage(
+    db: Session,
+    source_label: str,
+    etf_symbol: str,
+    coverage: str,
+    rows: List[Dict[str, Any]],
+    symbol_keys: List[str],
+    required_field_hint: str
+) -> Tuple[List[str], List[str]]:
+    expected_symbols = _pick_coverage_symbols(db, etf_symbol, coverage)
+    imported_symbols = _extract_import_symbols(rows, symbol_keys)
+    return _assert_import_symbols_match(
+        source_label=source_label,
+        etf_symbol=etf_symbol,
+        coverage=coverage,
+        expected_symbols=expected_symbols,
+        imported_symbols=imported_symbols,
+        required_field_hint=required_field_hint
+    )
 
 def parse_xlsx_holdings(file_content: bytes) -> List[Dict[str, Any]]:
     """
@@ -508,14 +731,33 @@ async def import_finviz_data(
     """
     try:
         from app.services.orchestrator import get_orchestrator
-        
+
+        normalized_etf_symbol = str(request.etf_symbol or "").strip().upper()
+        normalized_coverage = str(request.coverage or "top20").strip().lower()
+        _, alias_mappings = _validate_import_rows_by_coverage(
+            db=db,
+            source_label="Finviz",
+            etf_symbol=normalized_etf_symbol,
+            coverage=normalized_coverage,
+            rows=request.data,
+            symbol_keys=["Ticker", "ticker", "Symbol", "symbol"],
+            required_field_hint="Ticker"
+        )
+        if alias_mappings:
+            logger.info(
+                "finviz_symbol_alias_mapped etf=%s coverage=%s mappings=%s",
+                normalized_etf_symbol,
+                normalized_coverage,
+                alias_mappings,
+            )
+
         orchestrator = get_orchestrator()
-        
+
         # 处理导入
         result = await orchestrator.process_finviz_import(
-            etf_symbol=request.etf_symbol,
+            etf_symbol=normalized_etf_symbol,
             data=request.data,
-            coverage=request.coverage
+            coverage=normalized_coverage
         )
         
         if 'error' in result:
@@ -533,12 +775,13 @@ async def import_finviz_data(
 
         return {
             'status': 'success',
-            'etf_symbol': request.etf_symbol,
-            'coverage': request.coverage,
+            'etf_symbol': normalized_etf_symbol,
+            'coverage': normalized_coverage,
             'records_imported': result.get('records_count', 0),
             'breadth_metrics': result.get('breadth_metrics', {}),
             'validation': result.get('validation', {}),
-            'statistics': result.get('statistics')
+            'statistics': result.get('statistics'),
+            'symbol_alias_mappings': alias_mappings or None
         }
         
     except HTTPException:
@@ -584,9 +827,34 @@ async def import_mc_data(
     """
     try:
         from app.services.orchestrator import get_orchestrator
-        
+
+        normalized_etf_symbol = str(request.etf_symbol or "").strip().upper()
+        normalized_coverage = str(request.coverage or "").strip().lower()
+        if normalized_etf_symbol or normalized_coverage:
+            if not normalized_etf_symbol or not normalized_coverage:
+                raise HTTPException(
+                    status_code=400,
+                    detail="MarketChameleon 导入校验需要同时提供 etf_symbol 和 coverage"
+                )
+            _, alias_mappings = _validate_import_rows_by_coverage(
+                db=db,
+                source_label="MarketChameleon",
+                etf_symbol=normalized_etf_symbol,
+                coverage=normalized_coverage,
+                rows=request.data,
+                symbol_keys=["symbol", "Symbol", "Ticker", "ticker"],
+                required_field_hint="symbol"
+            )
+            if alias_mappings:
+                logger.info(
+                    "mc_symbol_alias_mapped etf=%s coverage=%s mappings=%s",
+                    normalized_etf_symbol,
+                    normalized_coverage,
+                    alias_mappings,
+                )
+
         orchestrator = get_orchestrator()
-        
+
         # 处理导入
         result = await orchestrator.process_mc_import(request.data)
         
@@ -653,15 +921,34 @@ async def import_finviz_csv(
                         row[key] = float(value) if value else None
                     except (ValueError, AttributeError):
                         row[key] = None
-        
+
+        normalized_etf_symbol = str(etf_symbol or "").strip().upper()
+        normalized_coverage = str(coverage or "top20").strip().lower()
+        _, alias_mappings = _validate_import_rows_by_coverage(
+            db=db,
+            source_label="Finviz",
+            etf_symbol=normalized_etf_symbol,
+            coverage=normalized_coverage,
+            rows=data,
+            symbol_keys=["Ticker", "ticker", "Symbol", "symbol"],
+            required_field_hint="Ticker"
+        )
+        if alias_mappings:
+            logger.info(
+                "finviz_csv_symbol_alias_mapped etf=%s coverage=%s mappings=%s",
+                normalized_etf_symbol,
+                normalized_coverage,
+                alias_mappings,
+            )
+
         # 处理导入
         from app.services.orchestrator import get_orchestrator
-        
+
         orchestrator = get_orchestrator()
         result = await orchestrator.process_finviz_import(
-            etf_symbol=etf_symbol,
+            etf_symbol=normalized_etf_symbol,
             data=data,
-            coverage=coverage
+            coverage=normalized_coverage
         )
         
         parsed_items = result.get('parsed_data') or []
@@ -675,13 +962,16 @@ async def import_finviz_csv(
 
         return {
             'status': 'success',
-            'etf_symbol': etf_symbol,
-            'coverage': coverage,
+            'etf_symbol': normalized_etf_symbol,
+            'coverage': normalized_coverage,
             'records_imported': result.get('records_count', 0),
             'breadth_metrics': result.get('breadth_metrics', {}),
-            'validation': result.get('validation', {})
+            'validation': result.get('validation', {}),
+            'symbol_alias_mappings': alias_mappings or None
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"CSV 导入失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -690,6 +980,8 @@ async def import_finviz_csv(
 @router.post("/marketchameleon/csv")
 async def import_mc_csv(
     file: UploadFile = File(...),
+    etf_symbol: Optional[str] = Form(None),
+    coverage: Optional[str] = Form(None),
     db: Session = Depends(get_db)
 ):
     """
@@ -724,7 +1016,32 @@ async def import_mc_csv(
                         row[key] = float(value) if value else None
                     except (ValueError, AttributeError):
                         row[key] = None
-        
+
+        normalized_etf_symbol = str(etf_symbol or "").strip().upper()
+        normalized_coverage = str(coverage or "").strip().lower()
+        if normalized_etf_symbol or normalized_coverage:
+            if not normalized_etf_symbol or not normalized_coverage:
+                raise HTTPException(
+                    status_code=400,
+                    detail="MarketChameleon CSV 导入校验需要同时提供 etf_symbol 和 coverage"
+                )
+            _, alias_mappings = _validate_import_rows_by_coverage(
+                db=db,
+                source_label="MarketChameleon",
+                etf_symbol=normalized_etf_symbol,
+                coverage=normalized_coverage,
+                rows=data,
+                symbol_keys=["symbol", "Symbol", "Ticker", "ticker"],
+                required_field_hint="symbol"
+            )
+            if alias_mappings:
+                logger.info(
+                    "mc_csv_symbol_alias_mapped etf=%s coverage=%s mappings=%s",
+                    normalized_etf_symbol,
+                    normalized_coverage,
+                    alias_mappings,
+                )
+
         # 处理导入
         from app.services.orchestrator import get_orchestrator
         
@@ -747,6 +1064,8 @@ async def import_mc_csv(
             'data': result.get('processed_data')
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"MarketChameleon CSV 导入失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))

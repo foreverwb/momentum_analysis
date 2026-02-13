@@ -19,6 +19,7 @@ RET_OK: Any = None
 
 
 class _DummyOptionType:
+    ALL = "ALL"
     CALL = "CALL"
     PUT = "PUT"
 

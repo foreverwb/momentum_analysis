@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisco
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from typing import List, Optional, Dict, Any, Tuple
-from datetime import datetime, date as date_type
+from datetime import datetime, date as date_type, timedelta, timezone
 import asyncio
 import json
 
@@ -16,7 +16,7 @@ import pandas as pd
 
 from app.models import get_db, Task, ETF, ETFHolding, Stock, PriceHistory, ImportedData, IVData, ScoreSnapshot
 from app.schemas import TaskCreate
-from app.api.etfs import refresh_etf_data
+from app.api.etfs import refresh_etf_data, ETF_REFRESH_COOLDOWN_MINUTES
 from app.api.series_utils import build_metric_series, build_sma20_comparison_series
 
 router = APIRouter()
@@ -24,19 +24,24 @@ router = APIRouter()
 
 def format_task_response(task: Task) -> dict:
     """格式化任务响应数据"""
+    base_indices = _normalize_base_indices(task.base_index)
     return {
         "id": task.id,
         "title": task.title,
         "type": task.type,
-        "baseIndex": task.base_index,
+        "baseIndex": ",".join(base_indices),
+        "baseIndices": base_indices,
         "sector": task.sector,
         "etfs": task.etfs or [],
-        "createdAt": task.created_at.strftime("%Y-%m-%d") if task.created_at else None
+        "createdAt": task.created_at.strftime("%Y-%m-%d") if task.created_at else None,
+        "updatedAt": task.updated_at.isoformat() if task.updated_at else None,
     }
 
 
 def _parse_coverage(coverage: str) -> Tuple[str, int]:
     coverage = (coverage or "top20").lower()
+    if coverage == "all":
+        return "all", 0
     if coverage.startswith("top"):
         return "top", int(coverage.replace("top", "") or 20)
     if coverage.startswith("weight"):
@@ -59,6 +64,62 @@ def _normalize_symbols(raw: Any) -> List[str]:
             pass
         return [item.strip().upper() for item in text.split(',') if item.strip()]
     return []
+
+
+def _normalize_base_indices(raw: Any) -> List[str]:
+    symbols = _normalize_symbols(raw)
+    deduped: List[str] = []
+    for symbol in symbols:
+        if symbol and symbol not in deduped:
+            deduped.append(symbol)
+    return deduped or ["SPY"]
+
+
+def _coerce_datetime(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _format_beijing_time(value: Optional[datetime]) -> Optional[str]:
+    dt = _coerce_datetime(value)
+    if dt is None:
+        return None
+    return (dt + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
+
+
+def _task_monitored_etf_symbols(task: Task) -> List[str]:
+    """
+    返回任务详情页应监控的 ETF 列表。
+    - 默认使用 task.etfs
+    - drilldown 任务额外包含 task.sector（若存在），并置于首位
+    """
+    symbols = _normalize_symbols(task.etfs)
+    if str(task.type or "").lower() == "drilldown" and task.sector:
+        sector_symbol = str(task.sector).strip().upper()
+        if sector_symbol:
+            symbols = [sector_symbol] + symbols
+
+    deduped: List[str] = []
+    for symbol in symbols:
+        if symbol and symbol not in deduped:
+            deduped.append(symbol)
+    return deduped
 
 
 def _load_price_history(db: Session, symbol: str, min_rows: int = 60) -> Optional[pd.DataFrame]:
@@ -175,6 +236,7 @@ async def get_task_trend_comparison(
     task_id: int,
     period: int = Query(20, description="对比周期（交易日）: 5/20/63"),
     metric: str = Query("relative", description="指标: relative/sma20/return20d/score"),
+    label_tz: str = Query("market", description="日期标签时区: market/beijing"),
     db: Session = Depends(get_db)
 ):
     """
@@ -188,6 +250,9 @@ async def get_task_trend_comparison(
         raise HTTPException(status_code=400, detail="period must be one of 5, 20, 63")
     if metric not in ("relative", "sma20", "return20d", "score"):
         raise HTTPException(status_code=400, detail="metric must be one of relative, sma20, return20d, score")
+    normalized_label_tz = (label_tz or "market").strip().lower()
+    if normalized_label_tz not in ("market", "beijing"):
+        raise HTTPException(status_code=400, detail="label_tz must be one of market, beijing")
 
     task = db.query(Task).filter(Task.id == task_id).first()
     if not task:
@@ -196,8 +261,7 @@ async def get_task_trend_comparison(
     symbols = _normalize_symbols(task.etfs)
     if task.sector:
         symbols.append(task.sector.upper())
-    if task.base_index:
-        symbols.append(task.base_index.upper())
+    symbols.extend(_normalize_base_indices(task.base_index))
     symbols.extend(["SPY", "QQQ"])
 
     # 去重并保持顺序
@@ -207,11 +271,17 @@ async def get_task_trend_comparison(
             deduped.append(symbol)
 
     if metric == "sma20":
-        dates, price_series, sma20_series, deviation_series = build_sma20_comparison_series(db, deduped, period)
+        dates, price_series, sma20_series, deviation_series = build_sma20_comparison_series(
+            db,
+            deduped,
+            period,
+            label_tz=normalized_label_tz,
+        )
         return {
             "task_id": task.id,
             "period": period,
             "metric": metric,
+            "label_tz": normalized_label_tz,
             "symbols": deduped,
             "dates": dates,
             # 保持向后兼容：series 默认返回可读性更高的偏离度(%)
@@ -221,12 +291,19 @@ async def get_task_trend_comparison(
             "deviation_series": deviation_series,
         }
 
-    dates, series = build_metric_series(db, deduped, period, metric=metric)
+    dates, series = build_metric_series(
+        db,
+        deduped,
+        period,
+        metric=metric,
+        label_tz=normalized_label_tz,
+    )
 
     return {
         "task_id": task.id,
         "period": period,
         "metric": metric,
+        "label_tz": normalized_label_tz,
         "symbols": deduped,
         "dates": dates,
         "series": series
@@ -238,10 +315,11 @@ async def create_task(task: TaskCreate, db: Session = Depends(get_db)):
     """
     创建新的监控任务
     """
+    base_indices = _normalize_base_indices(task.baseIndex)
     new_task = Task(
         title=task.title,
         type=task.type.value,
-        base_index=task.baseIndex,
+        base_index=",".join(base_indices),
         sector=task.sector,
         etfs=task.etfs,
         created_at=datetime.utcnow()
@@ -268,9 +346,10 @@ async def update_task(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     
+    base_indices = _normalize_base_indices(task_update.baseIndex)
     task.title = task_update.title
     task.type = task_update.type.value
-    task.base_index = task_update.baseIndex
+    task.base_index = ",".join(base_indices)
     task.sector = task_update.sector
     task.etfs = task_update.etfs
     
@@ -328,7 +407,12 @@ async def refresh_all_etfs(task_id: int, db: Session = Depends(get_db)):
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    if not task.etfs:
+    etf_symbols = _task_monitored_etf_symbols(task)
+
+    if not etf_symbols:
+        refresh_finished_at = datetime.utcnow()
+        task.updated_at = refresh_finished_at
+        db.commit()
         return {
             "status": "success",
             "task_id": task_id,
@@ -336,17 +420,19 @@ async def refresh_all_etfs(task_id: int, db: Session = Depends(get_db)):
             "completed": 0,
             "failed": 0,
             "results": [],
-            "message": "任务中没有 ETF"
+            "message": "任务中没有 ETF",
+            "updated_at": refresh_finished_at.isoformat(),
         }
 
     results = []
     failed_count = 0
 
-    for symbol in task.etfs:
+    for symbol in etf_symbols:
         try:
             result = await refresh_etf_data(symbol, db)
             results.append(result)
-            if result.get("status") != "success":
+            result_status = str(result.get("status") or "").lower()
+            if result_status not in {"success", "snapshot"}:
                 failed_count += 1
         except Exception as e:
             failed_count += 1
@@ -359,14 +445,52 @@ async def refresh_all_etfs(task_id: int, db: Session = Depends(get_db)):
                 "data_sources": {}
             })
 
+    refresh_finished_at = datetime.utcnow()
+    task.updated_at = refresh_finished_at
+    db.commit()
+
+    snapshot_results = [
+        item for item in results
+        if str(item.get("status") or "").lower() == "snapshot"
+    ]
+    all_snapshot = len(snapshot_results) == len(results) and len(results) > 0
+
+    next_refresh_candidates: List[datetime] = []
+    cooldown_minutes = ETF_REFRESH_COOLDOWN_MINUTES
+    for item in snapshot_results:
+        parsed = _coerce_datetime(item.get("next_refresh_at"))
+        if parsed is not None:
+            next_refresh_candidates.append(parsed)
+        gate = item.get("refresh_gate")
+        if isinstance(gate, dict):
+            gate_minutes = gate.get("cooldown_minutes")
+            if isinstance(gate_minutes, (int, float)):
+                cooldown_minutes = int(gate_minutes)
+    next_refresh_at = min(next_refresh_candidates) if next_refresh_candidates else None
+    next_refresh_label = _format_beijing_time(next_refresh_at)
+    if all_snapshot:
+        summary_message = (
+            f"已跳过刷新：IBKR 与 Futu 数据在 {cooldown_minutes} 分钟内已更新（{len(snapshot_results)} 个 ETF）。"
+            + (f"下次可刷新时间（北京时间）{next_refresh_label}" if next_refresh_label else "")
+        )
+        summary_status = "snapshot"
+        completed_count = len(etf_symbols)
+        failed_count = 0
+    else:
+        summary_message = f"刷新完成: {len(etf_symbols) - failed_count} 成功, {failed_count} 失败"
+        summary_status = "success" if failed_count == 0 else "partial_success"
+        completed_count = len(etf_symbols) - failed_count
+
     return {
-        "status": "success" if failed_count == 0 else "partial_success",
+        "status": summary_status,
         "task_id": task_id,
-        "total": len(task.etfs),
-        "completed": len(task.etfs) - failed_count,
+        "total": len(etf_symbols),
+        "completed": completed_count,
         "failed": failed_count,
         "results": results,
-        "message": f"刷新完成: {len(task.etfs) - failed_count} 成功, {failed_count} 失败"
+        "message": summary_message,
+        "next_refresh_at": next_refresh_at.isoformat() if next_refresh_at else None,
+        "updated_at": refresh_finished_at.isoformat(),
     }
 
 
@@ -444,7 +568,9 @@ async def refresh_momentum_stocks(
         ).order_by(ETFHolding.weight.desc()).all()
 
         filtered: List[ETFHolding] = []
-        if coverage_type == "top":
+        if coverage_type == "all":
+            filtered = holdings
+        elif coverage_type == "top":
             filtered = holdings[:coverage_value]
         else:
             total = 0.0
@@ -616,7 +742,7 @@ async def websocket_refresh_stream(websocket: WebSocket, task_id: int, db: Sessi
             await websocket.close()
             return
 
-        etf_symbols = task.etfs or []
+        etf_symbols = _task_monitored_etf_symbols(task)
 
         # 如果没有 ETF，直接完成
         if not etf_symbols:

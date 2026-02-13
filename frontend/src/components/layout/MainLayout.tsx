@@ -1,33 +1,40 @@
-import React, { useState, useEffect } from 'react';
+import React, { useMemo, useEffect } from 'react';
+import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { Header } from './Header';
 import type { NavSection } from '../../types';
 
-interface MainLayoutProps {
-  children: (activeSection: NavSection) => React.ReactNode;
-}
-
 const STORAGE_KEY = 'momentum-radar-active-section';
+const SECTION_PATH_MAP: Record<NavSection, string> = {
+  core: '/core',
+  sector: '/sector',
+  industry: '/industry',
+  momentum: '/momentum',
+  tracking: '/tracking',
+};
 
-// 验证是否为有效的导航项
-function isValidSection(section: string): section is NavSection {
-  return ['core', 'sector', 'industry', 'momentum', 'tracking'].includes(section);
+function normalizePath(pathname: string): string {
+  const normalized = pathname.replace(/\/+$/, '');
+  return normalized || '/';
 }
 
-export function MainLayout({ children }: MainLayoutProps) {
-  // 从 localStorage 读取初始状态
-  const [activeSection, setActiveSection] = useState<NavSection>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved && isValidSection(saved)) {
-        return saved;
-      }
-    } catch (e) {
-      console.warn('Failed to read from localStorage:', e);
-    }
-    return 'sector'; // 默认页面
-  });
+function getSectionFromPath(pathname: string): NavSection {
+  const path = normalizePath(pathname);
+  if (path === '/core' || path.startsWith('/core/')) return 'core';
+  if (path === '/industry' || path.startsWith('/industry/')) return 'industry';
+  if (path === '/momentum' || path.startsWith('/momentum/')) return 'momentum';
+  if (path === '/tracking' || path.startsWith('/tracking/')) return 'tracking';
+  if (path === '/tasks' || path.startsWith('/tasks/')) return 'tracking';
+  return 'sector';
+}
 
-  // 当 activeSection 变化时保存到 localStorage
+export function MainLayout() {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const activeSection = useMemo(
+    () => getSectionFromPath(location.pathname),
+    [location.pathname]
+  );
+
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_KEY, activeSection);
@@ -37,8 +44,10 @@ export function MainLayout({ children }: MainLayoutProps) {
   }, [activeSection]);
 
   const handleNavigate = (section: NavSection) => {
-    console.log('Navigating to:', section);
-    setActiveSection(section);
+    const targetPath = SECTION_PATH_MAP[section];
+    if (normalizePath(location.pathname) !== targetPath) {
+      navigate(targetPath);
+    }
   };
 
   return (
@@ -46,7 +55,7 @@ export function MainLayout({ children }: MainLayoutProps) {
       <div className="p-4 max-w-[1600px] mx-auto">
         <Header activeSection={activeSection} onNavigate={handleNavigate} />
         <main>
-          {children(activeSection)}
+          <Outlet />
         </main>
       </div>
     </div>

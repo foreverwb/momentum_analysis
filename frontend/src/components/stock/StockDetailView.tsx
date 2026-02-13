@@ -32,8 +32,9 @@ const stockTrendCache = new Map<string, {
 const toTrendCacheKey = (
   symbol: string,
   period: '5d' | '20d' | '63d',
-  metric: 'relative' | 'sma20' | 'return20d' | 'score'
-): string => `${symbol.trim().toUpperCase()}|${period}|${metric}`;
+  metric: 'relative' | 'sma20' | 'return20d' | 'score',
+  labelTimezone: 'market' | 'beijing'
+): string => `${symbol.trim().toUpperCase()}|${period}|${metric}|${labelTimezone}`;
 
 const hasValidSeriesValues = (values: Array<number | null> | undefined): boolean => {
   return Array.isArray(values) && values.some((value) => typeof value === 'number' && Number.isFinite(value));
@@ -61,6 +62,7 @@ export function StockDetailView({ symbol, onBack }: StockDetailViewProps) {
   const [activeTab, setActiveTab] = useState<'overview' | 'breakdown' | 'options'>('overview');
   const [trendPeriod, setTrendPeriod] = useState<'5d' | '20d' | '63d'>('20d');
   const [trendMetric, setTrendMetric] = useState<'relative' | 'sma20' | 'return20d' | 'score'>('relative');
+  const [trendLabelTimezone, setTrendLabelTimezone] = useState<'market' | 'beijing'>('beijing');
   const [trendDates, setTrendDates] = useState<string[]>([]);
   const [trendSeries, setTrendSeries] = useState<RelativeTrendSeries[]>([]);
   const [trendPriceSeries, setTrendPriceSeries] = useState<RelativeTrendSeries[]>([]);
@@ -69,7 +71,7 @@ export function StockDetailView({ symbol, onBack }: StockDetailViewProps) {
   const [trendError, setTrendError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!symbol || symbol.trim() === '') {
+    if (!symbol || symbol.trim() === '' || !stock) {
       return;
     }
     let cancelled = false;
@@ -80,37 +82,52 @@ export function StockDetailView({ symbol, onBack }: StockDetailViewProps) {
       SPY: '#94a3b8',
       QQQ: '#64748b',
     };
-    const cacheKey = toTrendCacheKey(normalizedSymbol, trendPeriod, trendMetric);
+    const cacheKey = toTrendCacheKey(normalizedSymbol, trendPeriod, trendMetric, trendLabelTimezone);
     const cached = stockTrendCache.get(cacheKey);
-    if (cached && Date.now() - cached.cachedAt < STOCK_TREND_CACHE_TTL_MS) {
-      setTrendDates(cached.dates);
-      setTrendSeries(cached.series);
-      setTrendPriceSeries(cached.priceSeries);
-      setTrendSma20Series(cached.sma20Series);
-      setTrendError(null);
-      setIsTrendLoading(false);
-      return;
-    }
     if (cached) {
       setTrendDates(cached.dates);
       setTrendSeries(cached.series);
       setTrendPriceSeries(cached.priceSeries);
       setTrendSma20Series(cached.sma20Series);
+      setTrendError(null);
     }
 
-    setIsTrendLoading(true);
+    const hasFreshCache = Boolean(cached && Date.now() - cached.cachedAt < STOCK_TREND_CACHE_TTL_MS);
+    setIsTrendLoading(!hasFreshCache);
     setTrendError(null);
 
     const loadTrendData = async () => {
       try {
-        const marketSymbols = ['SPY', 'QQQ'];
-        const warmupPromise =
-          trendMetric === 'score'
-            ? null
-            : api.syncPriceDataForSymbols(marketSymbols).catch((syncError) => {
-                console.warn('Market trend data warmup failed:', syncError);
-                return null;
-              });
+        const sectorEtfs = (
+          Array.isArray(stock.sectorEtfs) && stock.sectorEtfs.length > 0
+            ? stock.sectorEtfs
+            : stock.sector
+              ? [stock.sector]
+              : []
+        ).map((s) => s.toUpperCase());
+        const industryEtfs = (stock.industryEtfs || []).map((s) => s.toUpperCase());
+        const marketSymbols = Array.from(
+          new Set([normalizedSymbol, ...sectorEtfs, ...industryEtfs, 'SPY', 'QQQ'])
+        );
+        if (trendMetric !== 'score' && marketSymbols.length > 0) {
+          try {
+            await api.ensureDailyPriceSync(marketSymbols);
+          } catch (dailySyncError) {
+            console.warn('Daily price sync check failed:', dailySyncError);
+          }
+          if (cancelled) return;
+        }
+        let warmupPromise: Promise<unknown> | null = null;
+        const ensureWarmup = (): Promise<unknown> => {
+          if (warmupPromise) {
+            return warmupPromise;
+          }
+          warmupPromise = api.syncPriceDataForSymbols(marketSymbols).catch((syncError) => {
+            console.warn('Market trend data warmup failed:', syncError);
+            return null;
+          });
+          return warmupPromise;
+        };
 
         const withSeriesColors = (
           seriesItems: Array<{ symbol: string; values: Array<number | null> }> | undefined
@@ -145,15 +162,24 @@ export function StockDetailView({ symbol, onBack }: StockDetailViewProps) {
           });
         };
 
-        let resp = await api.getStockTrendComparison(normalizedSymbol, periodValue, trendMetric);
+        let resp = await api.getStockTrendComparison(
+          normalizedSymbol,
+          periodValue,
+          trendMetric,
+          trendLabelTimezone,
+        );
         if (
           trendMetric !== 'score' &&
-          !hasRequiredSymbolsData(resp.price_series || resp.series, marketSymbols) &&
-          warmupPromise
+          !hasRequiredSymbolsData(resp.price_series || resp.series, marketSymbols)
         ) {
-          await warmupPromise;
+          await ensureWarmup();
           if (cancelled) return;
-          resp = await api.getStockTrendComparison(normalizedSymbol, periodValue, trendMetric);
+          resp = await api.getStockTrendComparison(
+            normalizedSymbol,
+            periodValue,
+            trendMetric,
+            trendLabelTimezone,
+          );
         }
         if (cancelled) return;
         const baseSeriesRaw =
@@ -194,7 +220,15 @@ export function StockDetailView({ symbol, onBack }: StockDetailViewProps) {
     return () => {
       cancelled = true;
     };
-  }, [symbol, trendPeriod, trendMetric]);
+  }, [
+    symbol,
+    trendPeriod,
+    trendMetric,
+    trendLabelTimezone,
+    stock?.sector,
+    stock?.sectorEtfs?.join(','),
+    stock?.industryEtfs?.join(','),
+  ]);
 
   const trendValueFormatter = React.useMemo(() => {
     if (trendMetric === 'sma20') {
@@ -214,15 +248,22 @@ export function StockDetailView({ symbol, onBack }: StockDetailViewProps) {
       DIA: 'market',
       [symbol.trim().toUpperCase()]: 'stock',
     };
-    if (stock?.sector) {
-      map[stock.sector.toUpperCase()] = 'sector';
-    }
+    const sectorEtfs = (
+      Array.isArray(stock?.sectorEtfs) && stock.sectorEtfs.length > 0
+        ? stock.sectorEtfs
+        : stock?.sector
+          ? [stock.sector]
+          : []
+    ).filter(Boolean);
+    sectorEtfs.forEach((etfSymbol) => {
+      map[etfSymbol.toUpperCase()] = 'sector';
+    });
     (stock?.industryEtfs || []).forEach((etfSymbol) => {
       if (!etfSymbol) return;
       map[etfSymbol.toUpperCase()] = 'industry';
     });
     return map;
-  }, [stock?.industryEtfs, stock?.sector, symbol]);
+  }, [stock?.industryEtfs?.join(','), stock?.sector, stock?.sectorEtfs?.join(','), symbol]);
 
   if (isLoading) {
     return (
@@ -270,6 +311,32 @@ export function StockDetailView({ symbol, onBack }: StockDetailViewProps) {
             走势对比加载失败：{trendError}
           </div>
         )}
+        <div className="flex justify-end mb-2">
+          <div className="inline-flex rounded border border-[var(--border-light)] overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setTrendLabelTimezone('market')}
+              className={`px-2 py-1 text-xs transition-colors ${
+                trendLabelTimezone === 'market'
+                  ? 'bg-[var(--accent-blue)] text-white'
+                  : 'bg-[var(--bg-primary)] text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+              }`}
+            >
+              美东交易日
+            </button>
+            <button
+              type="button"
+              onClick={() => setTrendLabelTimezone('beijing')}
+              className={`px-2 py-1 text-xs border-l border-[var(--border-light)] transition-colors ${
+                trendLabelTimezone === 'beijing'
+                  ? 'bg-[var(--accent-blue)] text-white'
+                  : 'bg-[var(--bg-primary)] text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+              }`}
+            >
+              北京时间
+            </button>
+          </div>
+        </div>
         <RelativeTrendChart
           title="走势对比"
           dates={trendDates}

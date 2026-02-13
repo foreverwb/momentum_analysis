@@ -1,28 +1,54 @@
 from sqlalchemy import (
     create_engine, Column, Integer, String, Float, DateTime,
     ForeignKey, Enum, JSON, Date, BigInteger, Boolean, UniqueConstraint, Text,
-    inspect, text
+    inspect, text, event
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime, date
-from pathlib import Path
 import enum
 import re
 import logging
 
+from ..core.paths import migrate_legacy_backend_storage
+
 logger = logging.getLogger(__name__)
 
-BACKEND_ROOT = Path(__file__).resolve().parents[2]
-DB_FILE = BACKEND_ROOT / "momentum_radar.db"
+STORAGE_PATHS = migrate_legacy_backend_storage()
+BACKEND_ROOT = STORAGE_PATHS.backend_root
+DB_FILE = STORAGE_PATHS.main_db
 SQLALCHEMY_DATABASE_URL = f"sqlite:///{DB_FILE}"
+SQLITE_BUSY_TIMEOUT_MS = 30000
 
 engine = create_engine(
-    SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
+    SQLALCHEMY_DATABASE_URL,
+    connect_args={
+        "check_same_thread": False,
+        "timeout": SQLITE_BUSY_TIMEOUT_MS / 1000,
+    },
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
+
+
+def _configure_sqlite_connection(dbapi_connection, _connection_record) -> None:
+    try:
+        cursor = dbapi_connection.cursor()
+    except Exception:
+        return
+
+    try:
+        cursor.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+        cursor.execute("PRAGMA journal_mode = WAL")
+        cursor.execute("PRAGMA synchronous = NORMAL")
+    finally:
+        cursor.close()
+
+
+@event.listens_for(engine, "connect")
+def _on_sqlite_connect(dbapi_connection, connection_record) -> None:
+    _configure_sqlite_connection(dbapi_connection, connection_record)
 
 
 # ============ 默认板块 ETF 配置 ============

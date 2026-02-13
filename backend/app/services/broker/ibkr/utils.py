@@ -33,11 +33,32 @@ def is_ibkr_dependency_available() -> bool:
     return IB_INSYNC_AVAILABLE
 
 
+def format_ibkr_stock_symbol(symbol: str) -> str:
+    """
+    Normalize stock symbol for IBKR contract construction.
+
+    IBKR uses space-separated class suffixes for some US tickers
+    (e.g. BRK.B -> BRK B, BF.B -> BF B).
+    """
+    normalized = str(symbol or "").strip().upper()
+    if not normalized:
+        return ""
+    if "." not in normalized:
+        return normalized
+    head, *tail = [part for part in normalized.split(".") if part]
+    if not head or not tail:
+        return normalized
+    return " ".join([head, *tail])
+
+
 def make_stock_contract(symbol: str, exchange: str = "SMART", currency: str = "USD") -> Any:
     """Create a Stock contract if dependency is available."""
     if not STOCK_CLASS:
         return None
-    return STOCK_CLASS(symbol, exchange, currency)
+    normalized_symbol = format_ibkr_stock_symbol(symbol)
+    if not normalized_symbol:
+        return None
+    return STOCK_CLASS(normalized_symbol, exchange, currency)
 
 
 def make_index_contract(symbol: str, exchange: str = "CBOE", currency: str = "USD") -> Any:
@@ -45,4 +66,3 @@ def make_index_contract(symbol: str, exchange: str = "CBOE", currency: str = "US
     if not INDEX_CLASS:
         return None
     return INDEX_CLASS(symbol, exchange, currency)
-

@@ -332,6 +332,12 @@ class DataOrchestrator:
         self._tasks: Dict[str, OrchestratorTask] = {}
         self._cache: Dict[str, Any] = {}
         self._cache_expiry: Dict[str, datetime] = {}
+        # sync_price 会话级去重: symbol -> last_sync_timestamp
+        self._sync_price_ts: Dict[str, float] = {}
+        self._sync_price_cache: Dict[str, pd.DataFrame] = {}
+        self._sync_price_ttl: float = 60.0  # 60秒内不重复请求同一标的
+        # 防止并发 connect_ibkr 使用同一 client_id 触发 Error 326
+        self._ibkr_connect_lock = asyncio.Lock()
 
         defaults = broker_defaults(self._broker_config)
         
@@ -370,6 +376,27 @@ class DataOrchestrator:
         Returns:
             bool: 是否连接成功
         """
+        if self._ibkr_ready():
+            return True
+
+        async with self._ibkr_connect_lock:
+            # 双重检查，避免并发请求排队后重复连接
+            if self._ibkr_ready():
+                return True
+            return await self._connect_ibkr_once(
+                host=host,
+                port=port,
+                client_id=client_id,
+                timeout=timeout,
+            )
+
+    async def _connect_ibkr_once(
+        self,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+        client_id: Optional[int] = None,
+        timeout: Optional[int] = None,
+    ) -> bool:
         defaults = self._broker_config.ibkr
         resolved_host = host.strip() if isinstance(host, str) and host.strip() else defaults.host
         resolved_port = port if isinstance(port, int) and port > 0 else defaults.port
@@ -750,7 +777,11 @@ class DataOrchestrator:
                 'error': str(e)
             }
     
-    async def get_spy_data(self, symbol: str = 'SPY') -> Optional[Dict]:
+    async def get_spy_data(
+        self,
+        symbol: str = 'SPY',
+        sma_periods: Optional[List[int]] = None,
+    ) -> Optional[Dict]:
         """
         获取指数数据（默认 SPY）
         
@@ -762,7 +793,11 @@ class DataOrchestrator:
         
         try:
             if self._ibkr is not None:
-                return await asyncio.to_thread(self._ibkr.get_spy_with_sma, symbol.upper())
+                return await asyncio.to_thread(
+                    self._ibkr.get_spy_with_sma,
+                    symbol.upper(),
+                    sma_periods,
+                )
             return None
         except Exception as e:
             logger.error(f"获取 {symbol} 数据失败: {e}")
@@ -1249,7 +1284,7 @@ class DataOrchestrator:
             Dict: 处理结果
         """
         try:
-            from .parsers.mc_parser import process_mc_data, classify_heat_type
+            from .parsers.mc_parser import process_mc_data, normalize_heat_type
             
             # 处理数据
             processed = process_mc_data(data)
@@ -1257,7 +1292,7 @@ class DataOrchestrator:
             # 分类热度类型
             heat_distribution = {}
             for item in processed:
-                heat_type = item.get('heat_type', 'NORMAL')
+                heat_type = normalize_heat_type(item.get('heat_type', 'normal'))
                 heat_distribution[heat_type] = heat_distribution.get(heat_type, 0) + 1
             
             result = {
@@ -1364,7 +1399,7 @@ class DataOrchestrator:
         duration: str = '1 Y'
     ) -> Dict:
         """
-        同步价格数据
+        同步价格数据（带会话级去重 + 本会话数据缓存复用）
         
         Args:
             symbols: 股票代码列表
@@ -1379,9 +1414,24 @@ class DataOrchestrator:
                 'synced': []
             }
         
-        synced = []
+        # --- 去重: 过滤掉 TTL 内已成功同步的 symbol ---
+        now = perf_counter()
+        need_sync = []
+        already_fresh = []
+        frame_map: Dict[str, pd.DataFrame] = {}
+        for s in symbols:
+            last_ts = self._sync_price_ts.get(s)
+            if last_ts is not None and (now - last_ts) < self._sync_price_ttl:
+                already_fresh.append(s)
+                cached_df = self._sync_price_cache.get(s)
+                if cached_df is not None and not cached_df.empty:
+                    frame_map[s] = cached_df
+            else:
+                need_sync.append(s)
+        
+        synced = list(already_fresh)  # 已缓存的视为已同步
         failed = []
-        ok = 0
+        ok = len(already_fresh)
         fail = 0
         total = len(symbols)
         start_ts = perf_counter()
@@ -1390,15 +1440,21 @@ class DataOrchestrator:
             "sync_price",
             stage="start",
             total=total,
+            need_fetch=len(need_sync),
+            skipped_fresh=len(already_fresh),
             status="start",
         )
         
-        for idx, symbol in enumerate(symbols, start=1):
+        for idx, symbol in enumerate(need_sync, start=1):
             try:
                 df = self._ibkr.get_ohlcv_data(symbol, duration)
                 if df is not None and not df.empty:
                     synced.append(symbol)
                     ok += 1
+                    # 记录成功时间戳
+                    self._sync_price_ts[symbol] = perf_counter()
+                    self._sync_price_cache[symbol] = df
+                    frame_map[symbol] = df
                 else:
                     failed.append(symbol)
                     fail += 1
@@ -1421,12 +1477,12 @@ class DataOrchestrator:
                     status="fail",
                     err=str(e),
                 )
-            if idx % 10 == 0 or idx == total:
+            if idx % 10 == 0 or idx == len(need_sync):
                 log.info(
                     "sync_price",
                     stage="progress",
                     total=total,
-                    done=idx,
+                    completed=idx + len(already_fresh),
                     ok=ok,
                     fail=fail,
                     status="progress",
@@ -1448,7 +1504,11 @@ class DataOrchestrator:
             'synced': synced,
             'failed': failed,
             'total': len(symbols),
-            'success_count': len(synced)
+            'success_count': len(synced),
+            'need_fetch': need_sync,
+            'skipped_fresh': already_fresh,
+            # 供上层（如 market API）复用，避免同一轮请求再次拉取历史数据。
+            'price_frames': frame_map,
         }
     
     async def sync_iv_data(self, symbols: List[str]) -> Dict:
@@ -1496,14 +1556,89 @@ class DataOrchestrator:
                 'synced': []
             }
 
+        def _has_iv_or_oi(payload: Any) -> bool:
+            if payload is None:
+                return False
+            try:
+                if payload.is_valid():
+                    return True
+            except Exception:
+                pass
+            oi_keys = (
+                "total_oi",
+                "delta_oi_1d",
+                "oi_bucket_0_7",
+                "oi_bucket_8_30",
+                "oi_bucket_31_90",
+                "call_oi_bucket_0_7",
+                "call_oi_bucket_8_30",
+                "call_oi_bucket_31_90",
+                "put_oi_bucket_0_7",
+                "put_oi_bucket_8_30",
+                "put_oi_bucket_31_90",
+                "net_delta_oi_0_7",
+                "net_delta_oi_8_30",
+                "net_delta_oi_31_90",
+                "call_delta_oi_0_7",
+                "call_delta_oi_8_30",
+                "call_delta_oi_31_90",
+                "put_delta_oi_0_7",
+                "put_delta_oi_8_30",
+                "put_delta_oi_31_90",
+                "net_delta3d_0_7",
+                "net_delta3d_8_30",
+                "net_delta3d_31_90",
+                "net_delta5d_0_7",
+                "net_delta5d_8_30",
+                "net_delta5d_31_90",
+            )
+            return any(getattr(payload, key, None) is not None for key in oi_keys)
+
         ok = 0
         fail = 0
+        synced_symbols: List[str] = []
+        failed_symbols: List[str] = []
+        iv_data: Dict[str, Dict[str, Any]] = {}
         for idx, symbol in enumerate(symbols, start=1):
             data = iv_results.get(symbol)
-            if data and data.is_valid():
+            if _has_iv_or_oi(data):
                 ok += 1
+                synced_symbols.append(symbol)
+                iv_data[symbol] = {
+                    'iv7': getattr(data, 'iv7', None),
+                    'iv30': getattr(data, 'iv30', None),
+                    'iv60': getattr(data, 'iv60', None),
+                    'iv90': getattr(data, 'iv90', None),
+                    'total_oi': getattr(data, 'total_oi', None),
+                    'delta_oi_1d': getattr(data, 'delta_oi_1d', None),
+                    'oi_bucket_0_7': getattr(data, 'oi_bucket_0_7', None),
+                    'oi_bucket_8_30': getattr(data, 'oi_bucket_8_30', None),
+                    'oi_bucket_31_90': getattr(data, 'oi_bucket_31_90', None),
+                    'call_oi_bucket_0_7': getattr(data, 'call_oi_bucket_0_7', None),
+                    'call_oi_bucket_8_30': getattr(data, 'call_oi_bucket_8_30', None),
+                    'call_oi_bucket_31_90': getattr(data, 'call_oi_bucket_31_90', None),
+                    'put_oi_bucket_0_7': getattr(data, 'put_oi_bucket_0_7', None),
+                    'put_oi_bucket_8_30': getattr(data, 'put_oi_bucket_8_30', None),
+                    'put_oi_bucket_31_90': getattr(data, 'put_oi_bucket_31_90', None),
+                    'net_delta_oi_0_7': getattr(data, 'net_delta_oi_0_7', None),
+                    'net_delta_oi_8_30': getattr(data, 'net_delta_oi_8_30', None),
+                    'net_delta_oi_31_90': getattr(data, 'net_delta_oi_31_90', None),
+                    'call_delta_oi_0_7': getattr(data, 'call_delta_oi_0_7', None),
+                    'call_delta_oi_8_30': getattr(data, 'call_delta_oi_8_30', None),
+                    'call_delta_oi_31_90': getattr(data, 'call_delta_oi_31_90', None),
+                    'put_delta_oi_0_7': getattr(data, 'put_delta_oi_0_7', None),
+                    'put_delta_oi_8_30': getattr(data, 'put_delta_oi_8_30', None),
+                    'put_delta_oi_31_90': getattr(data, 'put_delta_oi_31_90', None),
+                    'net_delta3d_0_7': getattr(data, 'net_delta3d_0_7', None),
+                    'net_delta3d_8_30': getattr(data, 'net_delta3d_8_30', None),
+                    'net_delta3d_31_90': getattr(data, 'net_delta3d_31_90', None),
+                    'net_delta5d_0_7': getattr(data, 'net_delta5d_0_7', None),
+                    'net_delta5d_8_30': getattr(data, 'net_delta5d_8_30', None),
+                    'net_delta5d_31_90': getattr(data, 'net_delta5d_31_90', None),
+                }
             else:
                 fail += 1
+                failed_symbols.append(symbol)
                 logger.warning(
                     "sync_iv_item",
                     broker="futu",
@@ -1517,22 +1652,11 @@ class DataOrchestrator:
                     "sync_iv",
                     stage="progress",
                     total=total,
-                    done=idx,
+                    completed=idx,
                     ok=ok,
                     fail=fail,
                     status="progress",
                 )
-
-        iv_data = {
-            symbol: {
-                'iv7': data.iv7,
-                'iv30': data.iv30,
-                'iv60': data.iv60,
-                'iv90': data.iv90,
-                'total_oi': data.total_oi
-            }
-            for symbol, data in iv_results.items()
-        }
 
         elapsed_ms = (perf_counter() - start_ts) * 1000
         status = "ok" if fail == 0 else "partial"
@@ -1547,9 +1671,10 @@ class DataOrchestrator:
         )
 
         return {
-            'synced': list(iv_data.keys()),
+            'synced': synced_symbols,
+            'failed': failed_symbols,
             'data': iv_data,
-            'success_count': len(iv_data)
+            'success_count': len(synced_symbols)
         }
     
     # ==================== 缓存管理 ====================

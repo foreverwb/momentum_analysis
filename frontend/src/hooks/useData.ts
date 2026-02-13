@@ -33,8 +33,10 @@ import {
   getETFs,    
   getETF,      
   refreshETF,
+  getTask,
   getTasks,
   createTask,
+  updateTask,
   deleteTask,  
 } from '../services/api';
 
@@ -476,6 +478,19 @@ export function useTasks() {
 }
 
 /**
+ * Hook to fetch single task by ID
+ */
+export function useTask(id: string | number | null) {
+  return useQuery({
+    queryKey: taskQueryKeys.detail(id ?? ''),
+    queryFn: () => (id ? getTask(id) : null),
+    enabled: id !== null && String(id).trim() !== '',
+    staleTime: 60000,
+    gcTime: 300000,
+  });
+}
+
+/**
  * Hook to create a new task
  */
 export function useCreateTask() {
@@ -485,6 +500,22 @@ export function useCreateTask() {
     mutationFn: (input: CreateTaskInput) => createTask(input),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: taskQueryKeys.lists() });
+    },
+  });
+}
+
+/**
+ * Hook to update task
+ */
+export function useUpdateTask() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id, input }: { id: string | number; input: CreateTaskInput }) =>
+      updateTask(id, input),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: taskQueryKeys.lists() });
+      queryClient.invalidateQueries({ queryKey: taskQueryKeys.detail(variables.id) });
     },
   });
 }

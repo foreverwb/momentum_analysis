@@ -193,6 +193,10 @@ function toBoolean(value: unknown): boolean | undefined {
   return undefined;
 }
 
+function encodeSymbolPathSegment(symbol: string): string {
+  return encodeURIComponent(symbol.trim().toUpperCase()).replace(/\./g, '%2E');
+}
+
 function toStringArray(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) {
     return undefined;
@@ -219,9 +223,15 @@ function toNumberRecord(value: unknown): Record<string, number> {
 }
 
 function normalizeHeatType(value: unknown): HeatType {
-  const normalized = (toStringValue(value) || '').toLowerCase();
-  if (normalized === 'trend' || normalized === 'event' || normalized === 'hedge') {
-    return normalized;
+  const normalized = (toStringValue(value) || '').toLowerCase().replace(/\s+/g, '_');
+  if (normalized === 'trend' || normalized === 'trend_heat' || normalized.includes('trend')) {
+    return 'trend';
+  }
+  if (normalized === 'event' || normalized === 'event_heat' || normalized.includes('event')) {
+    return 'event';
+  }
+  if (normalized === 'hedge' || normalized === 'hedge_heat' || normalized.includes('hedge')) {
+    return 'hedge';
   }
   return 'normal';
 }
@@ -293,6 +303,7 @@ function normalizeStock(raw: unknown): Stock {
     symbol: toStringValue(source.symbol) ?? '',
     name: toStringValue(source.name) ?? toStringValue(source.symbol) ?? '',
     sector: toStringValue(source.sector),
+    sectorEtfs: toStringArray(source.sectorEtfs),
     industry: toStringValue(source.industry),
     industryEtfs: toStringArray(source.industryEtfs),
 
@@ -354,8 +365,18 @@ function normalizeStock(raw: unknown): Stock {
       options: toNumber(scoresRaw.options) ?? 0,
     },
     changes: {
-      delta3d: toNumber(changesRaw.delta3d) ?? null,
-      delta5d: toNumber(changesRaw.delta5d) ?? null,
+      delta3d:
+        toNumber(changesRaw.delta3d) ??
+        toNumber(changesRaw.delta_3d) ??
+        toNumber(source.delta3d) ??
+        toNumber(source.delta_3d) ??
+        null,
+      delta5d:
+        toNumber(changesRaw.delta5d) ??
+        toNumber(changesRaw.delta_5d) ??
+        toNumber(source.delta5d) ??
+        toNumber(source.delta_5d) ??
+        null,
     },
 
     heatType: normalizeHeatType(source.heatType ?? source.heat_type),
@@ -694,7 +715,7 @@ export async function getStockDetail(symbol: string): Promise<StockDetail> {
   if (!symbol || symbol.trim() === '') {
     throw new Error('Stock symbol is required');
   }
-  const response = await fetchApi<unknown>(`/stocks/symbol/${symbol.toUpperCase()}/detail`);
+  const response = await fetchApi<unknown>(`/stocks/symbol/${encodeSymbolPathSegment(symbol)}/detail`);
   return transformStockDetailResponse(response);
 }
 
@@ -705,7 +726,7 @@ export async function getStock(symbol: string): Promise<Stock> {
   if (!symbol || symbol.trim() === '') {
     throw new Error('Stock symbol is required');
   }
-  const response = await fetchApi<unknown>(`/stocks/symbol/${symbol.toUpperCase()}`);
+  const response = await fetchApi<unknown>(`/stocks/symbol/${encodeSymbolPathSegment(symbol)}`);
   return normalizeStock(response);
 }
 
@@ -962,7 +983,90 @@ interface MarketSyncApiResponse {
 
 const marketPriceSyncInFlight = new Map<string, Promise<{ synced: string[]; failed: string[] }>>();
 const marketPriceSyncLastSuccessAt = new Map<string, number>();
+const marketPriceDailySyncedAt = new Map<string, number>();
+let marketPriceDailyCacheLoaded = false;
 const MARKET_PRICE_SYNC_MAX_AGE_MS = 5 * 60 * 1000;
+const MARKET_PRICE_DAILY_SYNC_STORAGE_KEY = 'market-price-daily-sync-v1';
+const MARKET_PRICE_BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000;
+const MARKET_PRICE_ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
+const getBeijingSyncBoundaryMs = (nowMs: number): number => {
+  const beijingNow = new Date(nowMs + MARKET_PRICE_BEIJING_OFFSET_MS);
+  const year = beijingNow.getUTCFullYear();
+  const month = beijingNow.getUTCMonth();
+  const day = beijingNow.getUTCDate();
+  const hour = beijingNow.getUTCHours();
+  let boundaryUtcMs = Date.UTC(year, month, day, 0, 0, 0, 0); // 08:00 BJT
+  if (hour < 8) {
+    boundaryUtcMs -= MARKET_PRICE_ONE_DAY_MS;
+  }
+  return boundaryUtcMs;
+};
+
+const getBeijingSyncWindowKey = (nowMs: number): string => {
+  const boundaryMs = getBeijingSyncBoundaryMs(nowMs);
+  const beijingBoundary = new Date(boundaryMs + MARKET_PRICE_BEIJING_OFFSET_MS);
+  const year = beijingBoundary.getUTCFullYear();
+  const month = `${beijingBoundary.getUTCMonth() + 1}`.padStart(2, '0');
+  const day = `${beijingBoundary.getUTCDate()}`.padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
+const loadMarketPriceDailySyncCache = (): void => {
+  if (marketPriceDailyCacheLoaded || typeof window === 'undefined') {
+    return;
+  }
+  marketPriceDailyCacheLoaded = true;
+  try {
+    const raw = localStorage.getItem(MARKET_PRICE_DAILY_SYNC_STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== 'object' || parsed === null) return;
+    Object.entries(parsed as Record<string, unknown>).forEach(([symbol, value]) => {
+      if (typeof symbol !== 'string' || !symbol.trim()) return;
+      if (typeof value !== 'string') return;
+      const ts = new Date(value).getTime();
+      if (!Number.isFinite(ts)) return;
+      marketPriceDailySyncedAt.set(symbol.trim().toUpperCase(), ts);
+    });
+  } catch {
+    // ignore storage parse errors
+  }
+};
+
+const persistMarketPriceDailySyncCache = (): void => {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  try {
+    const payload: Record<string, string> = {};
+    marketPriceDailySyncedAt.forEach((ts, symbol) => {
+      if (!Number.isFinite(ts)) return;
+      payload[symbol] = new Date(ts).toISOString();
+    });
+    localStorage.setItem(MARKET_PRICE_DAILY_SYNC_STORAGE_KEY, JSON.stringify(payload));
+  } catch {
+    // ignore storage errors
+  }
+};
+
+const markMarketPriceDailySynced = (symbols: string[], syncedAtMs: number): void => {
+  if (!symbols.length || !Number.isFinite(syncedAtMs)) {
+    return;
+  }
+  symbols.forEach((symbol) => {
+    const normalized = symbol.trim().toUpperCase();
+    if (!normalized) return;
+    marketPriceDailySyncedAt.set(normalized, syncedAtMs);
+  });
+  persistMarketPriceDailySyncCache();
+};
+
+const isMarketPriceFreshInCurrentBeijingWindow = (symbol: string, boundaryMs: number): boolean => {
+  const normalized = symbol.trim().toUpperCase();
+  const syncedAt = marketPriceDailySyncedAt.get(normalized);
+  return typeof syncedAt === 'number' && Number.isFinite(syncedAt) && syncedAt >= boundaryMs;
+};
 
 interface SyncPriceDataOptions {
   force?: boolean;
@@ -976,6 +1080,7 @@ export async function syncPriceDataForSymbols(
   synced: string[];
   failed: string[];
 }> {
+  loadMarketPriceDailySyncCache();
   const cleanedSymbols = Array.from(
     new Set(
       (symbols || [])
@@ -988,16 +1093,36 @@ export async function syncPriceDataForSymbols(
     return { synced: [], failed: [] };
   }
 
-  const key = cleanedSymbols.join('|');
-  const maxAgeMs = options?.maxAgeMs ?? MARKET_PRICE_SYNC_MAX_AGE_MS;
-  if (!options?.force && maxAgeMs > 0) {
-    const lastSyncedAt = marketPriceSyncLastSuccessAt.get(key);
-    if (typeof lastSyncedAt === 'number' && Date.now() - lastSyncedAt < maxAgeMs) {
+  const nowMs = Date.now();
+  const boundaryMs = getBeijingSyncBoundaryMs(nowMs);
+  if (!options?.force) {
+    const alreadyFresh = cleanedSymbols.filter((symbol) =>
+      isMarketPriceFreshInCurrentBeijingWindow(symbol, boundaryMs)
+    );
+    if (alreadyFresh.length === cleanedSymbols.length) {
       return { synced: cleanedSymbols, failed: [] };
     }
   }
 
-  const existing = marketPriceSyncInFlight.get(key);
+  const key = cleanedSymbols.join('|');
+  const maxAgeMs = options?.maxAgeMs ?? MARKET_PRICE_SYNC_MAX_AGE_MS;
+  if (!options?.force && maxAgeMs > 0) {
+    const lastSyncedAt = marketPriceSyncLastSuccessAt.get(key);
+    if (typeof lastSyncedAt === 'number' && nowMs - lastSyncedAt < maxAgeMs) {
+      return { synced: cleanedSymbols, failed: [] };
+    }
+  }
+
+  const requestSymbols = options?.force
+    ? cleanedSymbols
+    : cleanedSymbols.filter((symbol) => !isMarketPriceFreshInCurrentBeijingWindow(symbol, boundaryMs));
+
+  if (requestSymbols.length === 0) {
+    return { synced: cleanedSymbols, failed: [] };
+  }
+
+  const requestKey = requestSymbols.join('|');
+  const existing = marketPriceSyncInFlight.get(requestKey);
   if (existing) {
     return existing;
   }
@@ -1007,26 +1132,147 @@ export async function syncPriceDataForSymbols(
       method: 'POST',
       timeout: 120000,
       body: JSON.stringify({
-        symbols: cleanedSymbols,
+        symbols: requestSymbols,
         sync_type: 'price',
       }),
     });
 
+    const failed = Array.isArray(response.failed)
+      ? response.failed.map((symbol) => symbol.trim().toUpperCase()).filter(Boolean)
+      : [];
+    const failedSet = new Set(failed);
+    const requestSucceeded = requestSymbols.filter((symbol) => !failedSet.has(symbol));
+    if (requestSucceeded.length > 0) {
+      markMarketPriceDailySynced(requestSucceeded, Date.now());
+    }
     const result = {
-      synced: Array.isArray(response.synced) ? response.synced : [],
-      failed: Array.isArray(response.failed) ? response.failed : [],
+      synced: Array.from(
+        new Set([
+          ...cleanedSymbols.filter((symbol) => isMarketPriceFreshInCurrentBeijingWindow(symbol, boundaryMs)),
+          ...(Array.isArray(response.synced)
+            ? response.synced.map((symbol) => symbol.trim().toUpperCase()).filter(Boolean)
+            : []),
+          ...requestSucceeded,
+        ])
+      ),
+      failed,
     };
     if (result.failed.length === 0) {
       marketPriceSyncLastSuccessAt.set(key, Date.now());
+      marketPriceSyncLastSuccessAt.set(requestKey, Date.now());
     }
     return result;
   })();
 
-  marketPriceSyncInFlight.set(key, request);
+  marketPriceSyncInFlight.set(requestKey, request);
   try {
     return await request;
   } finally {
-    marketPriceSyncInFlight.delete(key);
+    marketPriceSyncInFlight.delete(requestKey);
+  }
+}
+
+// ==================== 每日价格新鲜度保障 ====================
+
+/**
+ * 会话级追踪：今日已确认 fresh 的 symbol 集合（避免重复检查）
+ */
+const dailySyncConfirmed = new Set<string>();
+let dailySyncConfirmedDate = '';
+
+function resetDailySyncIfDateChanged(): void {
+  const today = getBeijingSyncWindowKey(Date.now());
+  if (dailySyncConfirmedDate !== today) {
+    dailySyncConfirmed.clear();
+    dailySyncConfirmedDate = today;
+  }
+}
+
+/**
+ * 检查价格数据新鲜度（后端判断哪些 symbol 今日尚未同步）
+ */
+export async function checkPriceFreshness(
+  symbols: string[]
+): Promise<{ stale: string[]; fresh: string[]; sync_date: string }> {
+  const cleaned = Array.from(
+    new Set(symbols.map((s) => s.trim().toUpperCase()).filter(Boolean))
+  );
+  if (cleaned.length === 0) {
+    return { stale: [], fresh: [], sync_date: '' };
+  }
+  const resp = await fetchApi<{ stale: string[]; fresh: string[]; sync_date: string }>(
+    '/market/price-freshness',
+    {
+      method: 'POST',
+      body: JSON.stringify({ symbols: cleaned }),
+    }
+  );
+  return resp;
+}
+
+/**
+ * 每日价格同步保障：确保 symbols 今日已从 IBKR 同步过价格数据
+ *
+ * - 先检查新鲜度
+ * - 如有 stale symbol，强制 sync 并 await
+ * - 会话内同一 symbol 确认后不再重复检查
+ *
+ * 返回: true = 执行了同步, false = 已是最新无需同步
+ */
+const dailySyncInFlight = new Map<string, Promise<boolean>>();
+
+export async function ensureDailyPriceSync(symbols: string[]): Promise<boolean> {
+  resetDailySyncIfDateChanged();
+
+  const cleaned = Array.from(
+    new Set(symbols.map((s) => s.trim().toUpperCase()).filter(Boolean))
+  );
+  // 过滤掉本次会话已确认 fresh 的
+  const unchecked = cleaned.filter((s) => !dailySyncConfirmed.has(s));
+  if (unchecked.length === 0) {
+    return false;
+  }
+
+  // 去重 in-flight key
+  const key = unchecked.sort().join('|');
+  const existing = dailySyncInFlight.get(key);
+  if (existing) {
+    return existing;
+  }
+
+  const doSync = async (): Promise<boolean> => {
+    try {
+      const freshness = await checkPriceFreshness(unchecked);
+      // 标记 fresh 的
+      for (const s of freshness.fresh) {
+        dailySyncConfirmed.add(s);
+      }
+      if (freshness.stale.length === 0) {
+        return false;
+      }
+      // 有 stale symbol，强制同步
+      console.info(
+        `[DailySync] ${freshness.stale.length} stale symbols, syncing:`,
+        freshness.stale
+      );
+      await syncPriceDataForSymbols(freshness.stale, { force: true });
+      // 同步完成，标记为 confirmed
+      for (const s of freshness.stale) {
+        dailySyncConfirmed.add(s.toUpperCase());
+      }
+      return true;
+    } catch (err) {
+      console.warn('[DailySync] freshness check / sync failed:', err);
+      return false;
+    }
+  };
+
+  const promise = doSync();
+  dailySyncInFlight.set(key, promise);
+  try {
+    return await promise;
+  } finally {
+    dailySyncInFlight.delete(key);
   }
 }
 
@@ -1148,6 +1394,11 @@ export function isValidSymbol(symbol: string): boolean {
 function normalizeETF(raw: unknown): ETF {
   const source = isRecord(raw) ? raw : {};
   const deltaRaw = isRecord(source.delta) ? source.delta : {};
+  const sourceUpdatedAtRaw = isRecord(source.sourceUpdatedAt) ? source.sourceUpdatedAt : {};
+  const sourceUpdatedAt: Record<string, string | null> = {};
+  Object.entries(sourceUpdatedAtRaw).forEach(([key, value]) => {
+    sourceUpdatedAt[key] = toStringValue(value) ?? null;
+  });
 
   const holdings = Array.isArray(source.holdings)
     ? source.holdings
@@ -1165,6 +1416,9 @@ function normalizeETF(raw: unknown): ETF {
             ticker: toStringValue(item.ticker) ?? '',
             weight: toNumber(item.weight) ?? 0,
             score: toNumber(item.score) ?? null,
+            price: toNumber(item.price) ?? null,
+            deviationFrom20ma: toNumber(item.deviationFrom20ma) ?? toNumber(item.deviation_from_20ma) ?? null,
+            aboveSma20: toBoolean(item.aboveSma20) ?? toBoolean(item.above_sma20) ?? null,
             updatedAt: toStringValue(item.updatedAt) ?? null,
             dataSources: Object.keys(dataSources).length > 0 ? dataSources : undefined,
             dataStatus: (toStringValue(item.dataStatus) as 'complete' | 'pending' | 'missing' | 'loading' | undefined) ?? undefined,
@@ -1194,7 +1448,8 @@ function normalizeETF(raw: unknown): ETF {
     holdingsCount: toNumber(source.holdingsCount) ?? 0,
     holdings,
     coverageRanges: toStringArray(source.coverageRanges),
-    lastUpdated: toStringValue(source.lastUpdated),
+    sourceUpdatedAt: Object.keys(sourceUpdatedAt).length > 0 ? sourceUpdatedAt : undefined,
+    lastUpdated: toStringValue(source.lastUpdated) ?? toStringValue(source.updatedAt) ?? toStringValue(source.updated_at),
   };
 }
 
@@ -1249,12 +1504,53 @@ function normalizeTaskType(value: unknown): Task['type'] {
   return 'rotation';
 }
 
-function normalizeTaskBaseIndex(value: unknown): Task['baseIndex'] {
-  const normalized = (toStringValue(value) || '').toUpperCase();
-  if (normalized === 'QQQ' || normalized === 'IWM') {
-    return normalized;
+function normalizeTaskBaseIndices(value: unknown): string[] {
+  const candidates: string[] = [];
+
+  if (Array.isArray(value)) {
+    value.forEach((item) => {
+      const normalized = (toStringValue(item) || String(item)).trim().toUpperCase();
+      if (normalized) {
+        candidates.push(normalized);
+      }
+    });
+  } else if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed) {
+      try {
+        const parsed: unknown = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+          parsed.forEach((item) => {
+            const normalized = (toStringValue(item) || String(item)).trim().toUpperCase();
+            if (normalized) {
+              candidates.push(normalized);
+            }
+          });
+        } else {
+          trimmed.split(',').forEach((item) => {
+            const normalized = item.trim().toUpperCase();
+            if (normalized) {
+              candidates.push(normalized);
+            }
+          });
+        }
+      } catch {
+        trimmed.split(',').forEach((item) => {
+          const normalized = item.trim().toUpperCase();
+          if (normalized) {
+            candidates.push(normalized);
+          }
+        });
+      }
+    }
   }
-  return 'SPY';
+
+  const deduped = Array.from(new Set(candidates));
+  return deduped.length > 0 ? deduped : ['SPY'];
+}
+
+function normalizeTaskBaseIndex(value: unknown): Task['baseIndex'] {
+  return normalizeTaskBaseIndices(value)[0] ?? 'SPY';
 }
 
 function normalizeTaskEtfs(value: unknown): string[] {
@@ -1290,11 +1586,13 @@ function normalizeTaskEtfs(value: unknown): string[] {
 
 function normalizeTask(raw: unknown): Task {
   const source = isRecord(raw) ? raw : {};
+  const baseIndices = normalizeTaskBaseIndices(source.baseIndices ?? source.baseIndex);
   return {
     id: toNumber(source.id) ?? 0,
     title: toStringValue(source.title) ?? '',
     type: normalizeTaskType(source.type),
-    baseIndex: normalizeTaskBaseIndex(source.baseIndex),
+    baseIndex: normalizeTaskBaseIndex(baseIndices),
+    baseIndices,
     sector: toStringValue(source.sector),
     etfs: normalizeTaskEtfs(source.etfs),
     createdAt: toStringValue(source.createdAt) ?? '',
@@ -1338,9 +1636,37 @@ export async function getTask(id: string | number): Promise<Task> {
  * Create a new task
  */
 export async function createTask(input: CreateTaskInput): Promise<Task> {
+  const normalizedBaseIndices = normalizeTaskBaseIndices(input.baseIndices ?? input.baseIndex);
+  const payload: Omit<CreateTaskInput, 'baseIndices'> = {
+    title: input.title,
+    type: input.type,
+    baseIndex: normalizedBaseIndices.join(','),
+    sector: input.sector,
+    etfs: input.etfs,
+  };
   const response = await fetchApi<unknown>('/tasks', {
     method: 'POST',
-    body: JSON.stringify(input),
+    body: JSON.stringify(payload),
+  });
+  return normalizeTask(response);
+}
+
+/**
+ * Update task
+ */
+export async function updateTask(id: string | number, input: CreateTaskInput): Promise<Task> {
+  const taskId = normalizeTaskId(id);
+  const normalizedBaseIndices = normalizeTaskBaseIndices(input.baseIndices ?? input.baseIndex);
+  const payload: Omit<CreateTaskInput, 'baseIndices'> = {
+    title: input.title,
+    type: input.type,
+    baseIndex: normalizedBaseIndices.join(','),
+    sector: input.sector,
+    etfs: input.etfs,
+  };
+  const response = await fetchApi<unknown>(`/tasks/${taskId}`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
   });
   return normalizeTask(response);
 }
@@ -1367,7 +1693,7 @@ export async function getETFBySymbol(symbol: string, includeHoldings = false): P
     throw new Error('ETF symbol is required');
   }
   const query = includeHoldings ? '?include_holdings=true' : '';
-  const response = await fetchApi<unknown>(`/etfs/symbol/${symbol.toUpperCase()}${query}`);
+  const response = await fetchApi<unknown>(`/etfs/symbol/${encodeSymbolPathSegment(symbol)}${query}`);
   return normalizeETF(response);
 }
 
@@ -1404,11 +1730,13 @@ export async function getTaskById(id: string | number): Promise<Task> {
 export async function getTaskTrendComparison(
   taskId: string | number,
   period: 5 | 20 | 63 = 20,
-  metric: 'relative' | 'sma20' | 'return20d' | 'score' = 'relative'
+  metric: 'relative' | 'sma20' | 'return20d' | 'score' = 'relative',
+  labelTimezone: 'market' | 'beijing' = 'market'
 ): Promise<{
   task_id: number;
   period: number;
   metric: string;
+  label_tz?: 'market' | 'beijing';
   symbols: string[];
   dates: string[];
   series: Array<{ symbol: string; values: Array<number | null> }>;
@@ -1423,23 +1751,26 @@ export async function getTaskTrendComparison(
     task_id: number;
     period: number;
     metric: string;
+    label_tz?: 'market' | 'beijing';
     symbols: string[];
     dates: string[];
     series: Array<{ symbol: string; values: Array<number | null> }>;
     price_series?: Array<{ symbol: string; values: Array<number | null> }>;
     sma20_series?: Array<{ symbol: string; values: Array<number | null> }>;
     deviation_series?: Array<{ symbol: string; values: Array<number | null> }>;
-  }>(`/tasks/${taskId}/trend-comparison?period=${period}&metric=${metric}`);
+  }>(`/tasks/${taskId}/trend-comparison?period=${period}&metric=${metric}&label_tz=${labelTimezone}`);
 }
 
 export async function getStockTrendComparison(
   symbol: string,
   period: 5 | 20 | 63 = 20,
-  metric: 'relative' | 'sma20' | 'return20d' | 'score' = 'relative'
+  metric: 'relative' | 'sma20' | 'return20d' | 'score' = 'relative',
+  labelTimezone: 'market' | 'beijing' = 'market'
 ): Promise<{
   symbol: string;
   period: number;
   metric: string;
+  label_tz?: 'market' | 'beijing';
   symbols: string[];
   dates: string[];
   series: Array<{ symbol: string; values: Array<number | null> }>;
@@ -1454,13 +1785,14 @@ export async function getStockTrendComparison(
     symbol: string;
     period: number;
     metric: string;
+    label_tz?: 'market' | 'beijing';
     symbols: string[];
     dates: string[];
     series: Array<{ symbol: string; values: Array<number | null> }>;
     price_series?: Array<{ symbol: string; values: Array<number | null> }>;
     sma20_series?: Array<{ symbol: string; values: Array<number | null> }>;
     deviation_series?: Array<{ symbol: string; values: Array<number | null> }>;
-  }>(`/stocks/symbol/${symbol.toUpperCase()}/trend-comparison?period=${period}&metric=${metric}`);
+  }>(`/stocks/symbol/${encodeSymbolPathSegment(symbol)}/trend-comparison?period=${period}&metric=${metric}&label_tz=${labelTimezone}`);
 }
 
 /**
@@ -1472,6 +1804,7 @@ export async function refreshTaskAllETFs(taskId: string | number): Promise<{
   total: number;
   completed: number;
   failed: number;
+  updated_at?: string;
   results: Array<{
     symbol: string;
     status: string;
@@ -1493,6 +1826,7 @@ export async function refreshTaskAllETFs(taskId: string | number): Promise<{
     total: number;
     completed: number;
     failed: number;
+    updated_at?: string;
     results: Array<{
       symbol: string;
       status: string;
@@ -1533,7 +1867,13 @@ function estimateRefreshSymbolsCount(
     return Math.max(1, Math.round(expectedSymbolsCount));
   }
 
-  if (coverageType.toLowerCase() === 'top') {
+  const normalizedCoverageType = coverageType.toLowerCase();
+
+  if (normalizedCoverageType === 'top') {
+    return Math.max(1, Math.round(coverageValue));
+  }
+
+  if (normalizedCoverageType === 'all' && Number.isFinite(coverageValue) && coverageValue > 0) {
     return Math.max(1, Math.round(coverageValue));
   }
 
@@ -1556,12 +1896,16 @@ export async function refreshHoldingsByCoverage(
   coverageType: string,
   coverageValue: number,
   expectedSymbolsCount?: number,
-  progressToken?: string
+  progressToken?: string,
+  relatedEtfSymbols?: string[]
 ): Promise<{
   status: string;
   symbol: string;
   coverage: string;
   stocks_count: number;
+  refreshed_stocks_count?: number;
+  skipped_recent_count?: number;
+  duplicate_scope_count?: number;
   total_weight: number;
   completeness: Record<string, unknown>;
   updated_stocks: Array<Record<string, unknown>>;
@@ -1577,23 +1921,30 @@ export async function refreshHoldingsByCoverage(
     expectedSymbolsCount
   );
   const timeoutMs = calcHoldingsRefreshTimeoutMs(estimatedSymbols);
+  const encodedSymbol = encodeSymbolPathSegment(symbol);
 
   return fetchApi<{
     status: string;
     symbol: string;
     coverage: string;
     stocks_count: number;
+    refreshed_stocks_count?: number;
+    skipped_recent_count?: number;
+    duplicate_scope_count?: number;
     total_weight: number;
     completeness: Record<string, unknown>;
     updated_stocks: Array<Record<string, unknown>>;
     message: string;
-  }>(`/etfs/symbol/${symbol.toUpperCase()}/refresh-holdings-by-coverage`, {
+  }>(`/etfs/symbol/${encodedSymbol}/refresh-holdings-by-coverage`, {
     method: 'POST',
     timeout: timeoutMs,
     body: JSON.stringify({
       coverage_type: coverageType,
       coverage_value: coverageValue,
       ...(progressToken && progressToken.trim() !== '' ? { progress_token: progressToken } : {}),
+      ...(Array.isArray(relatedEtfSymbols) && relatedEtfSymbols.length > 0
+        ? { related_etf_symbols: relatedEtfSymbols }
+        : {}),
     }),
   });
 }
@@ -1626,8 +1977,9 @@ export async function getHoldingsRefreshProgress(
   if (!progressToken || progressToken.trim() === '') {
     throw new Error('progressToken is required');
   }
+  const encodedSymbol = encodeSymbolPathSegment(symbol);
   return fetchApi<HoldingsRefreshProgress>(
-    `/etfs/symbol/${symbol.toUpperCase()}/refresh-holdings-progress/${encodeURIComponent(progressToken)}`,
+    `/etfs/symbol/${encodedSymbol}/refresh-holdings-progress/${encodeURIComponent(progressToken)}`,
     {
       timeout: 60000,
     }
@@ -1648,6 +2000,7 @@ export async function importFinvizData(
   records_imported: number;
   breadth_metrics: Record<string, unknown>;
   validation: Record<string, unknown>;
+  symbol_alias_mappings?: string[];
 }> {
   return fetchApi<{
     status: string;
@@ -1656,6 +2009,7 @@ export async function importFinvizData(
     records_imported: number;
     breadth_metrics: Record<string, unknown>;
     validation: Record<string, unknown>;
+    symbol_alias_mappings?: string[];
   }>('/import/finviz', {
     method: 'POST',
     body: JSON.stringify({
@@ -1670,6 +2024,8 @@ export async function importFinvizData(
  * Import MarketChameleon data
  */
 export async function importMCData(
+  etfSymbol: string,
+  coverage: string,
   data: Array<Record<string, unknown>>
 ): Promise<{
   status: string;
@@ -1685,6 +2041,8 @@ export async function importMCData(
   }>('/import/marketchameleon', {
     method: 'POST',
     body: JSON.stringify({
+      etf_symbol: etfSymbol.toUpperCase(),
+      coverage,
       data,
     }),
   });
@@ -1697,11 +2055,12 @@ export async function getETFHoldingsBySymbol(symbol: string): Promise<Array<{
   if (!symbol || symbol.trim() === '') {
     throw new Error('ETF symbol is required');
   }
+  const encodedSymbol = encodeSymbolPathSegment(symbol);
   return fetchApi<Array<{
     ticker: string;
     weight: number;
     dataDate?: string;
-  }>>(`/etfs/symbol/${symbol.toUpperCase()}/holdings`);
+  }>>(`/etfs/symbol/${encodedSymbol}/holdings`);
 }
 
 // ----------------------------------------------------------------------------
@@ -1712,6 +2071,15 @@ export interface MarketRegimeResponse {
   status: string;
   regime_text?: string;
   spy?: {
+    price: number;
+    sma20: number;
+    sma50: number;
+    dist_to_sma20?: number | null;
+    dist_to_sma50?: number | null;
+    return_20d: number;
+    sma20_slope: number;
+  };
+  qqq?: {
     price: number;
     sma20: number;
     sma50: number;
@@ -1894,6 +2262,6 @@ export async function getOptionsOverlayData(symbol: string): Promise<OptionsOver
   if (!symbol || symbol.trim() === '') {
     throw new Error('Stock symbol is required');
   }
-  const response = await fetchApi<unknown>(`/stocks/symbol/${symbol.toUpperCase()}/options-overlay`);
+  const response = await fetchApi<unknown>(`/stocks/symbol/${encodeSymbolPathSegment(symbol)}/options-overlay`);
   return normalizeOptionsOverlayData(response, symbol);
 }

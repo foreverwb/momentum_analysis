@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""Convenience wrapper for `./bin/finviz etfs ...`."""
+
+import os
+import sys
+from pathlib import Path
+
+
+if __name__ == "__main__":
+    backend_root = Path(__file__).resolve().parents[1]
+    env = dict(os.environ)
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        f"{backend_root}{os.pathsep}{existing_pythonpath}"
+        if existing_pythonpath
+        else str(backend_root)
+    )
+    os.execve(
+        sys.executable,
+        [sys.executable, "-m", "app.cli", "finviz", *sys.argv[1:]],
+        env,
+    )

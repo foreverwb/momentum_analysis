@@ -260,7 +260,6 @@ export const StockCard = memo(function StockCard({
 
         {/* Right: Score Box */}
         <div className="text-right">
-          <div className="text-xs text-[var(--text-muted)] mb-1">综合得分</div>
           <div className="text-[40px] font-bold text-[var(--text-primary)] leading-none">
             {scoreTotal?.toFixed(1) ?? '--'}
           </div>

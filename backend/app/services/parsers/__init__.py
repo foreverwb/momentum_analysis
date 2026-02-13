@@ -43,7 +43,10 @@ from .mc_parser import (
     calculate_risk_score,
     calculate_confidence_penalty,
     calculate_term_score,
+    calculate_positioning_score_from_iv,
     calculate_put_call_sentiment,
+    normalize_heat_type,
+    to_legacy_heat_type,
     
     # 分类
     classify_heat_type,
@@ -84,7 +87,10 @@ __all__ = [
     'calculate_risk_score',
     'calculate_confidence_penalty',
     'calculate_term_score',
+    'calculate_positioning_score_from_iv',
     'calculate_put_call_sentiment',
+    'normalize_heat_type',
+    'to_legacy_heat_type',
     'classify_heat_type',
     'get_heat_type_details',
     'HeatClassification',

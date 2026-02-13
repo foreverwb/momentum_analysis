@@ -129,21 +129,25 @@ def configure_logging() -> None:
     access_logger.propagate = False
     access_logger.disabled = True
 
+    # ── structlog 自身的 logger ──
+    # 使用 PrintLoggerFactory 直接写 stdout，完全绕过 stdlib 的 Logger._log()。
+    # 这样 logger.info("event", symbol="X", broker="ibkr") 中的任意 kwargs
+    # 都由 processor chain 消费，不会触发 stdlib 的 TypeError。
+    # stdlib 的 handler/formatter 仅用于 uvicorn 等第三方库的日志。
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,
-            structlog.stdlib.add_logger_name,
             structlog.stdlib.add_log_level,
             structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S", utc=True, key="T"),
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
             structlog.processors.UnicodeDecoder(),
             _decode_unicode_escapes,
-            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+            renderer,  # 最终 processor：将 event_dict 渲染为字符串后交给 PrintLogger
         ],
         context_class=dict,
-        logger_factory=structlog.stdlib.LoggerFactory(),
-        wrapper_class=structlog.stdlib.BoundLogger,
+        logger_factory=structlog.PrintLoggerFactory(sys.stdout),
+        wrapper_class=structlog.make_filtering_bound_logger(level),
         cache_logger_on_first_use=True,
     )
 

@@ -75,6 +75,7 @@ export interface Stock {
   symbol: string;
   name: string;
   sector?: string;
+  sectorEtfs?: string[];
   industry?: string;
   industryEtfs?: string[];
   
@@ -352,6 +353,9 @@ export interface Holding {
   ticker: string;
   weight: number;
   score?: number | null;
+  price?: number | null;
+  deviationFrom20ma?: number | null;
+  aboveSma20?: boolean | null;
   updatedAt?: string | null;
   dataSources?: Record<string, boolean>;
   dataStatus?: 'complete' | 'pending' | 'missing' | 'loading';
@@ -403,6 +407,7 @@ export interface ETF {
   // Holdings data
   holdings?: Holding[];
   coverageRanges?: string[];
+  sourceUpdatedAt?: Record<string, string | null>;
   
   // Metadata
   lastUpdated?: string;
@@ -414,7 +419,8 @@ export interface Task {
   id: number;
   title: string;
   type: TaskType;
-  baseIndex: 'SPY' | 'QQQ' | 'IWM';
+  baseIndex: string;
+  baseIndices?: string[];
   sector?: string;
   etfs: string[];
   createdAt: string;
@@ -425,7 +431,8 @@ export interface Task {
 export interface CreateTaskInput {
   title: string;
   type: TaskType;
-  baseIndex: 'SPY' | 'QQQ' | 'IWM';
+  baseIndex: string;
+  baseIndices?: string[];
   sector?: string;
   etfs: string[];
 }

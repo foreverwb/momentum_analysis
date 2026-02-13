@@ -8,6 +8,7 @@ from app.services.broker.futu.options_data import (
     OptionChainFetchMeta,
     OptionContract,
 )
+from app.services.broker.futu.utils import OPTION_TYPE
 
 
 class _DummyConnection:
@@ -54,6 +55,28 @@ def test_collect_expirations_fallback_to_windowed_when_full_chain_fails():
     assert meta.success_requests >= 1
     assert meta.strategy in {"mixed", "windowed"}
     assert meta.total_contracts >= 1
+
+
+class _CombinedOptionTypeClient:
+    def get_option_chain(self, code, *args, **kwargs):
+        assert kwargs.get("option_type") == OPTION_TYPE.ALL
+        expiry = (datetime.now().date() + timedelta(days=14)).strftime("%Y-%m-%d")
+        return 0, [
+            {"expiry_date": expiry, "code": "US.TEST240101C100", "option_type": "CALL"},
+            {"expiry_date": expiry, "code": "US.TEST240101P100", "option_type": "PUT"},
+        ]
+
+
+def test_collect_expirations_prefers_combined_option_type_when_available():
+    connection = _DummyConnection(_CombinedOptionTypeClient())
+    fetcher = FutuOptionsDataFetcher(connection=connection)
+
+    expirations, meta = fetcher.collect_expirations_with_meta(symbol="TEST", max_days=30, window_days=30)
+
+    contracts = next(iter(expirations.values()))
+    assert len(contracts) == 2
+    assert {str(contract.option_type).upper() for contract in contracts} == {"CALL", "PUT"}
+    assert meta.total_requests == 1
 
 
 class _FullNearTermClient:
@@ -143,7 +166,7 @@ def test_iv_terms_return_empty_when_only_far_term_chain_available():
     calculator = FutuIVCalculator(
         connection=connection,
         options_fetcher=_FarTermOnlyFetcher(),
-        oi_cache_file="/tmp/futu_oi_cache_test.json",
+        oi_cache_file="/tmp/futu_oi_cache_test.db",
     )
 
     result = calculator._fetch_symbol_iv_terms(symbol="TEST", max_days=120, window_days=30)
@@ -216,7 +239,7 @@ def test_fetch_iv_terms_exposes_call_put_bucket_split():
     calculator = FutuIVCalculator(
         connection=connection,
         options_fetcher=_BucketSplitFetcher(),
-        oi_cache_file="/tmp/futu_oi_cache_test.json",
+        oi_cache_file="/tmp/futu_oi_cache_test.db",
     )
 
     result = calculator._fetch_symbol_iv_terms(symbol="TEST", max_days=120, window_days=30, log_fetch_summary=False)
@@ -236,3 +259,23 @@ def test_fetch_iv_terms_exposes_call_put_bucket_split():
 def test_resolve_option_side_falls_back_to_contract_code():
     assert FutuIVCalculator._resolve_option_side(option_type="UNKNOWN", option_code="US.AAPL260320C00190000") == "call"
     assert FutuIVCalculator._resolve_option_side(option_type="UNKNOWN", option_code="US.AAPL260320P00190000") == "put"
+
+
+def test_pick_atm_iv_uses_call_side_from_combined_chain_records():
+    connection = _DummyConnection(client=object())
+    calculator = FutuIVCalculator(
+        connection=connection,
+        options_fetcher=FutuOptionsDataFetcher(connection=connection),
+        oi_cache_file="/tmp/futu_oi_cache_test.db",
+    )
+
+    contracts = [
+        OptionContract(code="US.TEST240101C100", option_type=OPTION_TYPE.ALL),
+        OptionContract(code="US.TEST240101P100", option_type=OPTION_TYPE.ALL),
+    ]
+    snapshot_map = {
+        "US.TEST240101C100": {"option_delta": 0.51, "option_implied_volatility": 0.40},
+        "US.TEST240101P100": {"option_delta": -0.49, "option_implied_volatility": 0.60},
+    }
+
+    assert calculator._pick_atm_iv(contracts, snapshot_map) == 40.0

@@ -44,7 +44,7 @@ _IBKR_CONNECTOR_REMOVED_MESSAGE = (
 class FutuConnector(BrokerConnector):
     """Compatibility connector built on top of the new futu submodules."""
 
-    OI_CACHE_FILE = "oi_cache.json"
+    OI_CACHE_FILE = FutuIVCalculator.DEFAULT_OI_CACHE_DB_FILE
     CACHE_LOCK = FutuIVCalculator.CACHE_LOCK
 
     def __init__(

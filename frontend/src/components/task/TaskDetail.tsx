@@ -9,6 +9,7 @@ import * as api from '../../services/api';
 interface TaskDetailProps {
   task: Task;
   onBack: () => void;
+  onViewStockDetail?: (symbol: string) => void;
 }
 
 // ETF 名称映射
@@ -46,6 +47,7 @@ const TREND_METRIC_OPTIONS = [
   { value: 'return20d', label: '20D收益' },
   { value: 'score', label: '综合评分' },
 ];
+const TREND_METRICS: Array<'relative' | 'sma20' | 'return20d' | 'score'> = ['relative', 'sma20', 'return20d', 'score'];
 const TASK_TREND_CACHE_TTL_MS = 60 * 1000;
 const taskTrendCache = new Map<string, {
   cachedAt: number;
@@ -54,12 +56,36 @@ const taskTrendCache = new Map<string, {
   priceSeries: RelativeTrendSeries[];
   sma20Series: RelativeTrendSeries[];
 }>();
+const taskTrendInFlight = new Map<string, Promise<void>>();
 
 const toTaskTrendCacheKey = (
   taskId: number,
   period: '5d' | '20d' | '63d',
-  metric: 'relative' | 'sma20' | 'return20d' | 'score'
-): string => `${taskId}|${period}|${metric}`;
+  metric: 'relative' | 'sma20' | 'return20d' | 'score',
+  labelTimezone: 'market' | 'beijing',
+  scopeKey: string
+): string => `${taskId}|${scopeKey}|${period}|${metric}|${labelTimezone}`;
+
+const toTaskTrendScopeKey = ({
+  etfsKey,
+  baseIndicesKey,
+  sector,
+  version,
+}: {
+  etfsKey: string;
+  baseIndicesKey: string;
+  sector?: string;
+  version?: string | null;
+}): string => {
+  const normalizedSector = (sector || '').trim().toUpperCase();
+  const normalizedVersion = (version || '').trim();
+  return [
+    etfsKey || '-',
+    baseIndicesKey || '-',
+    normalizedSector || '-',
+    normalizedVersion || '-',
+  ].join('::');
+};
 
 const hasValidSeriesValues = (values: Array<number | null> | undefined): boolean =>
   Array.isArray(values) && values.some((value) => typeof value === 'number' && Number.isFinite(value));
@@ -78,6 +104,25 @@ const hasRequiredSymbolsData = (
     const matched = rawSeries.find((item) => item.symbol?.toUpperCase?.() === symbol);
     return matched ? hasValidSeriesValues(matched.values) : false;
   });
+};
+
+const hasRenderableTrendCache = (cacheEntry?: {
+  dates: string[];
+  series: RelativeTrendSeries[];
+} | null): boolean => {
+  if (!cacheEntry) return false;
+  if (!Array.isArray(cacheEntry.dates) || cacheEntry.dates.length <= 1) return false;
+  return cacheEntry.series.some((item) => hasValidSeriesValues(item.values));
+};
+
+const isTaskTrendCacheFresh = (
+  cacheEntry?: { cachedAt: number } | null,
+  nowMs: number = Date.now()
+): boolean => {
+  if (!cacheEntry || !Number.isFinite(cacheEntry.cachedAt)) {
+    return false;
+  }
+  return nowMs - cacheEntry.cachedAt < TASK_TREND_CACHE_TTL_MS;
 };
 
 type SourceStatus = 'complete' | 'pending' | 'missing' | 'loading';
@@ -206,6 +251,12 @@ const formatUpdateDateTime = (value?: string | null): string => {
   return `${month}-${day} ${hours}:${minutes}`;
 };
 
+const parseTimestampMs = (value?: string | null): number => {
+  if (!value) return Number.NaN;
+  const ts = new Date(value).getTime();
+  return Number.isFinite(ts) ? ts : Number.NaN;
+};
+
 const formatBeijingBoundaryLabel = (boundaryUtcMs: number): string => {
   const beijing = new Date(boundaryUtcMs + BEIJING_OFFSET_MS);
   const year = beijing.getUTCFullYear();
@@ -239,6 +290,239 @@ const normalizeEtfs = (raw: unknown): string[] => {
   return [];
 };
 
+const dedupeSymbols = (symbols: string[]): string[] => {
+  const ordered: string[] = [];
+  symbols.forEach((symbol) => {
+    const normalized = symbol.trim().toUpperCase();
+    if (!normalized || ordered.includes(normalized)) return;
+    ordered.push(normalized);
+  });
+  return ordered;
+};
+
+const SHARE_CLASS_ALIAS_PATTERN = /^([A-Z][A-Z0-9]{0,5})[.-]([A-Z])$/;
+
+const canonicalizeComparableSymbol = (symbol: string): string => {
+  const normalized = symbol.trim().toUpperCase();
+  const matched = normalized.match(SHARE_CLASS_ALIAS_PATTERN);
+  if (!matched) return normalized;
+  return `${matched[1]}.${matched[2]}`;
+};
+
+const IMPORT_LIST_KEYS = ['data', 'items', 'rows', 'etfs', 'holdings', 'symbols'] as const;
+const IMPORT_SYMBOL_KEYS = [
+  'symbol',
+  'Symbol',
+  'ticker',
+  'Ticker',
+  'etf_symbol',
+  'etfSymbol',
+  'etf',
+  'ETF',
+  'code',
+  'Code',
+] as const;
+const COVERAGE_PATTERN = /^(top|weight)(\d+)$/i;
+const ALL_COVERAGE_ID = 'all';
+
+const extractImportRows = (payload: unknown): unknown[] | null => {
+  if (Array.isArray(payload)) return payload;
+  if (typeof payload !== 'object' || payload === null) return null;
+  const record = payload as Record<string, unknown>;
+  for (const key of IMPORT_LIST_KEYS) {
+    const value = record[key];
+    if (Array.isArray(value)) {
+      return value;
+    }
+  }
+  return null;
+};
+
+const extractSymbolFromImportItem = (item: unknown): string | null => {
+  if (typeof item === 'string') {
+    const normalized = item.trim().toUpperCase();
+    return normalized || null;
+  }
+  if (typeof item !== 'object' || item === null || Array.isArray(item)) return null;
+  const record = item as Record<string, unknown>;
+  for (const key of IMPORT_SYMBOL_KEYS) {
+    const value = record[key];
+    if (typeof value !== 'string') continue;
+    const normalized = value.trim().toUpperCase();
+    if (normalized) return normalized;
+  }
+  return null;
+};
+
+const pickSymbolsFromImportPayload = (payload: unknown): string[] => {
+  const rows = extractImportRows(payload);
+  if (!rows) return [];
+  return rows
+    .map((item) => extractSymbolFromImportItem(item))
+    .filter((value): value is string => Boolean(value));
+};
+
+const buildSymbolMismatchMessage = (
+  label: string,
+  expectedSymbols: string[],
+  importedSymbols: string[]
+): string => {
+  const expected = dedupeSymbols(expectedSymbols);
+  const imported = dedupeSymbols(importedSymbols);
+  const expectedSet = new Set(expected);
+  const importedSet = new Set(imported);
+  const missing = expected.filter((symbol) => !importedSet.has(symbol));
+  const extra = imported.filter((symbol) => !expectedSet.has(symbol));
+  const details: string[] = [];
+
+  if (imported.length !== expected.length) {
+    details.push(`数量不一致（期望 ${expected.length}，实际 ${imported.length}）`);
+  }
+  if (missing.length) {
+    details.push(`缺少: ${missing.join(', ')}`);
+  }
+  if (extra.length) {
+    details.push(`多出: ${extra.join(', ')}`);
+  }
+
+  return `${label}与当前监控任务不一致：${details.join('；')}`;
+};
+
+const assertSymbolsMatch = (
+  label: string,
+  expectedSymbols: string[],
+  importedSymbols: string[]
+): { symbols: string[]; aliasMappings: string[] } => {
+  const expected = dedupeSymbols(expectedSymbols);
+  const expectedByCanonical = new Map<string, string>();
+  expected.forEach((symbol) => {
+    const canonical = canonicalizeComparableSymbol(symbol);
+    if (!canonical || expectedByCanonical.has(canonical)) return;
+    expectedByCanonical.set(canonical, symbol);
+  });
+
+  const normalizedImported = importedSymbols
+    .map((symbol) => symbol.trim().toUpperCase())
+    .filter((symbol) => symbol.length > 0);
+
+  const resolvedImported = normalizedImported.map((symbol) => {
+    const canonical = canonicalizeComparableSymbol(symbol);
+    return expectedByCanonical.get(canonical) || canonical;
+  });
+
+  const aliasMappings = normalizedImported
+    .map((raw, index) => {
+      const resolved = resolvedImported[index];
+      if (!resolved || raw === resolved) return null;
+      return `${raw} -> ${resolved}`;
+    })
+    .filter((value): value is string => Boolean(value));
+
+  const importCounts = new Map<string, number>();
+  resolvedImported.forEach((symbol) => {
+    importCounts.set(symbol, (importCounts.get(symbol) || 0) + 1);
+  });
+  const duplicateSymbols = Array.from(importCounts.entries())
+    .filter(([, count]) => count > 1)
+    .map(([symbol]) => symbol);
+  if (duplicateSymbols.length) {
+    throw new Error(`${label}存在重复标的: ${duplicateSymbols.join(', ')}`);
+  }
+  const imported = dedupeSymbols(resolvedImported);
+  const expectedSet = new Set(expected);
+  const importedSet = new Set(imported);
+  const hasMissing = expected.some((symbol) => !importedSet.has(symbol));
+  const hasExtra = imported.some((symbol) => !expectedSet.has(symbol));
+
+  if (imported.length !== expected.length || hasMissing || hasExtra) {
+    throw new Error(buildSymbolMismatchMessage(label, expected, imported));
+  }
+  return {
+    symbols: imported,
+    aliasMappings: Array.from(new Set(aliasMappings)),
+  };
+};
+
+const parseCoverageSelection = (
+  coverageId: string
+): { type: 'all' } | { type: 'top' | 'weight'; value: number } | null => {
+  const normalized = coverageId.trim().toLowerCase();
+  if (normalized === ALL_COVERAGE_ID) {
+    return { type: 'all' };
+  }
+  const matched = normalized.match(COVERAGE_PATTERN);
+  if (!matched) return null;
+  const value = parseInt(matched[2], 10);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  return {
+    type: matched[1] === 'top' ? 'top' : 'weight',
+    value,
+  };
+};
+
+const pickCoverageSymbols = (holdings: Holding[], coverageId: string): string[] => {
+  const coverage = parseCoverageSelection(coverageId);
+  if (!coverage || holdings.length === 0) return [];
+  const sorted = [...holdings].sort((a, b) => (b.weight || 0) - (a.weight || 0));
+
+  if (coverage.type === 'all') {
+    return dedupeSymbols(sorted.map((holding) => holding.ticker));
+  }
+
+  if (coverage.type === 'top') {
+    return dedupeSymbols(sorted.slice(0, coverage.value).map((holding) => holding.ticker));
+  }
+
+  let totalWeight = 0;
+  const picked: string[] = [];
+  for (const holding of sorted) {
+    picked.push(holding.ticker);
+    totalWeight += holding.weight || 0;
+    if (totalWeight >= coverage.value) {
+      break;
+    }
+  }
+  return dedupeSymbols(picked);
+};
+
+const resolveMonitoredEtfs = (
+  rawEtfs: unknown,
+  taskType: Task['type'],
+  sector?: string
+): string[] => {
+  const normalizedEtfs = dedupeSymbols(normalizeEtfs(rawEtfs));
+  if (taskType !== 'drilldown') {
+    return normalizedEtfs;
+  }
+  const sectorSymbol = (sector || '').trim().toUpperCase();
+  if (!sectorSymbol) {
+    return normalizedEtfs;
+  }
+  return [sectorSymbol, ...normalizedEtfs.filter((symbol) => symbol !== sectorSymbol)];
+};
+
+const normalizeBaseIndices = (raw: unknown): string[] => {
+  if (Array.isArray(raw)) {
+    const deduped = Array.from(
+      new Set(
+        raw
+          .map((item) => String(item).trim().toUpperCase())
+          .filter((item) => item.length > 0)
+      )
+    );
+    return deduped.length > 0 ? deduped : ['SPY'];
+  }
+  if (typeof raw === 'string') {
+    const values = raw
+      .split(',')
+      .map((item) => item.trim().toUpperCase())
+      .filter((item) => item.length > 0);
+    const deduped = Array.from(new Set(values));
+    return deduped.length > 0 ? deduped : ['SPY'];
+  }
+  return ['SPY'];
+};
+
 const getSymbolsKey = (symbols: string[]): string => symbols.join('|');
 
 function getETFName(symbol: string): string {
@@ -253,6 +537,7 @@ interface ETFDetailData {
   symbol: string;
   name: string;
   type: 'sector' | 'industry';
+  lastUpdated: string | null;
   score: number | null;
   rank: number | null;
   totalCount: number;
@@ -267,7 +552,95 @@ interface ETFDetailData {
     count?: number;
   }>;
   coverageRanges: string[];
+  sourceUpdatedAt?: Partial<Record<SourceKey, string | null>>;
 }
+
+const pickLatestIsoTimestamp = (values: Array<string | null | undefined>): string | undefined => {
+  let latestTs = Number.NEGATIVE_INFINITY;
+  let latestValue: string | undefined;
+  values.forEach((value) => {
+    if (typeof value !== 'string' || value.trim() === '') return;
+    const parsed = new Date(value);
+    const ts = parsed.getTime();
+    if (!Number.isFinite(ts)) return;
+    if (ts > latestTs) {
+      latestTs = ts;
+      latestValue = parsed.toISOString();
+    }
+  });
+  return latestValue;
+};
+
+const deriveTaskSourceUpdatedAtMap = (
+  details: ETFDetailData[]
+): Partial<Record<SourceKey, string>> => {
+  if (!details.length) return {};
+
+  const derived: Partial<Record<SourceKey, string>> = {};
+  (Object.keys(SOURCE_CIRCLE_META) as SourceKey[]).forEach((sourceKey) => {
+    const timestamps = details.map((detail) => detail.sourceUpdatedAt?.[sourceKey] ?? null);
+    if (timestamps.some((value) => typeof value !== 'string' || value.trim() === '')) {
+      return;
+    }
+    const latestValue = pickLatestIsoTimestamp(timestamps);
+    if (latestValue) {
+      derived[sourceKey] = latestValue;
+    }
+  });
+  return derived;
+};
+
+const hasFiniteEtfScore = (value: number | null | undefined): value is number =>
+  typeof value === 'number' && Number.isFinite(value);
+
+const sortTaskEtfDetails = (
+  details: ETFDetailData[],
+  taskType: Task['type'],
+  orderHint: string[] = [],
+  sectorSymbol?: string
+): ETFDetailData[] => {
+  if (taskType !== 'rotation' && taskType !== 'drilldown') {
+    return [...details];
+  }
+
+  const fallbackOrder = orderHint.length > 0 ? orderHint : details.map((item) => item.symbol);
+  const orderIndex = new Map(
+    fallbackOrder.map((symbol, index) => [symbol.trim().toUpperCase(), index] as const)
+  );
+  const pinnedSector = taskType === 'drilldown'
+    ? (sectorSymbol || '').trim().toUpperCase()
+    : '';
+
+  return [...details].sort((left, right) => {
+    const leftSymbol = left.symbol.trim().toUpperCase();
+    const rightSymbol = right.symbol.trim().toUpperCase();
+
+    if (pinnedSector) {
+      const leftPinned = leftSymbol === pinnedSector;
+      const rightPinned = rightSymbol === pinnedSector;
+      if (leftPinned !== rightPinned) {
+        return leftPinned ? -1 : 1;
+      }
+    }
+
+    const leftHasScore = hasFiniteEtfScore(left.score);
+    const rightHasScore = hasFiniteEtfScore(right.score);
+    const leftScore = leftHasScore ? left.score : null;
+    const rightScore = rightHasScore ? right.score : null;
+
+    if (leftScore !== null && rightScore !== null && leftScore !== rightScore) {
+      return rightScore - leftScore;
+    }
+    if (leftHasScore !== rightHasScore) {
+      return leftHasScore ? -1 : 1;
+    }
+
+    return (
+      (orderIndex.get(leftSymbol) ?? Number.MAX_SAFE_INTEGER) -
+      (orderIndex.get(rightSymbol) ?? Number.MAX_SAFE_INTEGER)
+    );
+  });
+};
 
 const ETF_DETAILS_CACHE_TTL_MS = 60 * 1000;
 const etfDetailsCache = new Map<string, { cachedAt: number; data: ETFDetailData[] }>();
@@ -284,16 +657,26 @@ const normalizeRefreshStatus = (status?: string): RefreshResult['status'] => {
   return 'error';
 };
 
-export function TaskDetail({ task, onBack }: TaskDetailProps) {
+export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps) {
   const [trendPeriod, setTrendPeriod] = useState<'5d' | '20d' | '63d'>('20d');
   const [trendMetric, setTrendMetric] = useState<'relative' | 'sma20' | 'return20d' | 'score'>('relative');
+  const [trendLabelTimezone, setTrendLabelTimezone] = useState<'market' | 'beijing'>('market');
   const [holdingsModalOpen, setHoldingsModalOpen] = useState(false);
   const [etfModalOpen, setETFModalOpen] = useState(false);
   const [selectedETF, setSelectedETF] = useState<string>('');
   const [selectedCoverage, setSelectedCoverage] = useState<string | undefined>();
   const [coverageRangesByETF, setCoverageRangesByETF] = useState<Record<string, string[]>>({});
-  const [resolvedEtfs, setResolvedEtfs] = useState<string[]>(() => normalizeEtfs(task.etfs));
+  const [resolvedEtfs, setResolvedEtfs] = useState<string[]>(
+    () => resolveMonitoredEtfs(task.etfs, task.type, task.sector)
+  );
   const resolvedEtfsKey = useMemo(() => getSymbolsKey(resolvedEtfs), [resolvedEtfs]);
+  const etfDetailsCacheKey = useMemo(() => `${task.id}|${resolvedEtfsKey}`, [task.id, resolvedEtfsKey]);
+  const taskBaseIndices = useMemo(
+    () => normalizeBaseIndices(task.baseIndices ?? task.baseIndex),
+    [task.baseIndices, task.baseIndex]
+  );
+  const taskBaseIndicesKey = useMemo(() => getSymbolsKey(taskBaseIndices), [taskBaseIndices]);
+  const primaryBaseIndex = taskBaseIndices[0] || 'SPY';
 
   // API 数据状态
   const [etfDetails, setEtfDetails] = useState<ETFDetailData[]>([]);
@@ -318,14 +701,26 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
   const [refreshError, setRefreshError] = useState(false);
   const [refreshComplete, setRefreshComplete] = useState(false);
   const [latestRefreshResults, setLatestRefreshResults] = useState<Record<string, RefreshResult>>({});
+  const [lastRefreshAllAt, setLastRefreshAllAt] = useState<string | null>(task.updatedAt ?? null);
   const [sourceUpdatedAtMap, setSourceUpdatedAtMap] = useState<Partial<Record<SourceKey, string>>>(
     () => loadStoredSourceUpdatedAt(task.id)
   );
   const [clockNowMs, setClockNowMs] = useState<number>(() => Date.now());
+  const trendCacheScopeKey = useMemo(
+    () =>
+      toTaskTrendScopeKey({
+        etfsKey: resolvedEtfsKey,
+        baseIndicesKey: taskBaseIndicesKey,
+        sector: task.sector,
+        version: lastRefreshAllAt ?? task.updatedAt ?? null,
+      }),
+    [resolvedEtfsKey, taskBaseIndicesKey, task.sector, lastRefreshAllAt, task.updatedAt]
+  );
   const createFallbackETFDetail = (symbol: string, totalCount: number): ETFDetailData => ({
     symbol,
     name: getETFName(symbol),
     type: getETFType(symbol),
+    lastUpdated: null,
     score: null,
     rank: null,
     totalCount,
@@ -340,7 +735,28 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
       { source: '期权数据', status: 'missing', updatedAt: null },
     ],
     coverageRanges: [],
+    sourceUpdatedAt: {},
   });
+
+  const applySortedEtfDetails = (
+    details: ETFDetailData[],
+    options?: { orderHint?: string[]; cacheKey?: string; cacheAt?: number }
+  ): ETFDetailData[] => {
+    const sorted = sortTaskEtfDetails(
+      details,
+      task.type,
+      options?.orderHint ?? resolvedEtfs,
+      task.sector
+    );
+    setEtfDetails(sorted);
+    if (options?.cacheKey) {
+      etfDetailsCache.set(options.cacheKey, {
+        cachedAt: options.cacheAt ?? Date.now(),
+        data: sorted,
+      });
+    }
+    return sorted;
+  };
 
   const loadETFData = async (symbols: string[], options?: { silent?: boolean; cacheKey?: string }) => {
     const silent = Boolean(options?.silent);
@@ -359,6 +775,7 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
               symbol: etf.symbol,
               name: etf.name || getETFName(symbol),
               type: (etf.type as 'sector' | 'industry') || getETFType(symbol),
+              lastUpdated: etf.lastUpdated ?? null,
               score: etf.score > 0 ? etf.score : null,
               rank: etf.rank > 0 ? etf.rank : null,
               totalCount: symbols.length,
@@ -368,6 +785,7 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
               holdings: etf.holdings || [],
               dataStatus: generateDataStatus(etf),
               coverageRanges: etf.coverageRanges || [],
+              sourceUpdatedAt: etf.sourceUpdatedAt || {},
             };
           }
         } catch (e) {
@@ -379,12 +797,8 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
       });
       
       const results = await Promise.all(etfDataPromises);
-      setEtfDetails(results);
-      setSelectedETF((prev) => prev || results[0]?.symbol || '');
-      etfDetailsCache.set(cacheKey, {
-        cachedAt: Date.now(),
-        data: results,
-      });
+      const sortedResults = applySortedEtfDetails(results, { orderHint: symbols, cacheKey });
+      setSelectedETF((prev) => prev || sortedResults[0]?.symbol || '');
     } catch (e) {
       if (!silent) {
         setError(e instanceof Error ? e : new Error('加载数据失败'));
@@ -399,20 +813,21 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
   };
 
   useEffect(() => {
-    const normalized = normalizeEtfs(task.etfs);
-    if (!(Array.isArray(task.etfs) || typeof task.etfs === 'string')) {
-      return;
-    }
+    const normalized = resolveMonitoredEtfs(task.etfs, task.type, task.sector);
     setResolvedEtfs((prev) => {
       const prevKey = getSymbolsKey(prev);
       const nextKey = getSymbolsKey(normalized);
       return prevKey === nextKey ? prev : normalized;
     });
-  }, [task.etfs]);
+  }, [task.etfs, task.type, task.sector]);
 
   useEffect(() => {
     setSourceUpdatedAtMap(loadStoredSourceUpdatedAt(task.id));
   }, [task.id]);
+
+  useEffect(() => {
+    setLastRefreshAllAt(task.updatedAt ?? null);
+  }, [task.id, task.updatedAt]);
 
   useEffect(() => {
     saveStoredSourceUpdatedAt(task.id, sourceUpdatedAtMap);
@@ -436,7 +851,11 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
       try {
         const latestTask = await api.getTaskById(task.id);
         if (cancelled) return;
-        const normalized = normalizeEtfs(latestTask?.etfs);
+        const normalized = resolveMonitoredEtfs(
+          latestTask?.etfs,
+          latestTask?.type ?? task.type,
+          latestTask?.sector ?? task.sector
+        );
         if (normalized.length) {
           setResolvedEtfs(normalized);
         } else {
@@ -468,13 +887,20 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
       }
       return;
     }
-    const cacheKey = `${task.id}|${resolvedEtfsKey}`;
+    const cacheKey = etfDetailsCacheKey;
     const cached = etfDetailsCache.get(cacheKey);
     if (cached) {
-      setEtfDetails(cached.data);
-      setSelectedETF((prev) => prev || cached.data[0]?.symbol || '');
+      const sortedCached = sortTaskEtfDetails(cached.data, task.type, resolvedEtfs, task.sector);
+      setEtfDetails(sortedCached);
+      setSelectedETF((prev) => prev || sortedCached[0]?.symbol || '');
       setError(null);
       setIsLoading(false);
+      if (sortedCached.some((item, index) => item.symbol !== cached.data[index]?.symbol)) {
+        etfDetailsCache.set(cacheKey, {
+          cachedAt: cached.cachedAt,
+          data: sortedCached,
+        });
+      }
       const isFresh = Date.now() - cached.cachedAt < ETF_DETAILS_CACHE_TTL_MS;
       if (isFresh) {
         return;
@@ -483,7 +909,16 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
       return;
     }
     void loadETFData(resolvedEtfs, { cacheKey });
-  }, [resolvedEtfsKey, task.id]);
+  }, [etfDetailsCacheKey, resolvedEtfs, resolvedEtfsKey, task.id, task.type]);
+
+  useEffect(() => {
+    setSelectedETF((prev) => {
+      if (prev && etfDetails.some((item) => item.symbol === prev)) {
+        return prev;
+      }
+      return etfDetails[0]?.symbol || '';
+    });
+  }, [etfDetails]);
 
   useEffect(() => {
     if (!task.id) {
@@ -491,51 +926,88 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
     }
     let cancelled = false;
     const periodValue = trendPeriod === '5d' ? 5 : trendPeriod === '20d' ? 20 : 63;
-    const baseSymbol = task.baseIndex?.toUpperCase();
+    const baseSymbols = taskBaseIndices.map((symbol) => symbol.toUpperCase());
+    const baseSymbol = baseSymbols[0];
     const sectorSymbol = task.sector?.toUpperCase();
+    const marketSymbols = Array.from(
+      new Set(
+        [...resolvedEtfs, ...(sectorSymbol ? [sectorSymbol] : []), ...baseSymbols, 'SPY', 'QQQ']
+          .filter((symbol): symbol is string => Boolean(symbol))
+      )
+    );
     const reservedColors: Record<string, string> = {
       SPY: '#94a3b8',
       QQQ: '#64748b',
     };
-    if (baseSymbol) {
-      reservedColors[baseSymbol] = '#94a3b8';
-    }
+    baseSymbols.forEach((symbol, index) => {
+      reservedColors[symbol] = index === 0 ? '#94a3b8' : '#64748b';
+    });
     if (sectorSymbol) {
       reservedColors[sectorSymbol] = '#8b5cf6';
     }
-    const cacheKey = toTaskTrendCacheKey(task.id, trendPeriod, trendMetric);
-    const cached = taskTrendCache.get(cacheKey);
-    if (cached && Date.now() - cached.cachedAt < TASK_TREND_CACHE_TTL_MS) {
+    const setTrendFromCache = (metric: 'relative' | 'sma20' | 'return20d' | 'score'): boolean => {
+      const cacheKey = toTaskTrendCacheKey(task.id, trendPeriod, metric, trendLabelTimezone, trendCacheScopeKey);
+      const cached = taskTrendCache.get(cacheKey);
+      if (!cached) return false;
       setTrendDates(cached.dates);
       setTrendSeries(cached.series);
       setTrendPriceSeries(cached.priceSeries);
       setTrendSma20Series(cached.sma20Series);
+      return true;
+    };
+    const selectedCacheKey = toTaskTrendCacheKey(task.id, trendPeriod, trendMetric, trendLabelTimezone, trendCacheScopeKey);
+    const selectedCached = taskTrendCache.get(selectedCacheKey);
+    if (selectedCached) {
+      setTrendDates(selectedCached.dates);
+      setTrendSeries(selectedCached.series);
+      setTrendPriceSeries(selectedCached.priceSeries);
+      setTrendSma20Series(selectedCached.sma20Series);
       setTrendError(null);
-      setIsTrendLoading(false);
-      return;
-    }
-    if (cached) {
-      setTrendDates(cached.dates);
-      setTrendSeries(cached.series);
-      setTrendPriceSeries(cached.priceSeries);
-      setTrendSma20Series(cached.sma20Series);
     }
 
-    setIsTrendLoading(true);
+    const metricsToFetch = TREND_METRICS.filter((metric) => {
+      const cacheKey = toTaskTrendCacheKey(task.id, trendPeriod, metric, trendLabelTimezone, trendCacheScopeKey);
+      const cached = taskTrendCache.get(cacheKey);
+      if (!cached) return true;
+      if (metric === trendMetric) return true;
+      if (!isTaskTrendCacheFresh(cached)) return true;
+      if (!hasRenderableTrendCache(cached)) return true;
+      return false;
+    });
+
     setTrendError(null);
 
     const loadTrendData = async () => {
       try {
-        const marketSymbols = Array.from(
-          new Set([baseSymbol, 'SPY', 'QQQ'].filter((symbol): symbol is string => Boolean(symbol)))
-        );
-        const warmupPromise =
-          trendMetric === 'score' || marketSymbols.length === 0
-            ? null
-            : api.syncPriceDataForSymbols(marketSymbols).catch((syncError) => {
-                console.warn('Market trend data warmup failed:', syncError);
-                return null;
-              });
+        let dailySynced = false;
+        if (marketSymbols.length > 0) {
+          try {
+            dailySynced = await api.ensureDailyPriceSync(marketSymbols);
+          } catch (dailySyncError) {
+            console.warn('Daily price sync check failed:', dailySyncError);
+          }
+          if (cancelled) return;
+        }
+
+        const metricsToLoad = dailySynced ? TREND_METRICS : metricsToFetch;
+        if (metricsToLoad.length === 0) {
+          setTrendError(null);
+          setIsTrendLoading(false);
+          return;
+        }
+
+        setIsTrendLoading(true);
+        let warmupPromise: Promise<unknown> | null = null;
+        const ensureWarmup = (): Promise<unknown> => {
+          if (warmupPromise) {
+            return warmupPromise;
+          }
+          warmupPromise = api.syncPriceDataForSymbols(marketSymbols).catch((syncError) => {
+            console.warn('Market trend data warmup failed:', syncError);
+            return null;
+          });
+          return warmupPromise;
+        };
 
         const withSeriesColors = (
           seriesItems: Array<{ symbol: string; values: Array<number | null> }> | undefined
@@ -570,44 +1042,92 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
           });
         };
 
-        let resp = await api.getTaskTrendComparison(task.id, periodValue, trendMetric);
-        if (
-          trendMetric !== 'score' &&
-          marketSymbols.length > 0 &&
-          !hasRequiredSymbolsData(resp.price_series || resp.series, marketSymbols) &&
-          warmupPromise
-        ) {
-          await warmupPromise;
-          if (cancelled) return;
-          resp = await api.getTaskTrendComparison(task.id, periodValue, trendMetric);
-        }
+        const fetchMetricTrend = async (metric: 'relative' | 'sma20' | 'return20d' | 'score') => {
+          const cacheKey = toTaskTrendCacheKey(task.id, trendPeriod, metric, trendLabelTimezone, trendCacheScopeKey);
+          const cacheEntry = taskTrendCache.get(cacheKey);
+          if (cacheEntry && !dailySynced) {
+            const shouldReuseCache =
+              isTaskTrendCacheFresh(cacheEntry) &&
+              (metric !== trendMetric || hasRenderableTrendCache(cacheEntry));
+            if (shouldReuseCache) {
+              return;
+            }
+          }
+
+          const inFlight = taskTrendInFlight.get(cacheKey);
+          if (inFlight) {
+            await inFlight;
+            if (!dailySynced && taskTrendCache.has(cacheKey)) {
+              return;
+            }
+          }
+
+          const requestPromise = (async () => {
+            let resp = await api.getTaskTrendComparison(task.id, periodValue, metric, trendLabelTimezone);
+            if (
+              metric !== 'score' &&
+              marketSymbols.length > 0 &&
+              !hasRequiredSymbolsData(resp.price_series || resp.series, marketSymbols)
+            ) {
+              await ensureWarmup();
+              resp = await api.getTaskTrendComparison(task.id, periodValue, metric, trendLabelTimezone);
+            }
+            const baseSeriesRaw =
+              metric === 'sma20' && Array.isArray(resp.deviation_series)
+                ? resp.deviation_series
+                : resp.series;
+            const seriesWithColors = withSeriesColors(baseSeriesRaw);
+            const priceSeriesWithColors =
+              metric === 'sma20' ? withSeriesColors(resp.price_series) : [];
+            const sma20SeriesWithColors =
+              metric === 'sma20' ? withSeriesColors(resp.sma20_series) : [];
+            taskTrendCache.set(cacheKey, {
+              cachedAt: Date.now(),
+              dates: resp.dates || [],
+              series: seriesWithColors,
+              priceSeries: priceSeriesWithColors,
+              sma20Series: sma20SeriesWithColors,
+            });
+          })();
+
+          taskTrendInFlight.set(cacheKey, requestPromise);
+          try {
+            await requestPromise;
+          } finally {
+            if (taskTrendInFlight.get(cacheKey) === requestPromise) {
+              taskTrendInFlight.delete(cacheKey);
+            }
+          }
+        };
+
+        const results = await Promise.allSettled(metricsToLoad.map((metric) => fetchMetricTrend(metric)));
         if (cancelled) return;
-        const baseSeriesRaw =
-          trendMetric === 'sma20' && Array.isArray(resp.deviation_series)
-            ? resp.deviation_series
-            : resp.series;
-        const seriesWithColors = withSeriesColors(baseSeriesRaw);
-        const priceSeriesWithColors =
-          trendMetric === 'sma20' ? withSeriesColors(resp.price_series) : [];
-        const sma20SeriesWithColors =
-          trendMetric === 'sma20' ? withSeriesColors(resp.sma20_series) : [];
-        setTrendDates(resp.dates || []);
-        setTrendSeries(seriesWithColors);
-        setTrendPriceSeries(priceSeriesWithColors);
-        setTrendSma20Series(sma20SeriesWithColors);
-        taskTrendCache.set(cacheKey, {
-          cachedAt: Date.now(),
-          dates: resp.dates || [],
-          series: seriesWithColors,
-          priceSeries: priceSeriesWithColors,
-          sma20Series: sma20SeriesWithColors,
-        });
+
+        const hasSelectedMetricCache = setTrendFromCache(trendMetric);
+        if (!hasSelectedMetricCache) {
+          setTrendDates([]);
+          setTrendSeries([]);
+          setTrendPriceSeries([]);
+          setTrendSma20Series([]);
+        }
+
+        const failedResults = results.filter(
+          (result): result is PromiseRejectedResult => result.status === 'rejected'
+        );
+        if (!hasSelectedMetricCache && failedResults.length > 0) {
+          const firstReason = failedResults[0].reason;
+          setTrendError(firstReason instanceof Error ? firstReason.message : '走势数据加载失败');
+        } else {
+          setTrendError(null);
+        }
       } catch (e) {
         if (cancelled) return;
-        setTrendDates([]);
-        setTrendSeries([]);
-        setTrendPriceSeries([]);
-        setTrendSma20Series([]);
+        if (!selectedCached) {
+          setTrendDates([]);
+          setTrendSeries([]);
+          setTrendPriceSeries([]);
+          setTrendSma20Series([]);
+        }
         setTrendError(e instanceof Error ? e.message : '走势数据加载失败');
       } finally {
         if (cancelled) return;
@@ -620,7 +1140,19 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
     return () => {
       cancelled = true;
     };
-  }, [task.id, task.baseIndex, task.sector, trendPeriod, trendMetric]);
+  }, [task.id, resolvedEtfsKey, taskBaseIndicesKey, task.sector, trendPeriod, trendMetric, trendLabelTimezone, trendCacheScopeKey]);
+
+  useEffect(() => {
+    if (!task.id) return;
+    const cacheKey = toTaskTrendCacheKey(task.id, trendPeriod, trendMetric, trendLabelTimezone, trendCacheScopeKey);
+    const cached = taskTrendCache.get(cacheKey);
+    if (!cached) return;
+    setTrendDates(cached.dates);
+    setTrendSeries(cached.series);
+    setTrendPriceSeries(cached.priceSeries);
+    setTrendSma20Series(cached.sma20Series);
+    setTrendError(null);
+  }, [task.id, trendPeriod, trendMetric, trendLabelTimezone, trendCacheScopeKey]);
 
   useEffect(() => {
     if (!resolvedEtfs.length) {
@@ -714,9 +1246,29 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
   };
 
   const etfSymbols = resolvedEtfs;
-  const latestUpdatedAt = task.updatedAt || task.createdAt;
+  const latestUpdatedAt = useMemo(() => {
+    const refreshEventTs = parseTimestampMs(lastRefreshAllAt);
+    if (Number.isFinite(refreshEventTs)) {
+      return new Date(refreshEventTs).toISOString();
+    }
+    const latestEtfTs = etfDetails.reduce<number>((latest, etf) => {
+      const ts = parseTimestampMs(etf.lastUpdated);
+      return Number.isFinite(ts) && ts > latest ? ts : latest;
+    }, Number.NaN);
+    if (Number.isFinite(latestEtfTs)) {
+      return new Date(latestEtfTs).toISOString();
+    }
+    return task.updatedAt || task.createdAt;
+  }, [lastRefreshAllAt, etfDetails, task.updatedAt, task.createdAt]);
   const latestUpdatedAtLabel = useMemo(() => formatUpdateDate(latestUpdatedAt), [latestUpdatedAt]);
   const resetBoundaryMs = useMemo(() => getBeijingResetBoundaryMs(clockNowMs), [clockNowMs]);
+  const effectiveSourceUpdatedAtMap = useMemo(
+    () => ({
+      ...sourceUpdatedAtMap,
+      ...deriveTaskSourceUpdatedAtMap(etfDetails),
+    }),
+    [etfDetails, sourceUpdatedAtMap]
+  );
   const trendSymbolRoleMap = useMemo(() => {
     const roleMap: Record<string, 'market' | 'sector' | 'industry' | 'stock' | 'other'> = {
       SPY: 'market',
@@ -724,9 +1276,9 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
       IWM: 'market',
       DIA: 'market',
     };
-    if (task.baseIndex) {
-      roleMap[task.baseIndex.toUpperCase()] = 'market';
-    }
+    taskBaseIndices.forEach((symbol) => {
+      roleMap[symbol.toUpperCase()] = 'market';
+    });
     if (task.sector) {
       roleMap[task.sector.toUpperCase()] = 'sector';
     }
@@ -734,11 +1286,10 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
       roleMap[etf.symbol.toUpperCase()] = etf.type === 'sector' ? 'sector' : 'industry';
     });
     return roleMap;
-  }, [etfDetails, task.baseIndex, task.sector]);
-
+  }, [etfDetails, taskBaseIndicesKey, task.sector]);
   const sourceIndicators = useMemo(() => {
     return (Object.keys(SOURCE_CIRCLE_META) as SourceKey[]).map((sourceKey) => {
-      const updatedAt = sourceUpdatedAtMap[sourceKey] || null;
+      const updatedAt = effectiveSourceUpdatedAtMap[sourceKey] || null;
       const updatedAtMs = updatedAt ? new Date(updatedAt).getTime() : Number.NaN;
       const isUpdatedInCurrentWindow = Number.isFinite(updatedAtMs) && updatedAtMs >= resetBoundaryMs;
       const status: SourceStatus = isUpdatedInCurrentWindow ? 'complete' : 'missing';
@@ -756,12 +1307,12 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
         updatedAt: isUpdatedInCurrentWindow ? updatedAt : null,
       };
     });
-  }, [resetBoundaryMs, sourceUpdatedAtMap]);
+  }, [effectiveSourceUpdatedAtMap, resetBoundaryMs]);
 
   const refreshImportGuardMessage = useMemo(() => {
     const requiredSources: SourceKey[] = ['finviz', 'marketchameleon'];
     const missing = requiredSources.filter((sourceKey) => {
-      const updatedAt = sourceUpdatedAtMap[sourceKey];
+      const updatedAt = effectiveSourceUpdatedAtMap[sourceKey];
       if (!updatedAt) return true;
       const ts = new Date(updatedAt).getTime();
       return !Number.isFinite(ts) || ts < resetBoundaryMs;
@@ -777,7 +1328,7 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
     const missingLabel = missing.map((sourceKey) => sourceLabels[sourceKey]).join(' + ');
     const boundaryLabel = formatBeijingBoundaryLabel(resetBoundaryMs);
     return `请先导入 ${missingLabel} 最新数据（北京时间 ${boundaryLabel} 起算）。`;
-  }, [resetBoundaryMs, sourceUpdatedAtMap]);
+  }, [effectiveSourceUpdatedAtMap, resetBoundaryMs]);
 
   const trendValueFormatter = useMemo(() => {
     if (trendMetric === 'sma20') {
@@ -839,9 +1390,41 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
         return acc;
       }, {});
       setLatestRefreshResults((prev) => ({ ...prev, ...mappedResults }));
+      if (resp.results?.length) {
+        const refreshResultMap = new Map(
+          resp.results
+            .filter((item): item is typeof item & { symbol: string } => typeof item?.symbol === 'string')
+            .map((item) => [item.symbol.trim().toUpperCase(), item] as const)
+        );
+        const patchedEtfs = sortTaskEtfDetails(
+          etfDetails.map((etfDetail) => {
+            const refreshResult = refreshResultMap.get(etfDetail.symbol.trim().toUpperCase());
+            if (!refreshResult) {
+              return etfDetail;
+            }
+            return {
+              ...etfDetail,
+              ...(typeof refreshResult.score === 'number' ? { score: refreshResult.score } : {}),
+              ...(typeof refreshResult.completeness === 'number'
+                ? { completeness: refreshResult.completeness }
+                : {}),
+              ...(resp.updated_at ? { lastUpdated: resp.updated_at } : {}),
+            };
+          }),
+          task.type,
+          etfSymbols,
+          task.sector
+        );
+        setEtfDetails(patchedEtfs);
+        etfDetailsCache.set(etfDetailsCacheKey, {
+          cachedAt: Date.now(),
+          data: patchedEtfs,
+        });
+      }
       if (updatedSources.size > 0) {
         markSourcesUpdated(Array.from(updatedSources));
       }
+      setLastRefreshAllAt(resp.updated_at || new Date().toISOString());
 
       setRefreshProgress({
         completed: resp.completed ?? etfSymbols.length,
@@ -873,19 +1456,46 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
     expectedSymbolsCount?: number,
     progressToken?: string
   ) => {
-    // 解析 coverageId (如 "top10", "weight70")
-    const isTop = coverageId.startsWith('top');
-    const coverageType = isTop ? 'top' : 'weight';
-    const valueStr = coverageId.replace('top', '').replace('weight', '');
-    const coverageValue = parseInt(valueStr, 10);
+    const parsedCoverage = parseCoverageSelection(coverageId);
+    const normalizedSymbol = symbol.trim().toUpperCase();
+    const targetEtfDetail = etfDetails.find((etfDetail) => etfDetail.symbol === normalizedSymbol);
+    const expectedCoverageSymbols = targetEtfDetail
+      ? pickCoverageSymbols(targetEtfDetail.holdings, coverageId)
+      : [];
+    const coverageType = parsedCoverage?.type;
+    const coverageValue =
+      !parsedCoverage
+        ? undefined
+        : parsedCoverage.type === 'all'
+          ? expectedCoverageSymbols.length
+          : parsedCoverage.value;
+    const resolvedExpectedSymbolsCount =
+      typeof expectedSymbolsCount === 'number' && Number.isFinite(expectedSymbolsCount) && expectedSymbolsCount > 0
+        ? expectedSymbolsCount
+        : expectedCoverageSymbols.length > 0
+          ? expectedCoverageSymbols.length
+          : undefined;
 
     try {
-      if (isNaN(coverageValue)) {
+      if (!parsedCoverage) {
         console.error('无效的覆盖范围值');
         throw new Error('无效的覆盖范围值');
       }
+      if (!coverageType || coverageValue === undefined) {
+        console.error('无效的覆盖范围配置');
+        throw new Error('无效的覆盖范围配置');
+      }
 
       console.log(`开始刷新 ${symbol} 的 ${coverageId} Holdings 数据...`);
+      const relatedEtfSymbols = task.type === 'drilldown'
+        ? Array.from(
+            new Set(
+              etfSymbols
+                .map((item) => item.trim().toUpperCase())
+                .filter((item) => item !== '' && item !== normalizedSymbol)
+            )
+          )
+        : [];
 
       // 调用API刷新Holdings数据
       // 后端应该支持多数据源的并发获取：Finviz, MarketChameleon, 市场数据(IBKR), 期权数据(Futu)等
@@ -893,8 +1503,9 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
         symbol,
         coverageType,
         coverageValue,
-        expectedSymbolsCount,
-        progressToken
+        resolvedExpectedSymbolsCount,
+        progressToken,
+        relatedEtfSymbols
       );
 
       console.log('Holdings refresh response:', response);
@@ -903,16 +1514,45 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
       const updatedAtRaw = responseRecord['updated_at'];
       const updatedAtFromResponse = typeof updatedAtRaw === 'string' ? updatedAtRaw : undefined;
       const refreshedSources = new Set<SourceKey>();
+      const parseBooleanFlag = (value: unknown): boolean | undefined => {
+        if (typeof value === 'boolean') {
+          return value;
+        }
+        if (typeof value === 'string') {
+          const normalized = value.trim().toLowerCase();
+          if (normalized === 'true') return true;
+          if (normalized === 'false') return false;
+        }
+        return undefined;
+      };
+      const parseDataStatus = (value: unknown): Holding['dataStatus'] =>
+        value === 'complete' || value === 'pending' || value === 'missing' || value === 'loading'
+          ? value
+          : undefined;
+      const parseFiniteNumber = (value: unknown): number | undefined =>
+        typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+      type HoldingUpdatePatch = {
+        dataSources?: Record<string, boolean>;
+        dataStatus?: Holding['dataStatus'];
+        completeness?: number;
+        updatedAt?: string | null;
+        score?: number | null;
+      };
       const perHoldingUpdates = new Map<
         string,
-        {
-          dataSources?: Record<string, boolean>;
-          dataStatus?: Holding['dataStatus'];
-          completeness?: number;
-          updatedAt?: string | null;
-          score?: number | null;
-        }
+        HoldingUpdatePatch
       >();
+      const mergeHoldingUpdate = (ticker: string, patch: HoldingUpdatePatch) => {
+        const existing = perHoldingUpdates.get(ticker) || {};
+        const mergedDataSources = patch.dataSources
+          ? { ...(existing.dataSources || {}), ...patch.dataSources }
+          : existing.dataSources;
+        perHoldingUpdates.set(ticker, {
+          ...existing,
+          ...patch,
+          ...(mergedDataSources ? { dataSources: mergedDataSources } : {}),
+        });
+      };
       if (Array.isArray(response.updated_stocks)) {
         response.updated_stocks.forEach((stock) => {
           if (!isRecord(stock)) return;
@@ -922,15 +1562,7 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
           if (!ticker) return;
 
           const dataSourcesArray = Array.isArray(stock.data_sources) ? stock.data_sources : [];
-          const sourceFlags: Record<string, boolean> = {
-            finviz: false,
-            marketchameleon: false,
-            market_chameleon: false,
-            ibkr: false,
-            market_data: false,
-            futu: false,
-            options_data: false,
-          };
+          const sourceFlags: Record<string, boolean> = {};
           dataSourcesArray.forEach((source) => {
             if (typeof source !== 'string') return;
             const normalized = source.trim().toLowerCase();
@@ -955,25 +1587,15 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
             }
           });
 
-          const rawStatus = typeof stock['data_status'] === 'string' ? stock['data_status'] : undefined;
-          const dataStatus: Holding['dataStatus'] =
-            rawStatus === 'complete' || rawStatus === 'pending' || rawStatus === 'missing' || rawStatus === 'loading'
-              ? rawStatus
-              : undefined;
-
-          const completenessRaw = stock['completeness'];
-          const completeness = typeof completenessRaw === 'number' && Number.isFinite(completenessRaw)
-            ? completenessRaw
-            : undefined;
-
+          const dataStatus = parseDataStatus(stock['data_status']);
+          const completeness = parseFiniteNumber(stock['completeness']);
           const stockUpdatedAtRaw = stock['updated_at'];
           const stockUpdatedAt = typeof stockUpdatedAtRaw === 'string' ? stockUpdatedAtRaw : updatedAtFromResponse ?? null;
-
           const scoreRaw = stock['score'];
           const score = typeof scoreRaw === 'number' && Number.isFinite(scoreRaw) ? scoreRaw : null;
 
-          perHoldingUpdates.set(ticker, {
-            dataSources: dataSourcesArray.length > 0 ? sourceFlags : undefined,
+          mergeHoldingUpdate(ticker, {
+            dataSources: Object.keys(sourceFlags).length > 0 ? sourceFlags : undefined,
             dataStatus,
             completeness,
             updatedAt: stockUpdatedAt,
@@ -981,45 +1603,99 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
           });
         });
       }
+
+      const completenessRecord = isRecord(responseRecord['completeness']) ? responseRecord['completeness'] : null;
+      const holdingsStatus = completenessRecord && Array.isArray(completenessRecord['holdings_status'])
+        ? completenessRecord['holdings_status']
+        : [];
+      holdingsStatus.forEach((item) => {
+        if (!isRecord(item)) return;
+        const tickerRaw = item['ticker'];
+        const ticker = typeof tickerRaw === 'string' ? tickerRaw.trim().toUpperCase() : '';
+        if (!ticker) return;
+
+        const sourcePayload = isRecord(item['data_sources']) ? item['data_sources'] : {};
+        const finvizReady = parseBooleanFlag(sourcePayload['finviz']);
+        const mcReady = parseBooleanFlag(sourcePayload['marketchameleon']) ?? parseBooleanFlag(sourcePayload['market_chameleon']);
+        const ibkrReady = parseBooleanFlag(sourcePayload['ibkr']) ?? parseBooleanFlag(sourcePayload['market_data']);
+        const futuReady = parseBooleanFlag(sourcePayload['futu']) ?? parseBooleanFlag(sourcePayload['options_data']);
+
+        const sourceFlags: Record<string, boolean> = {};
+        if (finvizReady !== undefined) sourceFlags.finviz = finvizReady;
+        if (mcReady !== undefined) {
+          sourceFlags.marketchameleon = mcReady;
+          sourceFlags.market_chameleon = mcReady;
+        }
+        if (ibkrReady !== undefined) {
+          sourceFlags.ibkr = ibkrReady;
+          sourceFlags.market_data = ibkrReady;
+        }
+        if (futuReady !== undefined) {
+          sourceFlags.futu = futuReady;
+          sourceFlags.options_data = futuReady;
+        }
+
+        if (finvizReady) refreshedSources.add('finviz');
+        if (mcReady) refreshedSources.add('marketchameleon');
+        if (ibkrReady) refreshedSources.add('ibkr');
+        if (futuReady) refreshedSources.add('futu');
+
+        const status = parseDataStatus(item['status']);
+        const completeness = parseFiniteNumber(item['completeness_score']) ?? parseFiniteNumber(item['completeness']);
+        const lastUpdatedRaw = item['last_updated'];
+        const lastUpdated = typeof lastUpdatedRaw === 'string' ? lastUpdatedRaw : updatedAtFromResponse ?? null;
+
+        mergeHoldingUpdate(ticker, {
+          dataSources: Object.keys(sourceFlags).length > 0 ? sourceFlags : undefined,
+          dataStatus: status,
+          completeness,
+          updatedAt: lastUpdated,
+        });
+      });
+
       if (refreshedSources.size > 0) {
         markSourcesUpdated(Array.from(refreshedSources), updatedAtFromResponse);
       }
+      setLastRefreshAllAt(updatedAtFromResponse || new Date().toISOString());
 
       if (perHoldingUpdates.size > 0) {
         setEtfDetails((prev) =>
-          prev.map((etfDetail) => {
-            if (etfDetail.symbol !== symbol) return etfDetail;
-            const nextHoldings = etfDetail.holdings.map((holding) => {
-              const update = perHoldingUpdates.get(holding.ticker.toUpperCase());
-              if (!update) return holding;
-              const mergedDataSources = update.dataSources
-                ? { ...(holding.dataSources || {}), ...update.dataSources }
-                : holding.dataSources;
+          sortTaskEtfDetails(
+            prev.map((etfDetail) => {
+              if (etfDetail.symbol !== symbol) return etfDetail;
+              const nextHoldings = etfDetail.holdings.map((holding) => {
+                const update = perHoldingUpdates.get(holding.ticker.toUpperCase());
+                if (!update) return holding;
+                const mergedDataSources = update.dataSources
+                  ? { ...(holding.dataSources || {}), ...update.dataSources }
+                  : holding.dataSources;
+                return {
+                  ...holding,
+                  ...(mergedDataSources ? { dataSources: mergedDataSources } : {}),
+                  ...(update.dataStatus ? { dataStatus: update.dataStatus } : {}),
+                  ...(typeof update.completeness === 'number' ? { completeness: update.completeness } : {}),
+                  ...(update.updatedAt ? { updatedAt: update.updatedAt } : {}),
+                  ...(typeof update.score === 'number' ? { score: update.score } : {}),
+                };
+              });
               return {
-                ...holding,
-                ...(mergedDataSources ? { dataSources: mergedDataSources } : {}),
-                ...(update.dataStatus ? { dataStatus: update.dataStatus } : {}),
-                ...(typeof update.completeness === 'number' ? { completeness: update.completeness } : {}),
-                ...(update.updatedAt ? { updatedAt: update.updatedAt } : {}),
-                ...(typeof update.score === 'number' ? { score: update.score } : {}),
+                ...etfDetail,
+                holdings: nextHoldings,
               };
-            });
-            return {
-              ...etfDetail,
-              holdings: nextHoldings,
-            };
-          })
+            }),
+            task.type,
+            etfSymbols,
+            task.sector
+          )
         );
       }
 
-      // 当后端未返回逐标的更新结果时，回退为全量重载
-      if (perHoldingUpdates.size === 0) {
-        setTimeout(() => {
-          if (etfSymbols.length) {
-            loadETFData(etfSymbols, { silent: true });
-          }
-        }, 1000);
-      }
+      // 无论是否命中本地乐观更新，都做一次静默重拉，确保与后端最终状态一致。
+      window.setTimeout(() => {
+        if (etfSymbols.length) {
+          void loadETFData(etfSymbols, { silent: true });
+        }
+      }, 1000);
 
       return response;
     } catch (e) {
@@ -1126,7 +1802,7 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
               </span>
             </div>
             <div className="flex items-center gap-4 mt-1 text-sm text-[var(--text-muted)]">
-              <span>基准: {task.baseIndex}</span>
+              <span>基准: {taskBaseIndices.join(' / ')}</span>
               {task.sector && <span>板块: {task.sector}</span>}
               <span className="inline-flex items-center gap-1.5">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -1204,6 +1880,32 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
             走势对比加载失败：{trendError}
           </div>
         )}
+        <div className="flex justify-end mb-2">
+          <div className="inline-flex rounded border border-[var(--border-light)] overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setTrendLabelTimezone('market')}
+              className={`px-2 py-1 text-xs transition-colors ${
+                trendLabelTimezone === 'market'
+                  ? 'bg-[var(--accent-blue)] text-white'
+                  : 'bg-[var(--bg-primary)] text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+              }`}
+            >
+              美东交易日
+            </button>
+            <button
+              type="button"
+              onClick={() => setTrendLabelTimezone('beijing')}
+              className={`px-2 py-1 text-xs border-l border-[var(--border-light)] transition-colors ${
+                trendLabelTimezone === 'beijing'
+                  ? 'bg-[var(--accent-blue)] text-white'
+                  : 'bg-[var(--bg-primary)] text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+              }`}
+            >
+              北京时间
+            </button>
+          </div>
+        </div>
         <RelativeTrendChart
           title="走势对比"
           dates={trendDates}
@@ -1216,7 +1918,7 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
           metricOptions={TREND_METRIC_OPTIONS}
           onMetricChange={(value) => setTrendMetric(value as typeof trendMetric)}
           valueFormatter={trendValueFormatter}
-          baseSymbol={task.baseIndex}
+          baseSymbol={primaryBaseIndex}
           symbolRoleMap={trendSymbolRoleMap}
         />
         {isTrendLoading && (
@@ -1246,10 +1948,7 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
                   handleRefreshHoldings(etf.symbol, coverageId, expectedSymbolsCount, progressToken)
                 }
                 onImportHoldings={(coverageId?: string) => handleOpenHoldingsModal(etf.symbol, coverageId)}
-                onViewStockDetail={(ticker) => {
-                  console.log('View stock detail:', ticker);
-                  // TODO: Navigate to stock detail page
-                }}
+                onViewStockDetail={(ticker) => onViewStockDetail?.(ticker)}
               />
             );
           })}
@@ -1269,27 +1968,55 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
           console.log('Import holdings:', selectedETF, data);
           if (selectedETF && data.jsonData) {
             try {
-              const parsedData = JSON.parse(data.jsonData);
-              if (!Array.isArray(parsedData)) {
-                throw new Error('JSON 数据必须是数组格式');
+              const parsedPayload = JSON.parse(data.jsonData);
+              const parsedRows = extractImportRows(parsedPayload);
+              if (!parsedRows) {
+                throw new Error('JSON 数据必须是数组，或包含 data / holdings 数组字段');
               }
-              const importedAt = new Date().toISOString();
-              const importedSymbols = new Set(
-                parsedData
-                  .map((item) => {
-                    if (!isRecord(item)) return null;
-                    const symbolRaw = item.Ticker ?? item.ticker ?? item.Symbol ?? item.symbol;
-                    return typeof symbolRaw === 'string' ? symbolRaw.trim().toUpperCase() : null;
-                  })
-                  .filter((value): value is string => Boolean(value))
+              const parsedData = parsedRows.filter((item): item is Record<string, unknown> => isRecord(item));
+              if (parsedData.length !== parsedRows.length) {
+                throw new Error('JSON 数组中的每条记录必须是对象格式');
+              }
+              const importedSymbolsRaw = parsedData
+                .map((item) => extractSymbolFromImportItem(item))
+                .filter((value): value is string => Boolean(value));
+              if (!importedSymbolsRaw.length) {
+                throw new Error('未识别到持仓代码，请确认包含 Ticker 或 Symbol 字段');
+              }
+
+              const targetEtfDetail = etfDetails.find((etfDetail) => etfDetail.symbol === selectedETF);
+              if (!targetEtfDetail || targetEtfDetail.holdings.length === 0) {
+                throw new Error('当前 ETF 持仓为空，无法校验覆盖范围，请先刷新持仓后再导入');
+              }
+              const expectedCoverageSymbols = pickCoverageSymbols(targetEtfDetail.holdings, data.coverage);
+              if (!expectedCoverageSymbols.length) {
+                throw new Error(`覆盖范围 ${data.coverage} 未匹配到任何标的，无法导入`);
+              }
+              const matchResult = assertSymbolsMatch(
+                `Holdings（${selectedETF} / ${data.coverage}）`,
+                expectedCoverageSymbols,
+                importedSymbolsRaw
               );
+              if (matchResult.aliasMappings.length > 0) {
+                console.info(
+                  `Holdings（${selectedETF} / ${data.coverage}）标的映射: ${matchResult.aliasMappings.join(', ')}`
+                );
+              }
+              const importedSymbols = new Set(matchResult.symbols);
+
+              const importedAt = new Date().toISOString();
               
               // 调用后端 API 导入数据
               if (data.source === 'finviz') {
-                await api.importFinvizData(selectedETF, data.coverage, parsedData);
+                const response = await api.importFinvizData(selectedETF, data.coverage, parsedData);
+                if (Array.isArray(response.symbol_alias_mappings) && response.symbol_alias_mappings.length > 0) {
+                  console.info(
+                    `Finviz 标的映射: ${response.symbol_alias_mappings.join(', ')}`
+                  );
+                }
                 markSourcesUpdated(['finviz'], importedAt);
               } else {
-                await api.importMCData(parsedData);
+                await api.importMCData(selectedETF, data.coverage, parsedData);
                 markSourcesUpdated(['marketchameleon'], importedAt);
               }
 
@@ -1303,49 +2030,54 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
               // 先做乐观更新，确保卡片即时反馈
               if (importedSymbols.size > 0) {
                 setEtfDetails((prev) =>
-                  prev.map((etfDetail) => {
-                    if (etfDetail.symbol !== selectedETF) return etfDetail;
-                    const nextHoldings = etfDetail.holdings.map((holding) => {
-                      if (!importedSymbols.has(holding.ticker.toUpperCase())) {
-                        return holding;
-                      }
-                      const mergedDataSources = { ...(holding.dataSources || {}) };
-                      if (data.source === 'finviz') {
-                        mergedDataSources.finviz = true;
-                      } else {
-                        mergedDataSources.marketchameleon = true;
-                        mergedDataSources.market_chameleon = true;
-                      }
+                  sortTaskEtfDetails(
+                    prev.map((etfDetail) => {
+                      if (etfDetail.symbol !== selectedETF) return etfDetail;
+                      const nextHoldings = etfDetail.holdings.map((holding) => {
+                        if (!importedSymbols.has(holding.ticker.toUpperCase())) {
+                          return holding;
+                        }
+                        const mergedDataSources = { ...(holding.dataSources || {}) };
+                        if (data.source === 'finviz') {
+                          mergedDataSources.finviz = true;
+                        } else {
+                          mergedDataSources.marketchameleon = true;
+                          mergedDataSources.market_chameleon = true;
+                        }
 
-                      const finvizReady = Boolean(mergedDataSources.finviz);
-                      const mcReady = Boolean(
-                        mergedDataSources.marketchameleon || mergedDataSources.market_chameleon
-                      );
-                      const dataStatus: Holding['dataStatus'] =
-                        finvizReady && mcReady
-                          ? 'complete'
-                          : finvizReady || mcReady
-                            ? 'pending'
-                            : 'missing';
-                      const completeness =
-                        finvizReady && mcReady ? 100 : finvizReady || mcReady ? 50 : 0;
+                        const finvizReady = Boolean(mergedDataSources.finviz);
+                        const mcReady = Boolean(
+                          mergedDataSources.marketchameleon || mergedDataSources.market_chameleon
+                        );
+                        const dataStatus: Holding['dataStatus'] =
+                          finvizReady && mcReady
+                            ? 'complete'
+                            : finvizReady || mcReady
+                              ? 'pending'
+                              : 'missing';
+                        const completeness =
+                          finvizReady && mcReady ? 100 : finvizReady || mcReady ? 50 : 0;
 
+                        return {
+                          ...holding,
+                          dataSources: mergedDataSources,
+                          dataStatus,
+                          completeness,
+                          updatedAt: importedAt,
+                        };
+                      });
+                      const existingRanges = new Set(etfDetail.coverageRanges || []);
+                      existingRanges.add(data.coverage);
                       return {
-                        ...holding,
-                        dataSources: mergedDataSources,
-                        dataStatus,
-                        completeness,
-                        updatedAt: importedAt,
+                        ...etfDetail,
+                        holdings: nextHoldings,
+                        coverageRanges: Array.from(existingRanges),
                       };
-                    });
-                    const existingRanges = new Set(etfDetail.coverageRanges || []);
-                    existingRanges.add(data.coverage);
-                    return {
-                      ...etfDetail,
-                      holdings: nextHoldings,
-                      coverageRanges: Array.from(existingRanges),
-                    };
-                  })
+                    }),
+                    task.type,
+                    etfSymbols,
+                    task.sector
+                  )
                 );
               }
 
@@ -1365,15 +2097,37 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
         isOpen={etfModalOpen}
         onClose={() => setETFModalOpen(false)}
         etfSymbol={selectedETF}
-        onImport={(data) => {
+        onImport={async (data) => {
           console.log('Import ETF data:', selectedETF, data);
-          if (data.source === 'finviz') {
-            markSourcesUpdated(['finviz']);
-          } else {
-            markSourcesUpdated(['marketchameleon']);
-          }
-          if (etfSymbols.length) {
-            loadETFData(etfSymbols, { silent: true });
+          try {
+            const parsedPayload = JSON.parse(data.jsonData);
+            const importedSymbolsRaw = pickSymbolsFromImportPayload(parsedPayload);
+            if (!importedSymbolsRaw.length) {
+              throw new Error('未识别到 ETF 代码，请确认包含 symbol 或 ticker 字段');
+            }
+
+            const monitoredSymbols = dedupeSymbols(etfSymbols);
+            if (!monitoredSymbols.length) {
+              throw new Error('当前任务没有可校验的监控 ETF');
+            }
+            const matchResult = assertSymbolsMatch('ETF 列表', monitoredSymbols, importedSymbolsRaw);
+            if (matchResult.aliasMappings.length > 0) {
+              console.info(`ETF 列表标的映射: ${matchResult.aliasMappings.join(', ')}`);
+            }
+
+            const importedAt = new Date().toISOString();
+            if (data.source === 'finviz') {
+              markSourcesUpdated(['finviz'], importedAt);
+            } else {
+              markSourcesUpdated(['marketchameleon'], importedAt);
+            }
+            if (etfSymbols.length) {
+              await loadETFData(etfSymbols, { silent: true });
+            }
+          } catch (e) {
+            console.error('Import ETF data failed:', e);
+            const message = e instanceof Error ? e.message : '导入失败，请检查数据格式';
+            throw new Error(message);
           }
         }}
       />

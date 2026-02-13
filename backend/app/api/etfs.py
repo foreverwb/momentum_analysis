@@ -7,6 +7,8 @@ ETF API 端点
 import asyncio
 import json
 import logging
+import math
+import re
 import threading
 import pandas as pd
 
@@ -22,17 +24,40 @@ from app.models import (
     get_db, ETF, ETFHolding, VALID_SECTOR_SYMBOLS, Stock, ImportedData,
     PriceHistory, IVData, ScoreSnapshot
 )
+from app.core.broker_config import load_broker_config
+from app.services.parsers import normalize_heat_type
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 COVERAGE_RANGE_PRIORITY = [
     'top10', 'top15', 'top20', 'top25', 'top30',
-    'weight60', 'weight65', 'weight70', 'weight75', 'weight80', 'weight85'
+    'weight60', 'weight65', 'weight70', 'weight75', 'weight80', 'weight85',
+    'all',
 ]
+ETF_SCORE_WEIGHTS = {
+    'rel_mom': 0.45,
+    'trend_quality': 0.25,
+    'breadth': 0.20,
+    'options_confirm': 0.10,
+}
+ETF_COMPLETENESS_WEIGHTS = {
+    'ibkr_price': 20,
+    'ibkr_relmom': 25,
+    'ibkr_trend': 15,
+    'futu_iv': 10,
+    'finviz_breadth': 20,
+    'mc_options': 10,
+}
 HOLDINGS_PROGRESS_TTL_SECONDS = 30 * 60
+_refresh_config = load_broker_config().refresh
+ETF_REFRESH_COOLDOWN_MINUTES = _refresh_config.etf_cooldown_minutes
+ETF_REFRESH_COOLDOWN = timedelta(minutes=ETF_REFRESH_COOLDOWN_MINUTES)
+HOLDINGS_REFRESH_COOLDOWN_MINUTES = _refresh_config.holdings_cooldown_minutes
+HOLDINGS_REFRESH_COOLDOWN = timedelta(minutes=HOLDINGS_REFRESH_COOLDOWN_MINUTES)
 _HOLDINGS_REFRESH_PROGRESS: Dict[str, Dict[str, Any]] = {}
 _HOLDINGS_REFRESH_PROGRESS_LOCK = threading.Lock()
+_SHARE_CLASS_ALIAS_PATTERN = re.compile(r"^([A-Z][A-Z0-9]{0,5})[.-]([A-Z])$")
 
 
 def _utc_now_iso() -> str:
@@ -146,12 +171,527 @@ def _coerce_datetime(value: Any) -> Optional[datetime]:
     return dt
 
 
+def _canonical_symbol_key(value: Any) -> str:
+    normalized = str(value or "").strip().upper()
+    if not normalized:
+        return ""
+    matched = _SHARE_CLASS_ALIAS_PATTERN.match(normalized)
+    if not matched:
+        return normalized
+    return f"{matched.group(1)}.{matched.group(2)}"
+
+
+def _symbol_aliases(symbol: Any) -> List[str]:
+    canonical = _canonical_symbol_key(symbol)
+    if not canonical:
+        return []
+    aliases = {canonical}
+    if "." in canonical:
+        aliases.add(canonical.replace(".", "-", 1))
+    return sorted(aliases)
+
+
+def _iso_utc(value: Optional[datetime]) -> Optional[str]:
+    dt = _coerce_datetime(value)
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _beijing_import_boundary(now_utc: Optional[datetime] = None) -> Dict[str, Any]:
+    now_dt = _coerce_datetime(now_utc) or datetime.utcnow()
+    now_beijing = now_dt + timedelta(hours=8)
+    boundary_beijing = now_beijing.replace(hour=8, minute=0, second=0, microsecond=0)
+    if now_beijing < boundary_beijing:
+        boundary_beijing -= timedelta(days=1)
+    return {
+        "boundary_utc": boundary_beijing - timedelta(hours=8),
+        "boundary_date": boundary_beijing.date(),
+        "boundary_beijing": boundary_beijing,
+    }
+
+
+def _is_fresh_for_boundary(
+    record_date: Any,
+    created_at: Any,
+    *,
+    boundary_date: date,
+    boundary_utc: datetime,
+) -> bool:
+    coerced_date = _coerce_date(record_date)
+    coerced_created_at = _coerce_datetime(created_at)
+    has_fresh_by_date = coerced_date is not None and coerced_date >= boundary_date
+    has_fresh_by_time = coerced_created_at is not None and coerced_created_at >= boundary_utc
+    return has_fresh_by_date or has_fresh_by_time
+
+
+def _pick_record_updated_at(record_date: Any, created_at: Any) -> Optional[datetime]:
+    coerced_created_at = _coerce_datetime(created_at)
+    if coerced_created_at is not None:
+        return coerced_created_at
+    coerced_date = _coerce_date(record_date)
+    if coerced_date is None:
+        return None
+    return datetime.combine(coerced_date, datetime.min.time())
+
+
+def _build_etf_source_updated_at(
+    symbol: str,
+    db: Optional[Session],
+) -> Dict[str, Optional[str]]:
+    result: Dict[str, Optional[str]] = {
+        "finviz": None,
+        "marketchameleon": None,
+        "ibkr": None,
+        "futu": None,
+    }
+    if db is None:
+        return result
+
+    query_symbols = _symbol_aliases(symbol)
+    if not query_symbols:
+        return result
+
+    boundary = _beijing_import_boundary()
+    boundary_utc = boundary["boundary_utc"]
+    boundary_date = boundary["boundary_date"]
+    latest_by_source: Dict[str, datetime] = {}
+
+    try:
+        imported_rows = db.query(
+            ImportedData.source,
+            ImportedData.date,
+            ImportedData.created_at,
+        ).filter(
+            ImportedData.symbol.in_(query_symbols),
+            ImportedData.source.in_(["finviz", "marketchameleon"]),
+        ).all()
+
+        for row in imported_rows:
+            source_name = str(row.source or "").strip().lower()
+            if source_name not in result:
+                continue
+            if not _is_fresh_for_boundary(
+                row.date,
+                row.created_at,
+                boundary_date=boundary_date,
+                boundary_utc=boundary_utc,
+            ):
+                continue
+            candidate_dt = _pick_record_updated_at(row.date, row.created_at)
+            if candidate_dt is None:
+                continue
+            previous_dt = latest_by_source.get(source_name)
+            if previous_dt is None or candidate_dt > previous_dt:
+                latest_by_source[source_name] = candidate_dt
+    except Exception as exc:
+        logger.warning("ETF import source status query failed for %s: %s", symbol.upper(), exc)
+
+    try:
+        price_rows = db.query(
+            PriceHistory.date,
+            PriceHistory.created_at,
+        ).filter(
+            PriceHistory.symbol.in_(query_symbols),
+            PriceHistory.source == "ibkr",
+        ).all()
+
+        for row in price_rows:
+            if not _is_fresh_for_boundary(
+                row.date,
+                row.created_at,
+                boundary_date=boundary_date,
+                boundary_utc=boundary_utc,
+            ):
+                continue
+            candidate_dt = _pick_record_updated_at(row.date, row.created_at)
+            if candidate_dt is None:
+                continue
+            previous_dt = latest_by_source.get("ibkr")
+            if previous_dt is None or candidate_dt > previous_dt:
+                latest_by_source["ibkr"] = candidate_dt
+    except Exception as exc:
+        logger.warning("ETF IBKR source status query failed for %s: %s", symbol.upper(), exc)
+
+    try:
+        iv_rows = db.query(
+            IVData.date,
+            IVData.created_at,
+        ).filter(
+            IVData.symbol.in_(query_symbols),
+            IVData.source == "futu",
+        ).all()
+
+        for row in iv_rows:
+            if not _is_fresh_for_boundary(
+                row.date,
+                row.created_at,
+                boundary_date=boundary_date,
+                boundary_utc=boundary_utc,
+            ):
+                continue
+            candidate_dt = _pick_record_updated_at(row.date, row.created_at)
+            if candidate_dt is None:
+                continue
+            previous_dt = latest_by_source.get("futu")
+            if previous_dt is None or candidate_dt > previous_dt:
+                latest_by_source["futu"] = candidate_dt
+    except Exception as exc:
+        logger.warning("ETF Futu source status query failed for %s: %s", symbol.upper(), exc)
+
+    for source_name, updated_at in latest_by_source.items():
+        result[source_name] = _iso_utc(updated_at)
+    return result
+
+
+def _format_beijing_time(value: Optional[datetime]) -> Optional[str]:
+    dt = _coerce_datetime(value)
+    if dt is None:
+        return None
+    return (dt + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
+
+
+def _build_refresh_gate_state(
+    latest_at: Optional[datetime],
+    now_utc: Optional[datetime] = None,
+    cooldown: Optional[timedelta] = None,
+) -> Dict[str, Any]:
+    cooldown_window = cooldown or ETF_REFRESH_COOLDOWN
+    now_dt = _coerce_datetime(now_utc) or datetime.utcnow()
+    latest_dt = _coerce_datetime(latest_at)
+    if latest_dt is None:
+        return {
+            "latest_at": None,
+            "is_recent": False,
+            "age_seconds": None,
+            "remaining_seconds": None,
+            "next_refresh_at": None,
+        }
+
+    elapsed_seconds = max(0.0, (now_dt - latest_dt).total_seconds())
+    remaining_seconds = max(0.0, cooldown_window.total_seconds() - elapsed_seconds)
+    is_recent = remaining_seconds > 0
+    next_refresh_at = latest_dt + cooldown_window
+    return {
+        "latest_at": latest_dt,
+        "is_recent": is_recent,
+        "age_seconds": int(round(elapsed_seconds)),
+        "remaining_seconds": int(round(remaining_seconds)) if is_recent else 0,
+        "next_refresh_at": next_refresh_at,
+    }
+
+
+def _pick_next_refresh_at(states: List[Dict[str, Any]]) -> Optional[datetime]:
+    candidates: List[datetime] = []
+    for state in states:
+        if not state.get("is_recent"):
+            continue
+        candidate = _coerce_datetime(state.get("next_refresh_at"))
+        if candidate is not None:
+            candidates.append(candidate)
+    if not candidates:
+        return None
+    return min(candidates)
+
+
+def _build_refresh_gate_payload(state: Dict[str, Any]) -> Dict[str, Any]:
+    latest_at = _coerce_datetime(state.get("latest_at"))
+    next_at = _coerce_datetime(state.get("next_refresh_at"))
+    return {
+        "latest_at": _iso_utc(latest_at),
+        "is_recent": bool(state.get("is_recent", False)),
+        "age_seconds": state.get("age_seconds"),
+        "remaining_seconds": state.get("remaining_seconds"),
+        "next_refresh_at": _iso_utc(next_at),
+    }
+
+
+def _filter_holdings_by_coverage(
+    holdings: List[ETFHolding],
+    coverage_type: str,
+    coverage_value: int,
+) -> List[ETFHolding]:
+    coverage_kind = str(coverage_type or "").strip().lower()
+    if coverage_kind == "all":
+        return holdings
+    if coverage_kind == "top":
+        return holdings[:coverage_value]
+    if coverage_kind == "weight":
+        selected: List[ETFHolding] = []
+        accumulated_weight = 0.0
+        for holding in holdings:
+            selected.append(holding)
+            accumulated_weight += float(holding.weight or 0.0)
+            if accumulated_weight >= coverage_value:
+                break
+        return selected
+    raise HTTPException(status_code=400, detail=f"Invalid coverage_type: {coverage_type}")
+
+
+def _format_coverage_label(coverage_type: str, coverage_value: int) -> str:
+    coverage_kind = str(coverage_type or "").strip().lower()
+    if coverage_kind == "all":
+        return "all"
+    return f"{coverage_kind}{coverage_value}"
+
+
 class HoldingsCoverageRequest(BaseModel):
     coverage_type: str
     coverage_value: int
     sources: Optional[List[str]] = None
     concurrent: Optional[bool] = None
     progress_token: Optional[str] = None
+    related_etf_symbols: Optional[List[str]] = None
+
+
+def _default_etf_score_result() -> Dict[str, Dict[str, Any]]:
+    return {
+        'rel_mom': {'score': 0.0, 'data': None},
+        'trend_quality': {'score': 0.0, 'data': None},
+        'breadth': {'score': 50.0, 'data': None},
+        'options_confirm': {'score': 50.0, 'data': None},
+    }
+
+
+def _normalize_etf_dimension(default: Dict[str, Any], payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return dict(default)
+
+    normalized = {
+        "score": float(default.get("score", 0.0) or 0.0),
+        "data": default.get("data"),
+    }
+    score_value = payload.get("score")
+    if isinstance(score_value, (int, float)):
+        normalized["score"] = float(score_value)
+    if payload.get("data") is not None:
+        normalized["data"] = payload.get("data")
+    return normalized
+
+
+def _load_etf_score_result(payload: Any) -> Dict[str, Dict[str, Any]]:
+    score_result = _default_etf_score_result()
+    if not isinstance(payload, dict):
+        return score_result
+
+    for key in score_result:
+        score_result[key] = _normalize_etf_dimension(score_result[key], payload.get(key))
+    return score_result
+
+
+def _get_latest_import_payload(
+    db: Session,
+    symbol: str,
+    source: str,
+) -> Optional[Dict[str, Any]]:
+    query_symbols = _symbol_aliases(symbol)
+    if not query_symbols:
+        return None
+
+    record = db.query(ImportedData).filter(
+        ImportedData.symbol.in_(query_symbols),
+        ImportedData.source == source,
+    ).order_by(
+        ImportedData.date.desc(),
+        ImportedData.created_at.desc(),
+        ImportedData.id.desc(),
+    ).first()
+
+    if record and isinstance(record.data, dict):
+        return record.data
+    return None
+
+
+def _get_latest_etf_holdings(db: Session, etf_symbol: str) -> List[ETFHolding]:
+    latest_date = db.query(func.max(ETFHolding.data_date)).filter(
+        ETFHolding.etf_symbol == etf_symbol.upper()
+    ).scalar()
+    if not latest_date:
+        return []
+
+    return db.query(ETFHolding).filter(
+        ETFHolding.etf_symbol == etf_symbol.upper(),
+        ETFHolding.data_date == latest_date,
+    ).order_by(ETFHolding.weight.desc()).all()
+
+
+def _load_etf_holdings_finviz_payloads(db: Session, etf_symbol: str) -> List[Dict[str, Any]]:
+    payloads: List[Dict[str, Any]] = []
+    for holding in _get_latest_etf_holdings(db, etf_symbol):
+        finviz_payload = _get_latest_import_payload(db, str(holding.ticker or ""), "finviz")
+        if isinstance(finviz_payload, dict):
+            payloads.append(finviz_payload)
+    return payloads
+
+
+def _compute_snapshot_deltas(
+    db: Session,
+    symbol: str,
+    symbol_type: str,
+) -> Dict[str, Optional[float]]:
+    snapshots = db.query(ScoreSnapshot).filter(
+        ScoreSnapshot.symbol == symbol.upper(),
+        ScoreSnapshot.symbol_type == symbol_type,
+    ).order_by(ScoreSnapshot.date.desc(), ScoreSnapshot.id.desc()).limit(6).all()
+
+    if not snapshots:
+        return {"delta3d": None, "delta5d": None}
+
+    current = snapshots[0].total_score or 0
+    delta3d = None
+    delta5d = None
+
+    if len(snapshots) >= 4 and snapshots[3].total_score is not None:
+        delta3d = round(current - snapshots[3].total_score, 2)
+    if len(snapshots) >= 6 and snapshots[5].total_score is not None:
+        delta5d = round(current - snapshots[5].total_score, 2)
+
+    return {"delta3d": delta3d, "delta5d": delta5d}
+
+
+def _recalculate_etf_score_from_db(
+    etf: ETF,
+    db: Session,
+    *,
+    base_breakdown: Optional[Dict[str, Dict[str, Any]]] = None,
+    base_data_sources: Optional[Dict[str, bool]] = None,
+) -> Dict[str, Any]:
+    from app.services.calculators.etf_score import ETFScoreCalculator
+
+    latest_snapshot = db.query(ScoreSnapshot).filter(
+        ScoreSnapshot.symbol == etf.symbol,
+        ScoreSnapshot.symbol_type == 'etf',
+    ).order_by(ScoreSnapshot.date.desc(), ScoreSnapshot.id.desc()).first()
+
+    seed_payload: Any = base_breakdown
+    if seed_payload is None and latest_snapshot and isinstance(latest_snapshot.score_breakdown, dict):
+        seed_payload = latest_snapshot.score_breakdown
+
+    score_result = _load_etf_score_result(seed_payload)
+    calculator = ETFScoreCalculator()
+
+    latest_ibkr_created_at = _coerce_datetime(
+        db.query(func.max(PriceHistory.created_at)).filter(
+            PriceHistory.symbol == etf.symbol,
+            PriceHistory.source == "ibkr",
+        ).scalar()
+    )
+    latest_futu_created_at = _coerce_datetime(
+        db.query(func.max(IVData.created_at)).filter(
+            IVData.symbol == etf.symbol,
+            IVData.source == "futu",
+        ).scalar()
+    )
+
+    data_sources = {
+        'ibkr_price': latest_ibkr_created_at is not None,
+        'ibkr_relmom': score_result['rel_mom'].get('data') is not None,
+        'ibkr_trend': score_result['trend_quality'].get('data') is not None,
+        'futu_iv': latest_futu_created_at is not None or score_result['options_confirm'].get('data') is not None,
+        'finviz_breadth': score_result['breadth'].get('data') is not None,
+        'mc_options': False,
+    }
+    if isinstance(base_data_sources, dict):
+        for key in data_sources:
+            if key in base_data_sources:
+                data_sources[key] = bool(base_data_sources[key])
+
+    holdings = _get_latest_etf_holdings(db, etf.symbol)
+    if holdings:
+        etf.holdings_count = len(holdings)
+
+    finviz_payloads = _load_etf_holdings_finviz_payloads(db, etf.symbol)
+    if finviz_payloads:
+        breadth_result = calculator.calculate_breadth_score(etf.symbol, finviz_payloads)
+        if breadth_result.get('data') is not None:
+            score_result['breadth'] = _normalize_etf_dimension(
+                score_result['breadth'],
+                breadth_result,
+            )
+            data_sources['finviz_breadth'] = True
+
+    thresholds_payload = calculator.check_thresholds(
+        rel_mom_data=score_result['rel_mom'],
+        trend_data=score_result['trend_quality'],
+        breadth_data=score_result['breadth'],
+    )
+    thresholds_pass = bool(thresholds_payload.get('all_pass'))
+    threshold_details = thresholds_payload.get('details') or {}
+
+    total_score = round(
+        sum(
+            ETF_SCORE_WEIGHTS[key] * float((score_result.get(key) or {}).get('score') or 0.0)
+            for key in ETF_SCORE_WEIGHTS
+        ),
+        2,
+    )
+    completeness = sum(
+        ETF_COMPLETENESS_WEIGHTS[key]
+        for key, is_ready in data_sources.items()
+        if is_ready
+    )
+
+    should_persist = base_breakdown is not None or latest_snapshot is not None
+    normalized_sources = {key: bool(value) for key, value in data_sources.items()}
+
+    if not should_persist:
+        return {
+            "score": etf.score,
+            "rank": etf.rank,
+            "completeness": etf.completeness,
+            "thresholds_pass": latest_snapshot.thresholds_pass if latest_snapshot else None,
+            "thresholds": threshold_details,
+            "breakdown": score_result,
+            "data_sources": normalized_sources,
+        }
+
+    etf.score = total_score
+    etf.completeness = completeness
+    etf.updated_at = datetime.utcnow()
+
+    today = date.today()
+    existing_snapshot = db.query(ScoreSnapshot).filter(
+        ScoreSnapshot.symbol == etf.symbol,
+        ScoreSnapshot.symbol_type == 'etf',
+        ScoreSnapshot.date == today,
+    ).first()
+
+    if existing_snapshot:
+        existing_snapshot.total_score = total_score
+        existing_snapshot.score_breakdown = score_result
+        existing_snapshot.thresholds_pass = thresholds_pass
+    else:
+        db.add(ScoreSnapshot(
+            symbol=etf.symbol,
+            symbol_type='etf',
+            date=today,
+            total_score=total_score,
+            score_breakdown=score_result,
+            thresholds_pass=thresholds_pass,
+        ))
+
+    db.flush()
+    etf.delta = _compute_snapshot_deltas(db, etf.symbol, 'etf')
+
+    etfs_of_same_type = db.query(ETF).filter(
+        ETF.type == etf.type,
+        ETF.score > 0,
+    ).order_by(ETF.score.desc(), ETF.symbol.asc()).all()
+    for idx, peer_etf in enumerate(etfs_of_same_type, 1):
+        peer_etf.rank = idx
+
+    db.commit()
+    db.refresh(etf)
+
+    return {
+        "score": etf.score,
+        "rank": etf.rank,
+        "completeness": etf.completeness,
+        "thresholds_pass": thresholds_pass,
+        "thresholds": threshold_details,
+        "breakdown": score_result,
+        "data_sources": normalized_sources,
+    }
 
 
 def format_etf_response(etf: ETF, include_holdings: bool = False, db: Session = None) -> dict:
@@ -193,6 +733,7 @@ def format_etf_response(etf: ETF, include_holdings: bool = False, db: Session = 
 
             # 检查是否有足够的持仓数据来确定覆盖范围
             if holdings_for_date:
+                add_coverage('all')
                 total_holdings = len(holdings_for_date)
                 total_weight = sum(h.weight for h in holdings_for_date)
 
@@ -223,7 +764,11 @@ def format_etf_response(etf: ETF, include_holdings: bool = False, db: Session = 
         "delta": etf.delta or {"delta3d": None, "delta5d": None},
         "completeness": etf.completeness or 0.0,
         "holdingsCount": etf.holdings_count or 0,
-        "coverageRanges": ordered_coverage_ranges
+        "coverageRanges": ordered_coverage_ranges,
+        "sourceUpdatedAt": _build_etf_source_updated_at(etf.symbol, db),
+        # 兼容旧字段(lastUpdated)并提供统一字段(updatedAt)
+        "updatedAt": etf.updated_at.isoformat() if etf.updated_at else None,
+        "lastUpdated": etf.updated_at.isoformat() if etf.updated_at else None,
     }
 
     if etf.type == "industry" and etf.parent_sector:
@@ -239,17 +784,48 @@ def format_etf_response(etf: ETF, include_holdings: bool = False, db: Session = 
             updated_map = {}
             stock_updated_dt_map: Dict[str, Optional[datetime]] = {}
             stock_metrics_map: Dict[str, Dict[str, Any]] = {}
+            stock_price_map: Dict[str, Optional[float]] = {}
             source_map: Dict[str, Dict[str, bool]] = {}
             import_updated_dt_map: Dict[str, datetime] = {}
             if db:
                 try:
                     tickers = list(dict.fromkeys(str(h.ticker).upper() for h in holdings_today if h.ticker))
                     if tickers:
-                        stocks = db.query(Stock).filter(Stock.symbol.in_(tickers)).all()
+                        ticker_key_map = {
+                            ticker: _canonical_symbol_key(ticker) for ticker in tickers
+                        }
+                        canonical_to_ticker: Dict[str, str] = {}
+                        for ticker, canonical in ticker_key_map.items():
+                            if canonical and canonical not in canonical_to_ticker:
+                                canonical_to_ticker[canonical] = ticker
+                        ticker_query_symbols = sorted(
+                            {
+                                alias
+                                for ticker in tickers
+                                for alias in _symbol_aliases(ticker)
+                            }
+                        )
+
+                        stocks = db.query(Stock).filter(Stock.symbol.in_(ticker_query_symbols)).all()
                         for stock in stocks:
-                            score_map[stock.symbol] = stock.score_total
-                            stock_updated_dt_map[stock.symbol] = _coerce_datetime(stock.updated_at)
-                            stock_metrics_map[stock.symbol] = stock.metrics if isinstance(stock.metrics, dict) else {}
+                            stock_symbol = str(stock.symbol or "").upper()
+                            resolved_ticker = canonical_to_ticker.get(
+                                _canonical_symbol_key(stock_symbol),
+                                stock_symbol,
+                            )
+                            if not resolved_ticker:
+                                continue
+                            score_map[resolved_ticker] = stock.score_total
+                            stock_updated_dt_map[resolved_ticker] = _coerce_datetime(stock.updated_at)
+                            stock_metrics_map[resolved_ticker] = stock.metrics if isinstance(stock.metrics, dict) else {}
+                            stock_price_value = None
+                            try:
+                                parsed_price = float(stock.price) if stock.price is not None else None
+                                if parsed_price is not None and math.isfinite(parsed_price):
+                                    stock_price_value = parsed_price
+                            except (TypeError, ValueError):
+                                stock_price_value = None
+                            stock_price_map[resolved_ticker] = stock_price_value
 
                         # 北京时间 08:00 为日切边界
                         now_utc = datetime.utcnow()
@@ -278,12 +854,16 @@ def format_etf_response(etf: ETF, include_holdings: bool = False, db: Session = 
                                 ImportedData.date,
                                 ImportedData.created_at,
                             ).filter(
-                                ImportedData.symbol.in_(tickers),
+                                ImportedData.symbol.in_(ticker_query_symbols),
                                 ImportedData.source.in_(["finviz", "marketchameleon"]),
                             ).all()
 
                             for row in imported_rows:
                                 symbol_name = str(row.symbol).upper()
+                                symbol_canonical = _canonical_symbol_key(symbol_name)
+                                resolved_ticker = canonical_to_ticker.get(symbol_canonical)
+                                if not resolved_ticker:
+                                    continue
                                 source_name = str(row.source).lower()
                                 imported_date = _coerce_date(row.date)
                                 imported_created_at = _coerce_datetime(row.created_at)
@@ -296,7 +876,16 @@ def format_etf_response(etf: ETF, include_holdings: bool = False, db: Session = 
                                 if not (has_fresh_by_date or has_fresh_by_time):
                                     continue
 
-                                source_flags = source_map.setdefault(symbol_name, {})
+                                source_flags = source_map.setdefault(
+                                    resolved_ticker,
+                                    {
+                                        "finviz": False,
+                                        "market_chameleon": False,
+                                        "marketchameleon": False,
+                                        "ibkr": False,
+                                        "futu": False,
+                                    },
+                                )
                                 if source_name == "finviz":
                                     source_flags["finviz"] = True
                                 elif source_name == "marketchameleon":
@@ -304,9 +893,9 @@ def format_etf_response(etf: ETF, include_holdings: bool = False, db: Session = 
                                     source_flags["marketchameleon"] = True
 
                                 candidate_dt = imported_created_at if imported_created_at is not None else boundary_utc
-                                previous_dt = import_updated_dt_map.get(symbol_name)
+                                previous_dt = import_updated_dt_map.get(resolved_ticker)
                                 if previous_dt is None or candidate_dt > previous_dt:
-                                    import_updated_dt_map[symbol_name] = candidate_dt
+                                    import_updated_dt_map[resolved_ticker] = candidate_dt
                         except Exception as exc:
                             logger.warning(f"ImportedData query failed, skip import flags: {exc}")
 
@@ -316,7 +905,7 @@ def format_etf_response(etf: ETF, include_holdings: bool = False, db: Session = 
                                 func.max(PriceHistory.date).label("latest_date"),
                                 func.max(PriceHistory.created_at).label("latest_created_at"),
                             ).filter(
-                                PriceHistory.symbol.in_(tickers),
+                                PriceHistory.symbol.in_(ticker_query_symbols),
                                 PriceHistory.source == "ibkr",
                             ).group_by(
                                 PriceHistory.symbol
@@ -324,6 +913,9 @@ def format_etf_response(etf: ETF, include_holdings: bool = False, db: Session = 
 
                             for row in ibkr_price_rows:
                                 symbol_name = str(row.symbol).upper()
+                                resolved_ticker = canonical_to_ticker.get(_canonical_symbol_key(symbol_name))
+                                if not resolved_ticker:
+                                    continue
                                 latest_price_date = _coerce_date(row.latest_date)
                                 latest_price_created_at = _coerce_datetime(row.latest_created_at)
                                 has_fresh_by_date = (
@@ -337,15 +929,15 @@ def format_etf_response(etf: ETF, include_holdings: bool = False, db: Session = 
                                 if not (has_fresh_by_date or has_fresh_by_time):
                                     continue
 
-                                source_map.setdefault(symbol_name, {}).update({"ibkr": True})
+                                source_map.setdefault(resolved_ticker, {}).update({"ibkr": True})
                                 candidate_dt = (
                                     latest_price_created_at
                                     if latest_price_created_at is not None
                                     else boundary_utc
                                 )
-                                previous_dt = import_updated_dt_map.get(symbol_name)
+                                previous_dt = import_updated_dt_map.get(resolved_ticker)
                                 if previous_dt is None or candidate_dt > previous_dt:
-                                    import_updated_dt_map[symbol_name] = candidate_dt
+                                    import_updated_dt_map[resolved_ticker] = candidate_dt
                         except Exception as exc:
                             logger.warning(f"IBKR price query failed, skip ibkr flags: {exc}")
 
@@ -355,11 +947,14 @@ def format_etf_response(etf: ETF, include_holdings: bool = False, db: Session = 
                                 IVData.date,
                                 IVData.created_at,
                             ).filter(
-                                IVData.symbol.in_(tickers),
+                                IVData.symbol.in_(ticker_query_symbols),
                             ).all()
 
                             for row in iv_rows:
                                 symbol_name = str(row.symbol).upper()
+                                resolved_ticker = canonical_to_ticker.get(_canonical_symbol_key(symbol_name))
+                                if not resolved_ticker:
+                                    continue
                                 iv_date = _coerce_date(row.date)
                                 iv_created_at = _coerce_datetime(row.created_at)
                                 has_fresh_by_date = iv_date is not None and iv_date >= boundary_date
@@ -370,11 +965,11 @@ def format_etf_response(etf: ETF, include_holdings: bool = False, db: Session = 
                                 if not (has_fresh_by_date or has_fresh_by_time):
                                     continue
 
-                                source_map.setdefault(symbol_name, {}).update({"futu": True})
+                                source_map.setdefault(resolved_ticker, {}).update({"futu": True})
                                 candidate_dt = iv_created_at if iv_created_at is not None else boundary_utc
-                                previous_dt = import_updated_dt_map.get(symbol_name)
+                                previous_dt = import_updated_dt_map.get(resolved_ticker)
                                 if previous_dt is None or candidate_dt > previous_dt:
-                                    import_updated_dt_map[symbol_name] = candidate_dt
+                                    import_updated_dt_map[resolved_ticker] = candidate_dt
                         except Exception as exc:
                             logger.warning(f"Futu IV query failed, skip futu flags: {exc}")
 
@@ -424,55 +1019,59 @@ def format_etf_response(etf: ETF, include_holdings: bool = False, db: Session = 
                 except Exception as exc:
                     logger.warning(f"Stock score query failed, skip scores: {exc}")
 
-            result["holdings"] = [
-                {
-                    "ticker": h.ticker,
-                    "weight": h.weight,
-                    "score": score_map.get(h.ticker),
-                    "updatedAt": updated_map.get(str(h.ticker).upper()),
-                    "dataSources": source_map.get(
-                        str(h.ticker).upper(),
-                        {
-                            "finviz": False,
-                            "market_chameleon": False,
-                            "marketchameleon": False,
-                            "ibkr": False,
-                            "futu": False,
-                        },
-                    ),
-                    "dataStatus": (
-                        "complete"
-                        if (
-                            source_map.get(str(h.ticker).upper(), {}).get("finviz") and
-                            source_map.get(str(h.ticker).upper(), {}).get("market_chameleon")
-                        )
-                        else (
-                            "pending"
-                            if (
-                                source_map.get(str(h.ticker).upper(), {}).get("finviz") or
-                                source_map.get(str(h.ticker).upper(), {}).get("market_chameleon")
-                            )
-                            else "missing"
-                        )
-                    ),
-                    "completeness": (
-                        100.0
-                        if (
-                            source_map.get(str(h.ticker).upper(), {}).get("finviz") and
-                            source_map.get(str(h.ticker).upper(), {}).get("market_chameleon")
-                        )
-                        else (
-                            50.0
-                            if (
-                                source_map.get(str(h.ticker).upper(), {}).get("finviz") or
-                                source_map.get(str(h.ticker).upper(), {}).get("market_chameleon")
-                            )
-                            else 0.0
-                        )
-                    ),
-                }
-                for h in holdings_today
-            ]
+            holdings_payload: List[Dict[str, Any]] = []
+            for h in holdings_today:
+                ticker = str(h.ticker).upper()
+                source_flags = source_map.get(
+                    ticker,
+                    {
+                        "finviz": False,
+                        "market_chameleon": False,
+                        "marketchameleon": False,
+                        "ibkr": False,
+                        "futu": False,
+                    },
+                )
+                stock_metrics = stock_metrics_map.get(ticker, {})
+                deviation_raw = stock_metrics.get("deviationFrom20ma")
+                deviation_value: Optional[float] = None
+                if isinstance(deviation_raw, (int, float)):
+                    parsed_deviation = float(deviation_raw)
+                    if math.isfinite(parsed_deviation):
+                        deviation_value = parsed_deviation
+
+                has_finviz = bool(source_flags.get("finviz"))
+                has_mc = bool(source_flags.get("market_chameleon") or source_flags.get("marketchameleon"))
+                has_ibkr = bool(source_flags.get("ibkr"))
+                has_futu = bool(source_flags.get("futu"))
+                holding_completeness = (
+                    (20.0 if has_finviz else 0.0) +
+                    (10.0 if has_mc else 0.0) +
+                    (40.0 if has_ibkr else 0.0) +
+                    (30.0 if has_futu else 0.0)
+                )
+                if holding_completeness >= 80.0:
+                    holding_status = "complete"
+                elif holding_completeness >= 50.0:
+                    holding_status = "pending"
+                else:
+                    holding_status = "missing"
+                holdings_payload.append(
+                    {
+                        "ticker": h.ticker,
+                        "weight": h.weight,
+                        "score": score_map.get(ticker),
+                        "price": stock_price_map.get(ticker),
+                        "deviationFrom20ma": deviation_value,
+                        "aboveSma20": (deviation_value > 0) if deviation_value is not None else None,
+                        "updatedAt": updated_map.get(ticker),
+                        "dataSources": source_flags,
+                        "dataStatus": holding_status,
+                        "completeness": holding_completeness,
+                    }
+                )
+
+            result["holdings"] = holdings_payload
 
     return result
 
@@ -726,15 +1325,11 @@ async def refresh_etf_data(
     - symbol: ETF 符号
     """
     from app.services.orchestrator import get_orchestrator
-    from app.models import PriceHistory, IVData, ScoreSnapshot
     
     etf = db.query(ETF).filter(ETF.symbol == symbol.upper()).first()
     
     if not etf:
         raise HTTPException(status_code=404, detail=f"ETF '{symbol}' not found")
-    
-    orchestrator = get_orchestrator()
-    broker_status = orchestrator.get_broker_status()
     
     # 跟踪数据完整性
     data_sources = {
@@ -746,14 +1341,100 @@ async def refresh_etf_data(
         'mc_options': False
     }
     
-    score_result = {
-        'rel_mom': {'score': 0, 'data': None},
-        'trend_quality': {'score': 0, 'data': None},
-        'breadth': {'score': 50, 'data': None},  # 默认中性
-        'options_confirm': {'score': 50, 'data': None}  # 默认中性
-    }
-    
+    score_result = _default_etf_score_result()
+
+    latest_snapshot = db.query(ScoreSnapshot).filter(
+        ScoreSnapshot.symbol == etf.symbol,
+        ScoreSnapshot.symbol_type == 'etf'
+    ).order_by(ScoreSnapshot.date.desc(), ScoreSnapshot.id.desc()).first()
+
+    if latest_snapshot and isinstance(latest_snapshot.score_breakdown, dict):
+        score_result = _load_etf_score_result(latest_snapshot.score_breakdown)
+
+    now_utc = datetime.utcnow()
+    latest_ibkr_created_at = _coerce_datetime(
+        db.query(func.max(PriceHistory.created_at)).filter(
+            PriceHistory.symbol == etf.symbol,
+            PriceHistory.source == "ibkr",
+        ).scalar()
+    )
+    latest_futu_created_at = _coerce_datetime(
+        db.query(func.max(IVData.created_at)).filter(
+            IVData.symbol == etf.symbol,
+            IVData.source == "futu",
+        ).scalar()
+    )
+    ibkr_gate_state = _build_refresh_gate_state(latest_ibkr_created_at, now_utc=now_utc)
+    futu_gate_state = _build_refresh_gate_state(latest_futu_created_at, now_utc=now_utc)
+    has_cached_ibkr_breakdown = (
+        score_result['rel_mom'].get('data') is not None
+        and score_result['trend_quality'].get('data') is not None
+    )
+    has_cached_futu_breakdown = score_result['options_confirm'].get('data') is not None
+    skip_ibkr_refresh = bool(ibkr_gate_state.get("is_recent")) and has_cached_ibkr_breakdown
+    skip_futu_refresh = bool(futu_gate_state.get("is_recent")) and (
+        has_cached_futu_breakdown or latest_futu_created_at is not None
+    )
+    next_refresh_at = _pick_next_refresh_at([ibkr_gate_state, futu_gate_state])
+
+    if skip_ibkr_refresh:
+        data_sources['ibkr_price'] = latest_ibkr_created_at is not None
+        data_sources['ibkr_relmom'] = score_result['rel_mom'].get('data') is not None
+        data_sources['ibkr_trend'] = score_result['trend_quality'].get('data') is not None
+    if skip_futu_refresh:
+        data_sources['futu_iv'] = (
+            latest_futu_created_at is not None
+            or score_result['options_confirm'].get('data') is not None
+        )
+
+    if skip_ibkr_refresh and skip_futu_refresh:
+        recalculated = _recalculate_etf_score_from_db(
+            etf,
+            db,
+            base_breakdown=score_result,
+            base_data_sources=data_sources,
+        )
+        next_refresh_bjt = _format_beijing_time(next_refresh_at)
+        skip_message = (
+            f"IBKR 与 Futu 数据在 {ETF_REFRESH_COOLDOWN_MINUTES} 分钟内已刷新，已跳过。"
+            + (f"下次可刷新时间（北京时间）{next_refresh_bjt}" if next_refresh_bjt else "")
+        )
+        return {
+            "status": "snapshot",
+            "symbol": etf.symbol,
+            "message": skip_message,
+            "score": recalculated["score"],
+            "rank": recalculated["rank"],
+            "completeness": recalculated["completeness"],
+            "thresholds_pass": recalculated["thresholds_pass"],
+            "breakdown": recalculated["breakdown"],
+            "data_sources": recalculated["data_sources"],
+            "next_refresh_at": _iso_utc(next_refresh_at),
+            "refresh_gate": {
+                "cooldown_minutes": ETF_REFRESH_COOLDOWN_MINUTES,
+                "ibkr": _build_refresh_gate_payload(ibkr_gate_state),
+                "futu": _build_refresh_gate_payload(futu_gate_state),
+            },
+            "warnings": [skip_message],
+        }
+
     warnings = []
+    if skip_ibkr_refresh:
+        next_ibkr_text = _format_beijing_time(_coerce_datetime(ibkr_gate_state.get("next_refresh_at")))
+        warnings.append(
+            f"IBKR 数据在 {ETF_REFRESH_COOLDOWN_MINUTES} 分钟内已刷新，跳过 IBKR 拉取"
+            + (f"（北京时间可刷新时间 {next_ibkr_text}）" if next_ibkr_text else "")
+        )
+    if skip_futu_refresh:
+        next_futu_text = _format_beijing_time(_coerce_datetime(futu_gate_state.get("next_refresh_at")))
+        warnings.append(
+            f"Futu 数据在 {ETF_REFRESH_COOLDOWN_MINUTES} 分钟内已刷新，跳过 Futu 拉取"
+            + (f"（北京时间可刷新时间 {next_futu_text}）" if next_futu_text else "")
+        )
+
+    orchestrator = get_orchestrator()
+    broker_status = orchestrator.get_broker_status()
+
     price_df = None
     ibkr_started_at = perf_counter()
     ibkr_price_log = "N/A (not_started)"
@@ -770,7 +1451,7 @@ async def refresh_etf_data(
     ibkr_connected = ibkr_status.get('is_connected', False)
     ibkr_disconnect_reason = ibkr_status.get('last_error')
     
-    if not ibkr_connected:
+    if (not skip_ibkr_refresh) and (not ibkr_connected):
         # 尝试连接 IBKR
         try:
             ibkr_connected = await orchestrator.connect_ibkr()
@@ -782,7 +1463,16 @@ async def refresh_etf_data(
             warnings.append(f"IBKR 连接失败: {str(e)}")
             ibkr_disconnect_reason = str(e)
     
-    if ibkr_connected:
+    if skip_ibkr_refresh:
+        ibkr_refresh_time = _format_beijing_time(_coerce_datetime(ibkr_gate_state.get("next_refresh_at")))
+        ibkr_price_log = (
+            f"N/A (skip_cooldown_until_bjt={ibkr_refresh_time})"
+            if ibkr_refresh_time
+            else "N/A (skip_cooldown)"
+        )
+        ibkr_relmom_log = ibkr_price_log
+        ibkr_trend_log = ibkr_price_log
+    elif ibkr_connected:
         # 1.1 获取价格数据
         try:
             price_df = await orchestrator.get_ohlcv_data(etf.symbol, '100 D')
@@ -974,7 +1664,7 @@ async def refresh_etf_data(
     # ==================== 2. 从 Futu 获取 IV 数据 ====================
     futu_connected = broker_status.get('futu', {}).get('is_connected', False)
     
-    if not futu_connected:
+    if (not skip_futu_refresh) and (not futu_connected):
         # 尝试连接 Futu
         try:
             futu_connected = await orchestrator.connect_futu()
@@ -982,8 +1672,10 @@ async def refresh_etf_data(
                 warnings.append("已自动连接 Futu")
         except Exception:
             pass  # Futu 是可选的
-    
-    if futu_connected and orchestrator._futu:
+
+    if skip_futu_refresh:
+        pass
+    elif futu_connected and orchestrator._futu:
         futu = orchestrator._futu
         
         try:
@@ -1068,117 +1760,31 @@ async def refresh_etf_data(
     else:
         warnings.append("Futu 未连接，使用默认期权评分")
     
-    # ==================== 3. 计算综合评分 ====================
-    # 权重: RelMom 45%, Trend 25%, Breadth 20%, Options 10%
-    weights = {
-        'rel_mom': 0.45,
-        'trend_quality': 0.25,
-        'breadth': 0.20,
-        'options_confirm': 0.10
-    }
-    
-    total_score = (
-        weights['rel_mom'] * score_result['rel_mom']['score'] +
-        weights['trend_quality'] * score_result['trend_quality']['score'] +
-        weights['breadth'] * score_result['breadth']['score'] +
-        weights['options_confirm'] * score_result['options_confirm']['score']
+    recalculated = _recalculate_etf_score_from_db(
+        etf,
+        db,
+        base_breakdown=score_result,
+        base_data_sources=data_sources,
     )
-    
-    # 计算数据完整度
-    completeness_weight = {
-        'ibkr_price': 20,
-        'ibkr_relmom': 25,
-        'ibkr_trend': 15,
-        'futu_iv': 10,
-        'finviz_breadth': 20,
-        'mc_options': 10
-    }
-    completeness = sum(
-        completeness_weight[k] for k, v in data_sources.items() if v
-    )
-    
-    # 检查硬性门槛
-    thresholds_pass = True
-    threshold_details = {}
-    
-    # 门槛1: Price > SMA50
-    if score_result['trend_quality']['data']:
-        price_above_sma50 = score_result['trend_quality']['data'].get('price_above_sma50', False)
-        threshold_details['price_above_sma50'] = 'PASS' if price_above_sma50 else 'FAIL'
-        if not price_above_sma50:
-            thresholds_pass = False
-    else:
-        threshold_details['price_above_sma50'] = 'NO_DATA'
-    
-    # 门槛2: RS_20D > 0
-    if score_result['rel_mom']['data']:
-        rs_20d = score_result['rel_mom']['data'].get('RS_20D', 0) or 0
-        threshold_details['rs_20d_positive'] = 'PASS' if rs_20d > 0 else 'FAIL'
-        if rs_20d <= 0:
-            thresholds_pass = False
-    else:
-        threshold_details['rs_20d_positive'] = 'NO_DATA'
-    
-    # ==================== 4. 更新数据库 ====================
-    etf.score = round(total_score, 2)
-    etf.completeness = completeness
-    etf.updated_at = datetime.now()
-    
-    # 保存评分快照
-    from datetime import date as date_type
-    today = date_type.today()
-    existing_snapshot = db.query(ScoreSnapshot).filter(
-        ScoreSnapshot.symbol == etf.symbol,
-        ScoreSnapshot.symbol_type == 'etf',
-        ScoreSnapshot.date == today
-    ).first()
-    
-    if existing_snapshot:
-        existing_snapshot.total_score = total_score
-        existing_snapshot.score_breakdown = score_result
-        existing_snapshot.thresholds_pass = thresholds_pass
-    else:
-        snapshot = ScoreSnapshot(
-            symbol=etf.symbol,
-            symbol_type='etf',
-            date=today,
-            total_score=total_score,
-            score_breakdown=score_result,
-            thresholds_pass=thresholds_pass
-        )
-        db.add(snapshot)
-    
-    # 重新计算同类型 ETF 排名
-    etfs_of_same_type = db.query(ETF).filter(
-        ETF.type == etf.type,
-        ETF.score > 0
-    ).order_by(ETF.score.desc()).all()
-    
-    for idx, e in enumerate(etfs_of_same_type, 1):
-        e.rank = idx
-    
-    db.commit()
-    
-    # ==================== 5. 返回结果 ====================
-    normalized_sources = {key: bool(value) for key, value in data_sources.items()}
 
     return {
         "status": "success",
         "symbol": etf.symbol,
         "message": f"ETF {etf.symbol} 数据已刷新",
-        "score": etf.score,
-        "rank": etf.rank,
-        "completeness": completeness,
-        "thresholds_pass": thresholds_pass,
-        "thresholds": threshold_details,
-        "breakdown": {
-            "rel_mom": score_result['rel_mom'],
-            "trend_quality": score_result['trend_quality'],
-            "breadth": score_result['breadth'],
-            "options_confirm": score_result['options_confirm']
+        "score": recalculated["score"],
+        "rank": recalculated["rank"],
+        "completeness": recalculated["completeness"],
+        "thresholds_pass": recalculated["thresholds_pass"],
+        "thresholds": recalculated["thresholds"],
+        "breakdown": recalculated["breakdown"],
+        "data_sources": recalculated["data_sources"],
+        "warnings": warnings if warnings else None,
+        "next_refresh_at": _iso_utc(next_refresh_at),
+        "refresh_gate": {
+            "cooldown_minutes": ETF_REFRESH_COOLDOWN_MINUTES,
+            "ibkr": _build_refresh_gate_payload(ibkr_gate_state),
+            "futu": _build_refresh_gate_payload(futu_gate_state),
         },
-        "data_sources": normalized_sources,
-        "warnings": warnings if warnings else None
     }
 
 
@@ -1219,6 +1825,7 @@ async def refresh_holdings_data(
     
     etf.holdings_count = holdings_count
     etf.updated_at = datetime.now()
+
     db.commit()
     
     return {
@@ -1496,8 +2103,8 @@ async def refresh_holdings_by_coverage(
 
     参数:
     - symbol: ETF 符号
-    - coverage_type: 覆盖范围类型 ("top" 或 "weight")
-    - coverage_value: 覆盖范围值 (如果 type=top 则为数字如 10、15；如果 type=weight 则为百分比如 60、70)
+    - coverage_type: 覆盖范围类型 ("top"、"weight" 或 "all")
+    - coverage_value: 覆盖范围值 (如果 type=top 则为数字如 10、15；如果 type=weight 则为百分比如 60、70；如果 type=all 则忽略)
 
     返回:
     {
@@ -1558,23 +2165,9 @@ async def refresh_holdings_by_coverage(
     all_holdings = holdings_query.all()
 
     # 根据覆盖范围过滤
-    filtered_holdings = []
+    filtered_holdings = _filter_holdings_by_coverage(all_holdings, coverage_type, coverage_value)
 
-    if coverage_type.lower() == "top":
-        # Top N: 取前 N 只
-        filtered_holdings = all_holdings[:coverage_value]
-    elif coverage_type.lower() == "weight":
-        # Weight X%: 取权重累积到 X% 的股票
-        accumulated_weight = 0
-        for holding in all_holdings:
-            filtered_holdings.append(holding)
-            accumulated_weight += holding.weight
-            if accumulated_weight >= coverage_value:
-                break
-    else:
-        raise HTTPException(status_code=400, detail=f"Invalid coverage_type: {coverage_type}")
-
-    coverage_label = f"{coverage_type.lower()}{coverage_value}"
+    coverage_label = _format_coverage_label(coverage_type, coverage_value)
     progress_token = _normalize_progress_token(request.progress_token)
     if request.progress_token and not progress_token:
         raise HTTPException(status_code=400, detail="Invalid progress_token")
@@ -1620,21 +2213,33 @@ async def refresh_holdings_by_coverage(
             return ", ".join(symbols)
         return f"{', '.join(symbols[:max_items])} 等{len(symbols)}只"
 
+    coverage_symbols = list(dict.fromkeys(h.ticker.upper() for h in filtered_holdings if h.ticker))
+    coverage_key_to_symbol: Dict[str, str] = {}
+    for symbol_name in coverage_symbols:
+        symbol_key = _canonical_symbol_key(symbol_name)
+        if symbol_key and symbol_key not in coverage_key_to_symbol:
+            coverage_key_to_symbol[symbol_key] = symbol_name
+    coverage_query_symbols = sorted(
+        {
+            alias
+            for symbol_name in coverage_symbols
+            for alias in _symbol_aliases(symbol_name)
+        }
+    )
     coverage_fresh_imports: Dict[str, set] = {}
-    if filtered_holdings:
+    if coverage_symbols and coverage_query_symbols:
         boundary = _beijing_import_boundary()
         boundary_utc = boundary["boundary_utc"]
         boundary_date = boundary["boundary_date"]
         boundary_bjt = boundary["boundary_beijing"].strftime("%Y-%m-%d %H:%M")
 
-        coverage_symbols = list(dict.fromkeys(h.ticker.upper() for h in filtered_holdings if h.ticker))
         imported_rows = db.query(
             ImportedData.symbol,
             ImportedData.source,
             ImportedData.date,
             ImportedData.created_at
         ).filter(
-            ImportedData.symbol.in_(coverage_symbols),
+            ImportedData.symbol.in_(coverage_query_symbols),
             ImportedData.source.in_(["finviz", "marketchameleon"])
         ).all()
 
@@ -1642,6 +2247,10 @@ async def refresh_holdings_by_coverage(
         fresh_imports_by_symbol: Dict[str, set] = {}
         for row in imported_rows:
             symbol_name = str(row.symbol).upper()
+            symbol_key = _canonical_symbol_key(symbol_name)
+            resolved_symbol = coverage_key_to_symbol.get(symbol_key)
+            if not resolved_symbol:
+                continue
             source_name = str(row.source).lower()
             imported_date = row.date
             imported_created_at = row.created_at
@@ -1653,8 +2262,8 @@ async def refresh_holdings_by_coverage(
             )
 
             if has_fresh_by_date or has_fresh_by_time:
-                fresh_imports.add((symbol_name, source_name))
-                fresh_imports_by_symbol.setdefault(symbol_name, set()).add(source_name)
+                fresh_imports.add((resolved_symbol, source_name))
+                fresh_imports_by_symbol.setdefault(resolved_symbol, set()).add(source_name)
 
         missing_finviz = [s for s in coverage_symbols if (s, "finviz") not in fresh_imports]
         missing_mc = [s for s in coverage_symbols if (s, "marketchameleon") not in fresh_imports]
@@ -1692,6 +2301,223 @@ async def refresh_holdings_by_coverage(
                 progress_token,
                 {
                     "message": f"导入校验通过，准备刷新 {len(filtered_holdings)} 个标的...",
+                },
+            )
+
+    related_etf_symbols: List[str] = []
+    if isinstance(request.related_etf_symbols, list):
+        for candidate in request.related_etf_symbols:
+            if not isinstance(candidate, str):
+                continue
+            normalized = candidate.strip().upper()
+            if not normalized or normalized == symbol.upper():
+                continue
+            if normalized not in related_etf_symbols:
+                related_etf_symbols.append(normalized)
+    has_related_etf_scope = len(related_etf_symbols) > 0
+    coverage_symbol_set = set(coverage_symbols)
+    duplicate_scope_symbols: set[str] = set()
+    if has_related_etf_scope and coverage_symbols:
+        for peer_symbol in related_etf_symbols:
+            peer_latest_date = db.query(func.max(ETFHolding.data_date)).filter(
+                ETFHolding.etf_symbol == peer_symbol
+            ).scalar()
+            if not peer_latest_date:
+                continue
+            peer_holdings_all = db.query(ETFHolding).filter(
+                ETFHolding.etf_symbol == peer_symbol,
+                ETFHolding.data_date == peer_latest_date
+            ).order_by(ETFHolding.weight.desc()).all()
+            if not peer_holdings_all:
+                continue
+            peer_filtered_holdings = _filter_holdings_by_coverage(
+                peer_holdings_all,
+                coverage_type=coverage_type,
+                coverage_value=coverage_value,
+            )
+
+            for peer_holding in peer_filtered_holdings:
+                ticker_name = str(peer_holding.ticker).upper() if peer_holding.ticker else ""
+                if ticker_name and ticker_name in coverage_symbol_set:
+                    duplicate_scope_symbols.add(ticker_name)
+
+        logger.info(
+            "refresh_holdings_related_scope symbol=%s coverage=%s related_etfs=%s duplicate_symbols=%s",
+            symbol.upper(),
+            coverage_label,
+            len(related_etf_symbols),
+            len(duplicate_scope_symbols),
+        )
+
+    now_utc = datetime.utcnow()
+    ibkr_latest_rows = []
+    futu_latest_rows = []
+    if coverage_symbols:
+        ibkr_latest_rows = db.query(
+            PriceHistory.symbol,
+            func.max(PriceHistory.created_at).label("latest_created_at"),
+        ).filter(
+            PriceHistory.symbol.in_(coverage_symbols),
+            PriceHistory.source == "ibkr",
+        ).group_by(PriceHistory.symbol).all()
+        futu_latest_rows = db.query(
+            IVData.symbol,
+            func.max(IVData.created_at).label("latest_created_at"),
+        ).filter(
+            IVData.symbol.in_(coverage_symbols),
+            IVData.source == "futu",
+        ).group_by(IVData.symbol).all()
+
+    ibkr_latest_map = {
+        str(row.symbol).upper(): _coerce_datetime(getattr(row, "latest_created_at", None))
+        for row in ibkr_latest_rows
+    }
+    futu_latest_map = {
+        str(row.symbol).upper(): _coerce_datetime(getattr(row, "latest_created_at", None))
+        for row in futu_latest_rows
+    }
+    ibkr_gate_by_symbol = {
+        ticker: _build_refresh_gate_state(
+            ibkr_latest_map.get(ticker),
+            now_utc=now_utc,
+            cooldown=HOLDINGS_REFRESH_COOLDOWN,
+        )
+        for ticker in coverage_symbols
+    }
+    futu_gate_by_symbol = {
+        ticker: _build_refresh_gate_state(
+            futu_latest_map.get(ticker),
+            now_utc=now_utc,
+            cooldown=HOLDINGS_REFRESH_COOLDOWN,
+        )
+        for ticker in coverage_symbols
+    }
+    ibkr_recent_all = bool(coverage_symbols) and all(
+        bool(state.get("is_recent")) for state in ibkr_gate_by_symbol.values()
+    )
+    futu_recent_all = bool(coverage_symbols) and all(
+        bool(state.get("is_recent")) for state in futu_gate_by_symbol.values()
+    )
+    if (not has_related_etf_scope) and ibkr_recent_all and futu_recent_all:
+        _recalculate_etf_score_from_db(etf, db)
+        all_gate_states = list(ibkr_gate_by_symbol.values()) + list(futu_gate_by_symbol.values())
+        next_refresh_at = _pick_next_refresh_at(all_gate_states)
+        next_refresh_bjt = _format_beijing_time(next_refresh_at)
+        skip_message = (
+            f"IBKR 与 Futu 数据在 {HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟内已刷新，已跳过。"
+            + (f"下次可刷新时间（北京时间）{next_refresh_bjt}" if next_refresh_bjt else "")
+        )
+        if progress_token:
+            _patch_holdings_refresh_progress(
+                progress_token,
+                {
+                    "status": "completed",
+                    "completed": total_targets,
+                    "failed": 0,
+                    "current_item": "",
+                    "message": skip_message,
+                    "finished_at": _utc_now_iso(),
+                },
+            )
+        total_weight = sum(h.weight for h in filtered_holdings)
+        return {
+            "status": "snapshot",
+            "symbol": symbol.upper(),
+            "coverage": coverage_label,
+            "stocks_count": len(filtered_holdings),
+            "total_weight": round(total_weight, 2),
+            "futu_failed_count": 0,
+            "completeness": {},
+            "updated_stocks": [],
+            "updated_at": _utc_now_iso(),
+            "message": skip_message,
+            "next_refresh_at": _iso_utc(next_refresh_at),
+            "refresh_gate": {
+                "cooldown_minutes": HOLDINGS_REFRESH_COOLDOWN_MINUTES,
+                "ibkr": {
+                    "all_recent": ibkr_recent_all,
+                    "recent_count": sum(1 for state in ibkr_gate_by_symbol.values() if state.get("is_recent")),
+                    "total": len(coverage_symbols),
+                    "next_refresh_at": _iso_utc(_pick_next_refresh_at(list(ibkr_gate_by_symbol.values()))),
+                },
+                "futu": {
+                    "all_recent": futu_recent_all,
+                    "recent_count": sum(1 for state in futu_gate_by_symbol.values() if state.get("is_recent")),
+                    "total": len(coverage_symbols),
+                    "next_refresh_at": _iso_utc(_pick_next_refresh_at(list(futu_gate_by_symbol.values()))),
+                },
+            },
+        }
+
+    completeness_calculator = DataCompletenessCalculator(db)
+    cooldown_scope_symbols = set(coverage_symbols)
+    if has_related_etf_scope:
+        cooldown_scope_symbols = set(duplicate_scope_symbols)
+
+    recent_skip_symbol_set = {
+        ticker
+        for ticker in cooldown_scope_symbols
+        if bool(ibkr_gate_by_symbol.get(ticker, {}).get("is_recent"))
+        and bool(futu_gate_by_symbol.get(ticker, {}).get("is_recent"))
+    }
+    if has_related_etf_scope:
+        ibkr_recent_duplicates = sum(
+            1 for ticker in cooldown_scope_symbols if bool(ibkr_gate_by_symbol.get(ticker, {}).get("is_recent"))
+        )
+        futu_recent_duplicates = sum(
+            1 for ticker in cooldown_scope_symbols if bool(futu_gate_by_symbol.get(ticker, {}).get("is_recent"))
+        )
+        logger.info(
+            "refresh_holdings_duplicate_cooldown_eval symbol=%s coverage=%s duplicates=%s both_recent=%s ibkr_recent=%s futu_recent=%s",
+            symbol.upper(),
+            coverage_label,
+            len(cooldown_scope_symbols),
+            len(recent_skip_symbol_set),
+            ibkr_recent_duplicates,
+            futu_recent_duplicates,
+        )
+    skipped_recent_holdings: List[ETFHolding] = []
+    holdings_to_refresh: List[ETFHolding] = []
+    for holding in filtered_holdings:
+        ticker_text = str(holding.ticker).upper() if holding.ticker else ""
+        if ticker_text and ticker_text in recent_skip_symbol_set:
+            skipped_recent_holdings.append(holding)
+        else:
+            holdings_to_refresh.append(holding)
+
+    skipped_recent_count = len(skipped_recent_holdings)
+    refresh_targets_count = len(holdings_to_refresh)
+    duplicate_scope_count = len(duplicate_scope_symbols)
+    if skipped_recent_count > 0:
+        skipped_symbols_preview = ", ".join(
+            str(h.ticker).upper() for h in skipped_recent_holdings[:6] if h.ticker
+        )
+        if has_related_etf_scope:
+            skip_reason = (
+                f"同任务重复标的共 {duplicate_scope_count} 只，"
+                f"其中 {skipped_recent_count} 只在 {HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟冷却内已具备市场+期权数据"
+            )
+        else:
+            skip_reason = f"已跳过 {skipped_recent_count} 只（{HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟内已有市场+期权数据）"
+        logger.info(
+            "refresh_holdings_symbol_skip_recent symbol=%s coverage=%s skipped=%s total=%s cooldown_scope=%s preview=%s",
+            symbol.upper(),
+            coverage_label,
+            skipped_recent_count,
+            total_targets,
+            len(cooldown_scope_symbols),
+            skipped_symbols_preview,
+        )
+        progress_completed = skipped_recent_count
+        if progress_token:
+            _patch_holdings_refresh_progress(
+                progress_token,
+                {
+                    "completed": progress_completed,
+                    "failed": progress_failed,
+                    "message": (
+                        f"{skip_reason}，待刷新 {refresh_targets_count} 只..."
+                    ),
                 },
             )
 
@@ -1753,10 +2579,17 @@ async def refresh_holdings_by_coverage(
             db.add_all(new_records)
 
     def _get_imported(symbol: str, source: str) -> Optional[Dict[str, Any]]:
+        query_symbols = _symbol_aliases(symbol)
+        if not query_symbols:
+            return None
         record = db.query(ImportedData).filter(
-            ImportedData.symbol == symbol.upper(),
+            ImportedData.symbol.in_(query_symbols),
             ImportedData.source == source
-        ).order_by(ImportedData.date.desc()).first()
+        ).order_by(
+            ImportedData.date.desc(),
+            ImportedData.created_at.desc(),
+            ImportedData.id.desc()
+        ).first()
         return record.data if record else None
 
     def _get_latest_iv(symbol: str) -> Optional[Dict[str, Any]]:
@@ -1862,8 +2695,85 @@ async def refresh_holdings_by_coverage(
             return f"{float(value):.{digits}f}"
         return "N/A"
 
+    def _build_skipped_recent_result(holding: ETFHolding) -> Dict[str, Any]:
+        ticker = str(holding.ticker).upper() if holding.ticker else ""
+        imported_sources = coverage_fresh_imports.get(ticker, set())
+        data_sources: List[str] = []
+        if "finviz" in imported_sources:
+            data_sources.append("finviz")
+        if "marketchameleon" in imported_sources:
+            data_sources.extend(["marketchameleon", "market_chameleon", "mc"])
+        data_sources.extend(["ibkr", "market_data", "futu", "options_data"])
+        data_sources = list(dict.fromkeys(data_sources))
+
+        latest_candidates = [
+            dt
+            for dt in (
+                ibkr_latest_map.get(ticker),
+                futu_latest_map.get(ticker),
+            )
+            if isinstance(dt, datetime)
+        ]
+        if latest_candidates:
+            latest_dt = max(latest_candidates)
+            if latest_dt.tzinfo is None:
+                latest_dt = latest_dt.replace(tzinfo=timezone.utc)
+            else:
+                latest_dt = latest_dt.astimezone(timezone.utc)
+            updated_at = latest_dt.isoformat().replace("+00:00", "Z")
+        else:
+            updated_at = _utc_now_iso()
+
+        completeness_status = completeness_calculator.calculate_holding_data_completeness(
+            ticker,
+            {
+                "price_data": None,
+                "volume": None,
+                "change_1d": None,
+                "iv30": None,
+                "data_sources": data_sources,
+                "updated_at": updated_at,
+            },
+        )
+
+        return {
+            "ticker": ticker,
+            "weight": holding.weight,
+            "price": None,
+            "change_1d": None,
+            "data_sources": data_sources,
+            "iv7": None,
+            "iv30": None,
+            "iv60": None,
+            "iv90": None,
+            "total_oi": None,
+            "oi_bucket_0_7": None,
+            "oi_bucket_8_30": None,
+            "oi_bucket_31_90": None,
+            "call_oi_bucket_0_7": None,
+            "call_oi_bucket_8_30": None,
+            "call_oi_bucket_31_90": None,
+            "put_oi_bucket_0_7": None,
+            "put_oi_bucket_8_30": None,
+            "put_oi_bucket_31_90": None,
+            "data_status": completeness_status.status,
+            "completeness": completeness_status.completeness_score,
+            "score": None,
+            "updated_at": updated_at,
+            "skipped_recent": True,
+        }
+
+    skipped_recent_results = [_build_skipped_recent_result(holding) for holding in skipped_recent_holdings]
+    for item in skipped_recent_results:
+        logger.info(
+            "HOLDINGS- [SKIP] %s - 市场数据与期权数据在 %s 分钟冷却内，跳过抓取",
+            str(item.get("ticker") or "").upper(),
+            HOLDINGS_REFRESH_COOLDOWN_MINUTES,
+        )
+
     # 并发获取股票数据
     from app.services.orchestrator import get_orchestrator
+    from app.services.broker.futu import estimate_iv_fetch_time
     orchestrator = get_orchestrator()
 
     if progress_token:
@@ -1888,10 +2798,23 @@ async def refresh_holdings_by_coverage(
             logger.warning(f"Futu connect failed: {e}")
 
     if progress_token:
+        start_fetch_message = "开始并发抓取持仓数据..."
+        if skipped_recent_count > 0:
+            if has_related_etf_scope:
+                start_fetch_message = (
+                    f"同任务重复标的 {duplicate_scope_count} 只，"
+                    f"已跳过 {skipped_recent_count} 只（{HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟冷却），"
+                    f"开始抓取剩余 {refresh_targets_count} 只..."
+                )
+            else:
+                start_fetch_message = (
+                    f"已跳过 {skipped_recent_count} 只（{HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟内已有市场+期权数据），"
+                    f"开始抓取剩余 {refresh_targets_count} 只..."
+                )
         _patch_holdings_refresh_progress(
             progress_token,
             {
-                "message": "开始并发抓取持仓数据...",
+                "message": start_fetch_message,
             },
         )
 
@@ -1905,18 +2828,144 @@ async def refresh_holdings_by_coverage(
             symbol.upper(),
             coverage_label,
         )
+    ibkr_price_timeout_seconds = 30
     if sector_df is None and ibkr_connected:
+        logger.info(
+            "refresh_holdings_sector_prefetch symbol=%s coverage=%s sector_symbol=%s",
+            symbol.upper(),
+            coverage_label,
+            sector_symbol,
+        )
         try:
-            sector_fetched = await orchestrator.get_ohlcv_data(sector_symbol, '1 Y')
+            sector_fetched = await asyncio.wait_for(
+                orchestrator.get_ohlcv_data(sector_symbol, '1 Y'),
+                timeout=ibkr_price_timeout_seconds,
+            )
             if sector_fetched is not None and not sector_fetched.empty:
                 _save_price_history(sector_symbol, sector_fetched)
                 sector_df = sector_fetched
+                logger.info(
+                    "refresh_holdings_sector_prefetch_ok symbol=%s coverage=%s sector_symbol=%s bars=%s",
+                    symbol.upper(),
+                    coverage_label,
+                    sector_symbol,
+                    len(sector_fetched),
+                )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "refresh_holdings_sector_price_timeout symbol=%s timeout_seconds=%s",
+                sector_symbol,
+                ibkr_price_timeout_seconds,
+            )
         except Exception as e:
             logger.warning(f"Failed to get sector price data for {sector_symbol}: {e}")
 
-    updated_stocks = []
-    ordered_log_rows: List[Dict[str, Any]] = []
+    updated_stocks = list(skipped_recent_results)
     stock_semaphore = asyncio.Semaphore(5)  # 限制并发数为 5
+    futu_symbols = list(
+        dict.fromkeys(
+            str(holding.ticker).upper()
+            for holding in holdings_to_refresh
+            if isinstance(getattr(holding, "ticker", None), str) and holding.ticker.strip()
+        )
+    )
+    estimated_futu_seconds = estimate_iv_fetch_time(symbol_count=max(1, len(futu_symbols)))
+    futu_iv_timeout_seconds = max(45, int(estimated_futu_seconds + 15))
+    logger.info(
+        "refresh_holdings_futu_timeout_budget symbol=%s coverage=%s timeout_seconds=%s tickers=%s",
+        symbol.upper(),
+        coverage_label,
+        futu_iv_timeout_seconds,
+        len(futu_symbols),
+    )
+
+    async def _fetch_futu_iv_batch(symbols: List[str]) -> Dict[str, Any]:
+        normalized_symbols = list(dict.fromkeys(str(item).upper() for item in symbols if str(item).strip()))
+        if not normalized_symbols or not orchestrator._futu or not orchestrator._futu.is_connected():
+            return {}
+
+        batch_started_at = perf_counter()
+        logger.info(
+            "refresh_holdings_futu_batch_start symbol=%s coverage=%s tickers=%s",
+            symbol.upper(),
+            coverage_label,
+            len(normalized_symbols),
+        )
+        try:
+            iv_results = await asyncio.wait_for(
+                asyncio.to_thread(
+                    orchestrator._futu.fetch_iv_terms,
+                    normalized_symbols,
+                    max_days=120,
+                    max_retries=0,
+                    progress_total=len(normalized_symbols),
+                    progress_offset=0,
+                    log_progress=False,
+                    log_fetch_summary=False,
+                ),
+                timeout=futu_iv_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            elapsed_ms = (perf_counter() - batch_started_at) * 1000
+            logger.warning(
+                "refresh_holdings_futu_iv_timeout_batch symbol=%s coverage=%s tickers=%s timeout_seconds=%s elapsed_ms=%s",
+                symbol.upper(),
+                coverage_label,
+                len(normalized_symbols),
+                futu_iv_timeout_seconds,
+                round(elapsed_ms, 1),
+            )
+            if progress_token:
+                _patch_holdings_refresh_progress(
+                    progress_token,
+                    {
+                        "message": "Futu 批量期权数据获取超时，将继续完成其余流程。",
+                    },
+                )
+            return {}
+        except Exception as exc:
+            elapsed_ms = (perf_counter() - batch_started_at) * 1000
+            logger.warning(
+                "refresh_holdings_futu_batch_failed symbol=%s coverage=%s tickers=%s elapsed_ms=%s error=%s",
+                symbol.upper(),
+                coverage_label,
+                len(normalized_symbols),
+                round(elapsed_ms, 1),
+                str(exc),
+            )
+            if progress_token:
+                _patch_holdings_refresh_progress(
+                    progress_token,
+                    {
+                        "message": "Futu 批量期权数据获取失败，将继续完成其余流程。",
+                    },
+                )
+            return {}
+
+        payload = iv_results if isinstance(iv_results, dict) else {}
+        ok_count = 0
+        for ticker in normalized_symbols:
+            item = payload.get(ticker)
+            try:
+                if item is not None and item.is_valid():
+                    ok_count += 1
+            except Exception:
+                continue
+        elapsed_ms = (perf_counter() - batch_started_at) * 1000
+        logger.info(
+            "refresh_holdings_futu_batch_done symbol=%s coverage=%s tickers=%s ok=%s fail=%s elapsed_ms=%s",
+            symbol.upper(),
+            coverage_label,
+            len(normalized_symbols),
+            ok_count,
+            max(0, len(normalized_symbols) - ok_count),
+            round(elapsed_ms, 1),
+        )
+        return payload
+
+    futu_iv_task: Optional[asyncio.Task] = None
+    if futu_symbols and orchestrator._futu and orchestrator._futu.is_connected():
+        futu_iv_task = asyncio.create_task(_fetch_futu_iv_batch(futu_symbols))
 
     async def fetch_stock_data(holding: ETFHolding, idx: int, total_count: int):
         async with stock_semaphore:
@@ -1948,7 +2997,10 @@ async def refresh_holdings_by_coverage(
                 if ibkr_connected:
                     try:
                         # 获取股票的日线数据（用于动能评分）
-                        stock_df = await orchestrator.get_ohlcv_data(holding.ticker, '1 Y')
+                        stock_df = await asyncio.wait_for(
+                            orchestrator.get_ohlcv_data(holding.ticker, '1 Y'),
+                            timeout=ibkr_price_timeout_seconds,
+                        )
                         if stock_df is not None and not stock_df.empty:
                             latest_row = stock_df.iloc[-1]
                             price_data = float(latest_row.get('close', 0))
@@ -1971,6 +3023,13 @@ async def refresh_holdings_by_coverage(
                                     change_1d = ((price_data - prev_close) / prev_close) * 100
                         else:
                             ibkr_price_log = "N/A (empty_data)"
+                    except asyncio.TimeoutError:
+                        ibkr_price_log = "N/A (request_timeout)"
+                        logger.warning(
+                            "ibkr_holding_price_fetch_timeout symbol=%s timeout_seconds=%s",
+                            ticker,
+                            ibkr_price_timeout_seconds,
+                        )
                     except Exception as e:
                         ibkr_price_log = "N/A (request_failed)"
                         logger.warning("ibkr_holding_price_fetch_failed symbol=%s error=%s", ticker, str(e))
@@ -1997,37 +3056,28 @@ async def refresh_holdings_by_coverage(
                 put_oi_bucket_0_7 = None
                 put_oi_bucket_8_30 = None
                 put_oi_bucket_31_90 = None
-                if orchestrator._futu and orchestrator._futu.is_connected():
-                    try:
-                        iv_results = await asyncio.to_thread(
-                            orchestrator._futu.fetch_iv_terms,
-                            [holding.ticker],
-                            max_days=120,
-                            progress_total=total_count,
-                            progress_offset=idx - 1,
-                            log_progress=False,
-                            log_fetch_summary=False,
-                        )
-                        if holding.ticker in iv_results:
-                            iv_data = iv_results[holding.ticker]
-                            if iv_data.is_valid():
-                                iv30 = iv_data.iv30
-                                iv7 = iv_data.iv7
-                                iv60 = iv_data.iv60
-                                iv90 = iv_data.iv90
-                                total_oi = iv_data.total_oi
-                                oi_bucket_0_7 = iv_data.oi_bucket_0_7
-                                oi_bucket_8_30 = iv_data.oi_bucket_8_30
-                                oi_bucket_31_90 = iv_data.oi_bucket_31_90
-                                call_oi_bucket_0_7 = getattr(iv_data, 'call_oi_bucket_0_7', None)
-                                call_oi_bucket_8_30 = getattr(iv_data, 'call_oi_bucket_8_30', None)
-                                call_oi_bucket_31_90 = getattr(iv_data, 'call_oi_bucket_31_90', None)
-                                put_oi_bucket_0_7 = getattr(iv_data, 'put_oi_bucket_0_7', None)
-                                put_oi_bucket_8_30 = getattr(iv_data, 'put_oi_bucket_8_30', None)
-                                put_oi_bucket_31_90 = getattr(iv_data, 'put_oi_bucket_31_90', None)
-                                data_sources.append('futu')
-                    except Exception as e:
-                        logger.warning(f"Failed to get IV data for {holding.ticker}: {e}")
+                futu_failed = False
+                if futu_iv_task is not None:
+                    iv_results = await asyncio.shield(futu_iv_task)
+                    iv_data = iv_results.get(ticker)
+                    if iv_data is not None and iv_data.is_valid():
+                        iv30 = iv_data.iv30
+                        iv7 = iv_data.iv7
+                        iv60 = iv_data.iv60
+                        iv90 = iv_data.iv90
+                        total_oi = iv_data.total_oi
+                        oi_bucket_0_7 = iv_data.oi_bucket_0_7
+                        oi_bucket_8_30 = iv_data.oi_bucket_8_30
+                        oi_bucket_31_90 = iv_data.oi_bucket_31_90
+                        call_oi_bucket_0_7 = getattr(iv_data, 'call_oi_bucket_0_7', None)
+                        call_oi_bucket_8_30 = getattr(iv_data, 'call_oi_bucket_8_30', None)
+                        call_oi_bucket_31_90 = getattr(iv_data, 'call_oi_bucket_31_90', None)
+                        put_oi_bucket_0_7 = getattr(iv_data, 'put_oi_bucket_0_7', None)
+                        put_oi_bucket_8_30 = getattr(iv_data, 'put_oi_bucket_8_30', None)
+                        put_oi_bucket_31_90 = getattr(iv_data, 'put_oi_bucket_31_90', None)
+                        data_sources.append('futu')
+                    else:
+                        futu_failed = True
 
                 data_sources = list(dict.fromkeys(data_sources))
 
@@ -2067,6 +3117,7 @@ async def refresh_holdings_by_coverage(
                     "_log_idx": idx,
                     "_log_total": total_count,
                     "_log_ibkr": ibkr_price_log,
+                    "_futu_failed": futu_failed,
                 }
 
             except Exception as e:
@@ -2103,16 +3154,16 @@ async def refresh_holdings_by_coverage(
                     "_log_idx": idx,
                     "_log_total": total_count,
                     "_log_ibkr": "N/A (fetch_failed)",
+                    "_futu_failed": False,
                 }
 
     # 并发获取所有股票数据（按完成顺序处理，便于前端实时读取进度）
     fetch_tasks = [
-        asyncio.create_task(fetch_stock_data(h, idx, len(filtered_holdings)))
-        for idx, h in enumerate(filtered_holdings, start=1)
+        asyncio.create_task(fetch_stock_data(h, idx, max(1, refresh_targets_count)))
+        for idx, h in enumerate(holdings_to_refresh, start=1)
     ]
 
-    # 计算数据完整度
-    completeness_calculator = DataCompletenessCalculator(db)
+    futu_failed_count = 0
 
     for future in asyncio.as_completed(fetch_tasks):
         try:
@@ -2139,6 +3190,9 @@ async def refresh_holdings_by_coverage(
             log_idx = int(result.pop('_log_idx', 0) or 0)
             log_total = int(result.pop('_log_total', total_targets) or total_targets)
             ibkr_price_log = str(result.pop('_log_ibkr', 'N/A'))
+            futu_failed_flag = bool(result.pop('_futu_failed', False))
+            if futu_failed_flag:
+                futu_failed_count += 1
             if progress_token:
                 _patch_holdings_refresh_progress(
                     progress_token,
@@ -2160,97 +3214,100 @@ async def refresh_holdings_by_coverage(
 
             # 计算动能股评分并更新数据库
             score_value = None
+            data_sources_list = result.get('data_sources') or []
+
+            # 即使 IBKR 价格缺失，也应持久化已抓取的 Futu IV，避免前端静默重拉后回退为“缺失”。
+            if 'futu' in data_sources_list:
+                today = date.today()
+                ticker_upper = str(result['ticker']).upper()
+                total_oi_int = _as_int(result.get('total_oi'))
+                bucket_totals = _extract_bucket_totals(result)
+                delta_payload = _compute_bucket_delta_payload(
+                    ticker=ticker_upper,
+                    today=today,
+                    bucket_totals=bucket_totals,
+                    total_oi_value=total_oi_int,
+                )
+
+                for suffix in ("0_7", "8_30", "31_90"):
+                    result[f"oi_bucket_{suffix}"] = bucket_totals[suffix]["net"]
+                    result[f"call_oi_bucket_{suffix}"] = bucket_totals[suffix]["call"]
+                    result[f"put_oi_bucket_{suffix}"] = bucket_totals[suffix]["put"]
+                    result[f"net_delta_oi_{suffix}"] = delta_payload["by_bucket"][suffix]["net_1d"]
+                    result[f"call_delta_oi_{suffix}"] = delta_payload["by_bucket"][suffix]["call_1d"]
+                    result[f"put_delta_oi_{suffix}"] = delta_payload["by_bucket"][suffix]["put_1d"]
+                    result[f"net_delta3d_{suffix}"] = delta_payload["by_bucket"][suffix]["net_3d"]
+                    result[f"net_delta5d_{suffix}"] = delta_payload["by_bucket"][suffix]["net_5d"]
+                result["delta_oi_1d"] = delta_payload.get("total_oi_1d")
+
+                existing_iv = db.query(IVData).filter(
+                    IVData.symbol == ticker_upper,
+                    IVData.date == today,
+                ).first()
+                if existing_iv:
+                    existing_iv.iv7 = result.get('iv7')
+                    existing_iv.iv30 = result.get('iv30')
+                    existing_iv.iv60 = result.get('iv60')
+                    existing_iv.iv90 = result.get('iv90')
+                    existing_iv.total_oi = result.get('total_oi')
+                    existing_iv.delta_oi_1d = result.get('delta_oi_1d')
+                    existing_iv.oi_bucket_0_7 = result.get('oi_bucket_0_7')
+                    existing_iv.oi_bucket_8_30 = result.get('oi_bucket_8_30')
+                    existing_iv.oi_bucket_31_90 = result.get('oi_bucket_31_90')
+                    existing_iv.call_oi_bucket_0_7 = result.get('call_oi_bucket_0_7')
+                    existing_iv.call_oi_bucket_8_30 = result.get('call_oi_bucket_8_30')
+                    existing_iv.call_oi_bucket_31_90 = result.get('call_oi_bucket_31_90')
+                    existing_iv.put_oi_bucket_0_7 = result.get('put_oi_bucket_0_7')
+                    existing_iv.put_oi_bucket_8_30 = result.get('put_oi_bucket_8_30')
+                    existing_iv.put_oi_bucket_31_90 = result.get('put_oi_bucket_31_90')
+                    existing_iv.net_delta_oi_0_7 = result.get('net_delta_oi_0_7')
+                    existing_iv.net_delta_oi_8_30 = result.get('net_delta_oi_8_30')
+                    existing_iv.net_delta_oi_31_90 = result.get('net_delta_oi_31_90')
+                    existing_iv.call_delta_oi_0_7 = result.get('call_delta_oi_0_7')
+                    existing_iv.call_delta_oi_8_30 = result.get('call_delta_oi_8_30')
+                    existing_iv.call_delta_oi_31_90 = result.get('call_delta_oi_31_90')
+                    existing_iv.put_delta_oi_0_7 = result.get('put_delta_oi_0_7')
+                    existing_iv.put_delta_oi_8_30 = result.get('put_delta_oi_8_30')
+                    existing_iv.put_delta_oi_31_90 = result.get('put_delta_oi_31_90')
+                    existing_iv.source = 'futu'
+                    existing_iv.created_at = datetime.utcnow()
+                else:
+                    db.add(IVData(
+                        symbol=ticker_upper,
+                        date=today,
+                        iv7=result.get('iv7'),
+                        iv30=result.get('iv30'),
+                        iv60=result.get('iv60'),
+                        iv90=result.get('iv90'),
+                        total_oi=result.get('total_oi'),
+                        delta_oi_1d=result.get('delta_oi_1d'),
+                        oi_bucket_0_7=result.get('oi_bucket_0_7'),
+                        oi_bucket_8_30=result.get('oi_bucket_8_30'),
+                        oi_bucket_31_90=result.get('oi_bucket_31_90'),
+                        call_oi_bucket_0_7=result.get('call_oi_bucket_0_7'),
+                        call_oi_bucket_8_30=result.get('call_oi_bucket_8_30'),
+                        call_oi_bucket_31_90=result.get('call_oi_bucket_31_90'),
+                        put_oi_bucket_0_7=result.get('put_oi_bucket_0_7'),
+                        put_oi_bucket_8_30=result.get('put_oi_bucket_8_30'),
+                        put_oi_bucket_31_90=result.get('put_oi_bucket_31_90'),
+                        net_delta_oi_0_7=result.get('net_delta_oi_0_7'),
+                        net_delta_oi_8_30=result.get('net_delta_oi_8_30'),
+                        net_delta_oi_31_90=result.get('net_delta_oi_31_90'),
+                        call_delta_oi_0_7=result.get('call_delta_oi_0_7'),
+                        call_delta_oi_8_30=result.get('call_delta_oi_8_30'),
+                        call_delta_oi_31_90=result.get('call_delta_oi_31_90'),
+                        put_delta_oi_0_7=result.get('put_delta_oi_0_7'),
+                        put_delta_oi_8_30=result.get('put_delta_oi_8_30'),
+                        put_delta_oi_31_90=result.get('put_delta_oi_31_90'),
+                        source='futu',
+                    ))
+
             if price_df is None:
                 price_df = _load_price_history(result['ticker'])
 
             if price_df is not None and not price_df.empty:
-                if 'ibkr' in (result.get('data_sources') or []):
+                if 'ibkr' in data_sources_list:
                     _save_price_history(result['ticker'], price_df)
-
-                if 'futu' in (result.get('data_sources') or []):
-                    today = date.today()
-                    ticker_upper = str(result['ticker']).upper()
-                    total_oi_int = _as_int(result.get('total_oi'))
-                    bucket_totals = _extract_bucket_totals(result)
-                    delta_payload = _compute_bucket_delta_payload(
-                        ticker=ticker_upper,
-                        today=today,
-                        bucket_totals=bucket_totals,
-                        total_oi_value=total_oi_int,
-                    )
-
-                    for suffix in ("0_7", "8_30", "31_90"):
-                        result[f"oi_bucket_{suffix}"] = bucket_totals[suffix]["net"]
-                        result[f"call_oi_bucket_{suffix}"] = bucket_totals[suffix]["call"]
-                        result[f"put_oi_bucket_{suffix}"] = bucket_totals[suffix]["put"]
-                        result[f"net_delta_oi_{suffix}"] = delta_payload["by_bucket"][suffix]["net_1d"]
-                        result[f"call_delta_oi_{suffix}"] = delta_payload["by_bucket"][suffix]["call_1d"]
-                        result[f"put_delta_oi_{suffix}"] = delta_payload["by_bucket"][suffix]["put_1d"]
-                        result[f"net_delta3d_{suffix}"] = delta_payload["by_bucket"][suffix]["net_3d"]
-                        result[f"net_delta5d_{suffix}"] = delta_payload["by_bucket"][suffix]["net_5d"]
-                    result["delta_oi_1d"] = delta_payload.get("total_oi_1d")
-
-                    existing_iv = db.query(IVData).filter(
-                        IVData.symbol == ticker_upper,
-                        IVData.date == today,
-                    ).first()
-                    if existing_iv:
-                        existing_iv.iv7 = result.get('iv7')
-                        existing_iv.iv30 = result.get('iv30')
-                        existing_iv.iv60 = result.get('iv60')
-                        existing_iv.iv90 = result.get('iv90')
-                        existing_iv.total_oi = result.get('total_oi')
-                        existing_iv.delta_oi_1d = result.get('delta_oi_1d')
-                        existing_iv.oi_bucket_0_7 = result.get('oi_bucket_0_7')
-                        existing_iv.oi_bucket_8_30 = result.get('oi_bucket_8_30')
-                        existing_iv.oi_bucket_31_90 = result.get('oi_bucket_31_90')
-                        existing_iv.call_oi_bucket_0_7 = result.get('call_oi_bucket_0_7')
-                        existing_iv.call_oi_bucket_8_30 = result.get('call_oi_bucket_8_30')
-                        existing_iv.call_oi_bucket_31_90 = result.get('call_oi_bucket_31_90')
-                        existing_iv.put_oi_bucket_0_7 = result.get('put_oi_bucket_0_7')
-                        existing_iv.put_oi_bucket_8_30 = result.get('put_oi_bucket_8_30')
-                        existing_iv.put_oi_bucket_31_90 = result.get('put_oi_bucket_31_90')
-                        existing_iv.net_delta_oi_0_7 = result.get('net_delta_oi_0_7')
-                        existing_iv.net_delta_oi_8_30 = result.get('net_delta_oi_8_30')
-                        existing_iv.net_delta_oi_31_90 = result.get('net_delta_oi_31_90')
-                        existing_iv.call_delta_oi_0_7 = result.get('call_delta_oi_0_7')
-                        existing_iv.call_delta_oi_8_30 = result.get('call_delta_oi_8_30')
-                        existing_iv.call_delta_oi_31_90 = result.get('call_delta_oi_31_90')
-                        existing_iv.put_delta_oi_0_7 = result.get('put_delta_oi_0_7')
-                        existing_iv.put_delta_oi_8_30 = result.get('put_delta_oi_8_30')
-                        existing_iv.put_delta_oi_31_90 = result.get('put_delta_oi_31_90')
-                        existing_iv.source = 'futu'
-                        existing_iv.created_at = datetime.utcnow()
-                    else:
-                        db.add(IVData(
-                            symbol=ticker_upper,
-                            date=today,
-                            iv7=result.get('iv7'),
-                            iv30=result.get('iv30'),
-                            iv60=result.get('iv60'),
-                            iv90=result.get('iv90'),
-                            total_oi=result.get('total_oi'),
-                            delta_oi_1d=result.get('delta_oi_1d'),
-                            oi_bucket_0_7=result.get('oi_bucket_0_7'),
-                            oi_bucket_8_30=result.get('oi_bucket_8_30'),
-                            oi_bucket_31_90=result.get('oi_bucket_31_90'),
-                            call_oi_bucket_0_7=result.get('call_oi_bucket_0_7'),
-                            call_oi_bucket_8_30=result.get('call_oi_bucket_8_30'),
-                            call_oi_bucket_31_90=result.get('call_oi_bucket_31_90'),
-                            put_oi_bucket_0_7=result.get('put_oi_bucket_0_7'),
-                            put_oi_bucket_8_30=result.get('put_oi_bucket_8_30'),
-                            put_oi_bucket_31_90=result.get('put_oi_bucket_31_90'),
-                            net_delta_oi_0_7=result.get('net_delta_oi_0_7'),
-                            net_delta_oi_8_30=result.get('net_delta_oi_8_30'),
-                            net_delta_oi_31_90=result.get('net_delta_oi_31_90'),
-                            call_delta_oi_0_7=result.get('call_delta_oi_0_7'),
-                            call_delta_oi_8_30=result.get('call_delta_oi_8_30'),
-                            call_delta_oi_31_90=result.get('call_delta_oi_31_90'),
-                            put_delta_oi_0_7=result.get('put_delta_oi_0_7'),
-                            put_delta_oi_8_30=result.get('put_delta_oi_8_30'),
-                            put_delta_oi_31_90=result.get('put_delta_oi_31_90'),
-                            source='futu',
-                        ))
 
                 finviz_data = _get_imported(result['ticker'], 'finviz')
                 mc_data = _get_imported(result['ticker'], 'marketchameleon')
@@ -2474,7 +3531,7 @@ async def refresh_holdings_by_coverage(
                                 stock.risk_score = mc_risk_score
                             mc_heat_type = mc_data.get('heat_type')
                             if isinstance(mc_heat_type, str) and mc_heat_type.strip():
-                                stock.heat_type = mc_heat_type.strip().lower()
+                                stock.heat_type = normalize_heat_type(mc_heat_type)
                         except Exception:
                             pass
                     if existing_snapshot:
@@ -2495,21 +3552,37 @@ async def refresh_holdings_by_coverage(
 
             result['score'] = score_value
 
-            ordered_log_rows.append(
-                {
-                    "idx": log_idx,
-                    "total": log_total,
-                    "ticker": ticker_text,
-                    "ibkr_price_log": ibkr_price_log,
-                    "iv7": result.get('iv7'),
-                    "iv30": result.get('iv30'),
-                    "iv60": result.get('iv60'),
-                    "iv90": result.get('iv90'),
-                    "total_oi": result.get('total_oi'),
-                    "oi_bucket_0_7": result.get('oi_bucket_0_7'),
-                    "oi_bucket_8_30": result.get('oi_bucket_8_30'),
-                    "oi_bucket_31_90": result.get('oi_bucket_31_90'),
-                }
+            total_oi_raw = result.get("total_oi")
+            total_oi_text = (
+                str(int(total_oi_raw))
+                if isinstance(total_oi_raw, (int, float)) and total_oi_raw is not None
+                else "N/A"
+            )
+            oi_0_7_raw = result.get("oi_bucket_0_7")
+            oi_8_30_raw = result.get("oi_bucket_8_30")
+            oi_31_90_raw = result.get("oi_bucket_31_90")
+            oi_0_7_text = str(int(oi_0_7_raw)) if isinstance(oi_0_7_raw, (int, float)) else "N/A"
+            oi_8_30_text = str(int(oi_8_30_raw)) if isinstance(oi_8_30_raw, (int, float)) else "N/A"
+            oi_31_90_text = str(int(oi_31_90_raw)) if isinstance(oi_31_90_raw, (int, float)) else "N/A"
+            logger.info(
+                "\n".join(
+                    [
+                        f"HOLDINGS- [{log_idx}/{max(log_total, 1)}] {ticker_text}",
+                        f" - OHLCV(1Y): {ibkr_price_log}",
+                        (
+                            " - IV7/30/60/90: "
+                            f"{_fmt_float(result.get('iv7'), 2)}% / "
+                            f"{_fmt_float(result.get('iv30'), 2)}% / "
+                            f"{_fmt_float(result.get('iv60'), 2)}% / "
+                            f"{_fmt_float(result.get('iv90'), 2)}%"
+                        ),
+                        (
+                            f"-  Δ OI: {total_oi_text} "
+                            f"(0-7D: {oi_0_7_text}, 8-30D: {oi_8_30_text}, 31-90D: {oi_31_90_text})"
+                        ),
+                        "---",
+                    ]
+                )
             )
 
             updated_stocks.append(result)
@@ -2538,44 +3611,11 @@ async def refresh_holdings_by_coverage(
                     },
                 )
 
-    db.commit()
+    if futu_iv_task is not None:
+        await asyncio.gather(futu_iv_task, return_exceptions=True)
 
-    for row in sorted(ordered_log_rows, key=lambda item: int(item.get("idx") or 0)):
-        idx = int(row.get("idx") or 0)
-        total = int(row.get("total") or total_targets or 1)
-        ticker = str(row.get("ticker") or "")
-        total_oi_raw = row.get("total_oi")
-        total_oi_text = (
-            str(int(total_oi_raw))
-            if isinstance(total_oi_raw, (int, float)) and total_oi_raw is not None
-            else "N/A"
-        )
-        oi_0_7_raw = row.get("oi_bucket_0_7")
-        oi_8_30_raw = row.get("oi_bucket_8_30")
-        oi_31_90_raw = row.get("oi_bucket_31_90")
-        oi_0_7_text = str(int(oi_0_7_raw)) if isinstance(oi_0_7_raw, (int, float)) else "N/A"
-        oi_8_30_text = str(int(oi_8_30_raw)) if isinstance(oi_8_30_raw, (int, float)) else "N/A"
-        oi_31_90_text = str(int(oi_31_90_raw)) if isinstance(oi_31_90_raw, (int, float)) else "N/A"
-        logger.info(
-            "\n".join(
-                [
-                    f"HOLDINGS- [{idx}/{total}] {ticker}",
-                    f" - OHLCV(1Y): {row.get('ibkr_price_log')}",
-                    (
-                        " - IV7/30/60/90: "
-                        f"{_fmt_float(row.get('iv7'), 2)}% / "
-                        f"{_fmt_float(row.get('iv30'), 2)}% / "
-                        f"{_fmt_float(row.get('iv60'), 2)}% / "
-                        f"{_fmt_float(row.get('iv90'), 2)}%"
-                    ),
-                    (
-                        f"-  Δ OI: {total_oi_text} "
-                        f"(0-7D: {oi_0_7_text}, 8-30D: {oi_8_30_text}, 31-90D: {oi_31_90_text})"
-                    ),
-                    "---",
-                ]
-            )
-        )
+    db.commit()
+    _recalculate_etf_score_from_db(etf, db)
 
     # 评估覆盖范围的整体完整度
     holdings_with_data = [
@@ -2600,7 +3640,21 @@ async def refresh_holdings_by_coverage(
     )
 
     total_weight = sum(h.weight for h in filtered_holdings)
-    final_message = f"已刷新 {len(filtered_holdings)} 只持仓股票数据，平均完备度 {round(coverage_completeness.average_completeness, 1)}%"
+    refreshed_count = len(holdings_to_refresh)
+    if has_related_etf_scope:
+        final_message = (
+            f"覆盖 {len(filtered_holdings)} 只持仓：同任务重复标的 {duplicate_scope_count} 只，"
+            f"刷新 {refreshed_count} 只，跳过 {skipped_recent_count} 只（{HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟冷却），"
+            f"平均完备度 {round(coverage_completeness.average_completeness, 1)}%"
+        )
+    else:
+        final_message = (
+            f"覆盖 {len(filtered_holdings)} 只持仓：刷新 {refreshed_count} 只，"
+            f"跳过 {skipped_recent_count} 只（{HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟内已有市场+期权数据），"
+            f"平均完备度 {round(coverage_completeness.average_completeness, 1)}%"
+        )
+    if futu_failed_count > 0:
+        final_message += f"（Futu 期权数据部分缺失 {futu_failed_count} 只）"
 
     if progress_token:
         _patch_holdings_refresh_progress(
@@ -2620,7 +3674,11 @@ async def refresh_holdings_by_coverage(
         "symbol": symbol.upper(),
         "coverage": coverage_label,
         "stocks_count": len(filtered_holdings),
+        "refreshed_stocks_count": refreshed_count,
+        "skipped_recent_count": skipped_recent_count,
+        "duplicate_scope_count": duplicate_scope_count,
         "total_weight": round(total_weight, 2),
+        "futu_failed_count": futu_failed_count,
         "completeness": coverage_completeness.to_dict(),
         "updated_stocks": updated_stocks,
         "updated_at": _utc_now_iso(),

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ETF } from '../types';
 import * as api from '../services/api';
 
@@ -40,6 +40,7 @@ type ManualInputsState = {
   sma50?: string;
   return20d?: string; // 百分比
   breadth?: string;
+  qqqBreadth?: string;
 };
 
 interface Sector {
@@ -173,7 +174,7 @@ function EditableNumber({ value, onChange, suffix = '%', className = '' }: Edita
 // ============ 本地快照缓存 ============
 const MARKET_SNAPSHOT_STORAGE_KEY = 'coreTerminal.marketRegimeSnapshot.v1';
 const MARKET_MANUAL_INPUTS_STORAGE_KEY = 'coreTerminal.marketRegimeManualInputs.v1';
-const MANUAL_INPUT_KEYS: Array<keyof ManualInputsState> = ['price', 'sma20', 'sma50', 'return20d', 'breadth'];
+const MANUAL_INPUT_KEYS: Array<keyof ManualInputsState> = ['price', 'sma20', 'sma50', 'return20d', 'breadth', 'qqqBreadth'];
 
 const isFiniteNumber = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value);
@@ -258,9 +259,6 @@ const normalizeMarketRegimeResponse = (payload: unknown): MarketStatus => {
   };
 };
 
-const normalizeMarketSymbolSnapshot = (payload: unknown): MarketIndexData =>
-  normalizeIndexData(payload);
-
 const loadStoredSnapshot = (): StoredMarketSnapshot | null => {
   if (typeof window === 'undefined') return null;
   try {
@@ -306,12 +304,13 @@ const loadStoredManualInputs = (): ManualInputsState | null => {
       normalized[key] = trimmed;
     }
 
-    if (normalized.breadth !== undefined) {
-      const parsedBreadth = Number(normalized.breadth);
+    for (const key of ['breadth', 'qqqBreadth'] as const) {
+      if (normalized[key] === undefined) continue;
+      const parsedBreadth = Number(normalized[key]);
       if (Number.isNaN(parsedBreadth)) {
-        delete normalized.breadth;
+        delete normalized[key];
       } else {
-        normalized.breadth = Math.max(0, Math.min(100, parsedBreadth)).toString();
+        normalized[key] = Math.max(0, Math.min(100, parsedBreadth)).toString();
       }
     }
 
@@ -455,6 +454,10 @@ const formatNumber = (value: number | null | undefined, digits = 2): string => {
 
 function computeRegime(inputs: { price?: number; sma50?: number; return20d?: number; sma20Slope?: number; breadth?: number; dist50?: number | null }): 'A' | 'B' | 'C' {
   const { price, sma50, return20d, sma20Slope, breadth, dist50 } = inputs;
+  const breadthGood = breadth === undefined ? true : breadth >= 50;
+  const breadthCollapse = breadth !== undefined && breadth < 30;
+
+  if (breadthCollapse) return 'C';
   if (price === undefined || sma50 === undefined) return 'B';
 
   const diff50 = dist50 !== null && dist50 !== undefined ? dist50 : percentDiff(price, sma50);
@@ -465,10 +468,7 @@ function computeRegime(inputs: { price?: number; sma50?: number; return20d?: num
   const priceAbove50 = price > sma50;
   const priceBelow50 = price < sma50;
 
-  const breadthGood = breadth === undefined ? true : breadth >= 50;
-  const breadthCollapse = breadth !== undefined && breadth > 0 && breadth < 30;
-
-  if ((priceBelow50 && (return20d ?? 0) < 0) || breadthCollapse) return 'C';
+  if (priceBelow50 && (return20d ?? 0) < 0) return 'C';
   if (near50) return 'B';
   if (priceAbove50 && (slopeUp || returnUp) && breadthGood) return 'A';
   return 'B';
@@ -489,6 +489,7 @@ export function CoreTerminal() {
   });
   const [marketStatusError, setMarketStatusError] = useState<string | null>(null);
   const [manualInputs, setManualInputs] = useState<ManualInputsState>(() => loadStoredManualInputs() ?? {});
+  const marketFetchInFlightRef = useRef(false);
   const marketStatus = marketSnapshot.data;
 
   useEffect(() => {
@@ -584,22 +585,22 @@ export function CoreTerminal() {
       }));
   }, [industryEtfs, selectedSector]);
 
-  const handleBreadthChange = useCallback((value: string) => {
+  const handleBreadthChange = useCallback((key: 'breadth' | 'qqqBreadth', value: string) => {
     const trimmed = value.trim();
     if (trimmed === '') {
-      setManualInputs((prev) => ({ ...prev, breadth: '' }));
+      setManualInputs((prev) => ({ ...prev, [key]: '' }));
       return;
     }
 
     const normalized = trimmed.replace(/[^\d.-]/g, '');
     const parsed = Number(normalized);
     if (Number.isNaN(parsed)) {
-      setManualInputs((prev) => ({ ...prev, breadth: '' }));
+      setManualInputs((prev) => ({ ...prev, [key]: '' }));
       return;
     }
 
     const clamped = Math.max(0, Math.min(100, parsed));
-    setManualInputs((prev) => ({ ...prev, breadth: clamped.toString() }));
+    setManualInputs((prev) => ({ ...prev, [key]: clamped.toString() }));
   }, []);
 
   const numberFromManual = (value?: string) => {
@@ -609,43 +610,66 @@ export function CoreTerminal() {
   };
 
   const baseSpy = marketStatus?.spy;
-  const priceVal = numberFromManual(manualInputs.price) ?? baseSpy?.price;
-  const sma20Val = numberFromManual(manualInputs.sma20) ?? baseSpy?.sma20;
-  const sma50Val = numberFromManual(manualInputs.sma50) ?? baseSpy?.sma50;
-  const return20Val = numberFromManual(manualInputs.return20d) !== undefined
+  const baseQqq = marketStatus?.qqq;
+
+  const spyPriceVal = numberFromManual(manualInputs.price) ?? baseSpy?.price;
+  const spySma20Val = numberFromManual(manualInputs.sma20) ?? baseSpy?.sma20;
+  const spySma50Val = numberFromManual(manualInputs.sma50) ?? baseSpy?.sma50;
+  const spyReturn20Val = numberFromManual(manualInputs.return20d) !== undefined
     ? Number(manualInputs.return20d) / 100
     : baseSpy?.return20d;
-  const dist50Val = percentDiff(priceVal, sma50Val);
-  const canComputeRegime = isFiniteNumber(priceVal) && isFiniteNumber(sma50Val);
+  const spyDist50Val = percentDiff(spyPriceVal, spySma50Val);
+  const canComputeSpyRegime = isFiniteNumber(spyPriceVal) && isFiniteNumber(spySma50Val);
+  const effectiveSpyBreadth = numberFromManual(manualInputs.breadth) ?? marketStatus?.breadth;
 
   const effectiveSpy = {
-    price: priceVal,
-    sma20: sma20Val,
-    sma50: sma50Val,
-    return20d: return20Val,
+    price: spyPriceVal,
+    sma20: spySma20Val,
+    sma50: spySma50Val,
+    return20d: spyReturn20Val,
     sma20Slope: baseSpy?.sma20Slope,
-    distToSma50: dist50Val,
+    distToSma50: spyDist50Val,
   };
 
-  const effectiveBreadth = numberFromManual(manualInputs.breadth) ?? marketStatus?.breadth;
+  const qqqDist50Val = percentDiff(baseQqq?.price, baseQqq?.sma50);
+  const canComputeQqqRegime = isFiniteNumber(baseQqq?.price) && isFiniteNumber(baseQqq?.sma50);
+  const effectiveQqqBreadth = numberFromManual(manualInputs.qqqBreadth) ?? marketStatus?.breadth;
 
-  const computedStatus: MarketRegimeStatus = canComputeRegime
+  const effectiveQqq = {
+    ...baseQqq,
+    distToSma50: baseQqq?.distToSma50 ?? qqqDist50Val,
+  };
+
+  const spyComputedStatus: MarketRegimeStatus = canComputeSpyRegime
     ? computeRegime({
         price: effectiveSpy.price,
         sma50: effectiveSpy.sma50,
         return20d: effectiveSpy.return20d,
         sma20Slope: effectiveSpy.sma20Slope,
-        breadth: effectiveBreadth,
+        breadth: effectiveSpyBreadth,
         dist50: effectiveSpy.distToSma50 ?? percentDiff(effectiveSpy.price, effectiveSpy.sma50),
       })
     : 'UNKNOWN';
 
+  const qqqComputedStatus: MarketRegimeStatus = canComputeQqqRegime
+    ? computeRegime({
+        price: effectiveQqq.price,
+        sma50: effectiveQqq.sma50,
+        return20d: effectiveQqq.return20d,
+        sma20Slope: effectiveQqq.sma20Slope,
+        breadth: effectiveQqqBreadth,
+        dist50: effectiveQqq.distToSma50 ?? percentDiff(effectiveQqq.price, effectiveQqq.sma50),
+      })
+    : 'UNKNOWN';
+
   const displayRegime = {
-    status: canComputeRegime ? computedStatus : (marketStatus?.status ?? 'UNKNOWN'),
+    spyStatus: canComputeSpyRegime ? spyComputedStatus : (marketStatus?.status ?? 'UNKNOWN'),
+    qqqStatus: canComputeQqqRegime ? qqqComputedStatus : (marketStatus?.status ?? 'UNKNOWN'),
     spy: effectiveSpy,
-    qqq: marketStatus?.qqq,
+    qqq: effectiveQqq,
     vix: marketStatus?.vix ?? null,
-    breadth: effectiveBreadth,
+    spyBreadth: effectiveSpyBreadth,
+    qqqBreadth: effectiveQqqBreadth,
   };
 
   const dist20 = percentDiff(effectiveSpy.price, effectiveSpy.sma20);
@@ -653,9 +677,13 @@ export function CoreTerminal() {
   const qqqDist20 = displayRegime.qqq?.distToSma20 ?? percentDiff(displayRegime.qqq?.price, displayRegime.qqq?.sma20);
   const qqqDist50 = displayRegime.qqq?.distToSma50 ?? percentDiff(displayRegime.qqq?.price, displayRegime.qqq?.sma50);
   const hasMarketData = hasUsableSpyData(marketStatus?.spy);
-  const regimeBadge =
-    displayRegime.status === 'A' || displayRegime.status === 'B' || displayRegime.status === 'C'
-      ? displayRegime.status
+  const spyRegimeBadge =
+    displayRegime.spyStatus === 'A' || displayRegime.spyStatus === 'B' || displayRegime.spyStatus === 'C'
+      ? displayRegime.spyStatus
+      : '--';
+  const qqqRegimeBadge =
+    displayRegime.qqqStatus === 'A' || displayRegime.qqqStatus === 'B' || displayRegime.qqqStatus === 'C'
+      ? displayRegime.qqqStatus
       : '--';
   const marketSnapshotLabel =
     hasMarketData
@@ -664,14 +692,9 @@ export function CoreTerminal() {
         : marketSnapshot.source === 'cache'
           ? '缓存快照'
           : '暂无数据'
-      : canComputeRegime
+      : canComputeSpyRegime || canComputeQqqRegime
         ? '手动输入'
         : '暂无数据';
-  const breadthDisplayValue =
-    displayRegime.breadth === undefined || Number.isNaN(displayRegime.breadth)
-      ? 'N/A'
-      : `${displayRegime.breadth.toFixed(0)}%`;
-
   const sectorDelta = selectedSectorETF?.delta?.delta5d ?? selectedSectorETF?.delta?.delta3d ?? null;
   const sectorTrendLevel = getTrendLevel(sectorDelta, selectedSectorETF?.score);
   const hasSectorData = Boolean(selectedSectorETF);
@@ -682,8 +705,16 @@ export function CoreTerminal() {
   const sectorSubtitle = selectedSectorETF
     ? `${sectorName} · ${sectorName.replace('板块', '')} Sector`
     : '暂无板块数据';
+  const regimeMetricCellClassName = 'flex flex-col items-center justify-start text-center';
+  const regimeMetricLabelClassName = 'text-sm text-white/80';
+  const regimeMetricValueClassName = 'flex h-10 items-center justify-center text-2xl font-bold';
 
   const fetchMarketRegime = useCallback(async (refresh = false, showSpinner = false) => {
+    if (marketFetchInFlightRef.current) {
+      return;
+    }
+    marketFetchInFlightRef.current = true;
+
     if (showSpinner) {
       setIsRefreshing(true);
     }
@@ -700,20 +731,14 @@ export function CoreTerminal() {
         }
       }
 
-      const [response, qqqResponse] = await Promise.all([
-        api.getMarketRegime(refresh),
-        api.getMarketSymbolSnapshot('QQQ').catch((qqqError) => {
-          console.warn('获取 QQQ 快照失败:', qqqError);
-          return null;
-        }),
-      ]);
+      const response = await api.getMarketRegime(refresh);
 
       const cachedSnapshot = loadStoredSnapshot();
       const regimeSnapshot = normalizeMarketRegimeResponse(response);
-      const qqqSnapshot = qqqResponse ? normalizeMarketSymbolSnapshot(qqqResponse) : undefined;
       const nextSnapshot: MarketStatus = {
         ...regimeSnapshot,
-        qqq: qqqSnapshot ?? regimeSnapshot.qqq ?? cachedSnapshot?.data?.qqq,
+        spy: regimeSnapshot.spy ?? cachedSnapshot?.data?.spy,
+        qqq: regimeSnapshot.qqq ?? cachedSnapshot?.data?.qqq,
       };
 
       if (hasUsableSpyData(nextSnapshot.spy)) {
@@ -772,6 +797,7 @@ export function CoreTerminal() {
         return prev;
       });
     } finally {
+      marketFetchInFlightRef.current = false;
       if (showSpinner) {
         setIsRefreshing(false);
       }
@@ -788,7 +814,12 @@ export function CoreTerminal() {
       <div className="flex items-center justify-between mb-6">
         <button
           onClick={() => fetchMarketRegime(true, true)}
-          className="px-4 py-2 text-sm font-medium rounded-sm bg-blue-600 text-white hover:bg-blue-700 transition-colors flex items-center gap-2"
+          disabled={isRefreshing}
+          className={`px-4 py-2 text-sm font-medium rounded-sm transition-colors flex items-center gap-2 ${
+            isRefreshing
+              ? 'bg-blue-400 text-white cursor-not-allowed'
+              : 'bg-blue-600 text-white hover:bg-blue-700'
+          }`}
         >
           {isRefreshing ? <RefreshIcon className="animate" /> : ''}
           Refresh
@@ -802,44 +833,45 @@ export function CoreTerminal() {
       )}
 
       {/* Regime Gate 状态卡：SPY */}
-      <div className={`mb-6 p-6 rounded-2xl bg-gradient-to-r ${getRegimeColor(displayRegime.status)} shadow-xl text-white`}>
+      <div className={`mb-6 p-6 rounded-2xl bg-gradient-to-r ${getRegimeColor(displayRegime.spyStatus)} shadow-xl text-white`}>
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-4">
             <div className="w-16 h-16 bg-white/30 rounded-xl flex items-center justify-center backdrop-blur-sm">
-              <span className="text-3xl font-bold">{regimeBadge}</span>
+              <span className="text-3xl font-bold">{spyRegimeBadge}</span>
             </div>
             <div>
-              <h2 className="text-2xl font-bold mb-1">{getRegimeText(displayRegime.status)}</h2>
+              <h2 className="text-2xl font-bold mb-1">{getRegimeText(displayRegime.spyStatus)}</h2>
               <p className="text-white/90 text-sm">市场环境评估 · {marketSnapshotLabel}</p>
             </div>
           </div>
-          <div className="grid grid-cols-6 gap-6 items-center">
-            <div className="text-center">
-              <div className="text-sm text-white/80 mb-1">$SPY</div>
-              <div className="text-2xl font-bold">${displayRegime.spy?.price !== undefined ? displayRegime.spy.price.toFixed(2) : 'N/A'}</div>
+          <div className="grid grid-cols-6 gap-6 items-start">
+            <div className={regimeMetricCellClassName}>
+              <div className={regimeMetricLabelClassName}>$SPY</div>
+              <div className={regimeMetricValueClassName}>${displayRegime.spy?.price !== undefined ? displayRegime.spy.price.toFixed(2) : 'N/A'}</div>
             </div>
-            <div className="text-center">
-              <div className="text-sm text-white/80 mb-1">20DMA</div>
-              <div className="text-2xl font-bold">{formatPercent(dist20)}</div>
+            <div className={regimeMetricCellClassName}>
+              <div className={regimeMetricLabelClassName}>20DMA</div>
+              <div className={regimeMetricValueClassName}>{formatPercent(dist20)}</div>
             </div>
-            <div className="text-center">
-              <div className="text-sm text-white/80 mb-1">50DMA</div>
-              <div className={`text-2xl font-bold ${Math.abs(dist50 ?? 0) < 0.02 ? 'text-amber-200' : ''}`}>{formatPercent(dist50)}</div>
+            <div className={regimeMetricCellClassName}>
+              <div className={regimeMetricLabelClassName}>50DMA</div>
+              <div className={`${regimeMetricValueClassName} ${Math.abs(dist50 ?? 0) < 0.02 ? 'text-amber-200' : ''}`}>{formatPercent(dist50)}</div>
             </div>
-            <div className="text-center">
-              <div className="text-sm text-white/80 mb-1">20日收益率</div>
-              <div className="text-2xl font-bold">{formatPercent(displayRegime.spy?.return20d ?? null, 2)}</div>
+            <div className={regimeMetricCellClassName}>
+              <div className={regimeMetricLabelClassName}>20日收益率</div>
+              <div className={regimeMetricValueClassName}>{formatPercent(displayRegime.spy?.return20d ?? null, 2)}</div>
             </div>
-            <div className="text-center">
-              <div className="text-sm text-white/80 mb-1">20DMA Slope</div>
-              <div className="text-2xl font-bold">{formatNumber(displayRegime.spy?.sma20Slope ?? null, 3)}</div>
+            <div className={regimeMetricCellClassName}>
+              <div className={regimeMetricLabelClassName}>20DMA Slope</div>
+              <div className={regimeMetricValueClassName}>{formatNumber(displayRegime.spy?.sma20Slope ?? null, 3)}</div>
             </div>
-            <div className="text-center">
-              <div className="text-sm text-white/80 mb-1">市场广度</div>
+            <div className={regimeMetricCellClassName}>
+              <div className={regimeMetricLabelClassName}>市场广度</div>
               <EditableNumber
-                value={displayRegime.breadth}
-                onChange={handleBreadthChange}
+                value={displayRegime.spyBreadth}
+                onChange={(value) => handleBreadthChange('breadth', value)}
                 suffix="%"
+                className="h-10"
               />
             </div>
           </div>
@@ -847,41 +879,46 @@ export function CoreTerminal() {
       </div>
 
       {/* Regime Gate 状态卡：QQQ */}
-      <div className={`mb-6 p-6 rounded-2xl bg-gradient-to-r ${getRegimeColor(displayRegime.status)} shadow-xl text-white`}>
+      <div className={`mb-6 p-6 rounded-2xl bg-gradient-to-r ${getRegimeColor(displayRegime.qqqStatus)} shadow-xl text-white`}>
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-4">
             <div className="w-16 h-16 bg-white/30 rounded-xl flex items-center justify-center backdrop-blur-sm">
-              <span className="text-3xl font-bold">{regimeBadge}</span>
+              <span className="text-3xl font-bold">{qqqRegimeBadge}</span>
             </div>
             <div>
-              <h2 className="text-2xl font-bold mb-1">{getRegimeText(displayRegime.status)}</h2>
+              <h2 className="text-2xl font-bold mb-1">{getRegimeText(displayRegime.qqqStatus)}</h2>
               <p className="text-white/90 text-sm">市场环境评估 · {marketSnapshotLabel}</p>
             </div>
           </div>
-          <div className="grid grid-cols-6 gap-6 items-center">
-            <div className="text-center">
-              <div className="text-sm text-white/80 mb-1">$QQQ</div>
-              <div className="text-2xl font-bold">${displayRegime.qqq?.price !== undefined ? displayRegime.qqq.price.toFixed(2) : 'N/A'}</div>
+          <div className="grid grid-cols-6 gap-6 items-start">
+            <div className={regimeMetricCellClassName}>
+              <div className={regimeMetricLabelClassName}>$QQQ</div>
+              <div className={regimeMetricValueClassName}>${displayRegime.qqq?.price !== undefined ? displayRegime.qqq.price.toFixed(2) : 'N/A'}</div>
             </div>
-            <div className="text-center">
-              <div className="text-sm text-white/80 mb-1">20DMA</div>
-              <div className="text-2xl font-bold">{formatPercent(qqqDist20)}</div>
+            <div className={regimeMetricCellClassName}>
+              <div className={regimeMetricLabelClassName}>20DMA</div>
+              <div className={regimeMetricValueClassName}>{formatPercent(qqqDist20)}</div>
             </div>
-            <div className="text-center">
-              <div className="text-sm text-white/80 mb-1">50DMA</div>
-              <div className={`text-2xl font-bold ${Math.abs(qqqDist50 ?? 0) < 0.02 ? 'text-amber-200' : ''}`}>{formatPercent(qqqDist50)}</div>
+            <div className={regimeMetricCellClassName}>
+              <div className={regimeMetricLabelClassName}>50DMA</div>
+              <div className={`${regimeMetricValueClassName} ${Math.abs(qqqDist50 ?? 0) < 0.02 ? 'text-amber-200' : ''}`}>{formatPercent(qqqDist50)}</div>
             </div>
-            <div className="text-center">
-              <div className="text-sm text-white/80 mb-1">20日收益率</div>
-              <div className="text-2xl font-bold">{formatPercent(displayRegime.qqq?.return20d ?? null, 2)}</div>
+            <div className={regimeMetricCellClassName}>
+              <div className={regimeMetricLabelClassName}>20日收益率</div>
+              <div className={regimeMetricValueClassName}>{formatPercent(displayRegime.qqq?.return20d ?? null, 2)}</div>
             </div>
-            <div className="text-center">
-              <div className="text-sm text-white/80 mb-1">20DMA Slope</div>
-              <div className="text-2xl font-bold">{formatNumber(displayRegime.qqq?.sma20Slope ?? null, 3)}</div>
+            <div className={regimeMetricCellClassName}>
+              <div className={regimeMetricLabelClassName}>20DMA Slope</div>
+              <div className={regimeMetricValueClassName}>{formatNumber(displayRegime.qqq?.sma20Slope ?? null, 3)}</div>
             </div>
-            <div className="text-center">
-              <div className="text-sm text-white/80 mb-1">市场广度</div>
-              <div className="text-2xl font-bold">{breadthDisplayValue}</div>
+            <div className={regimeMetricCellClassName}>
+              <div className={regimeMetricLabelClassName}>市场广度</div>
+              <EditableNumber
+                value={displayRegime.qqqBreadth}
+                onChange={(value) => handleBreadthChange('qqqBreadth', value)}
+                suffix="%"
+                className="h-10"
+              />
             </div>
           </div>
         </div>

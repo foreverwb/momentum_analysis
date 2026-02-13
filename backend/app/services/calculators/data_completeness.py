@@ -209,7 +209,7 @@ class DataCompletenessCalculator:
 
         Args:
             etf_symbol: ETF 代码
-            coverage_type: 覆盖范围类型 ('top' 或 'weight')
+            coverage_type: 覆盖范围类型 ('top'、'weight' 或 'all')
             coverage_value: 覆盖范围值 (10, 15, 60 等)
             holdings_with_data: 持仓数据列表，每项包含:
                 {
@@ -293,12 +293,14 @@ class DataCompletenessCalculator:
         格式化覆盖范围标签
 
         Args:
-            coverage_type: 'top' 或 'weight'
+            coverage_type: 'top'、'weight' 或 'all'
             coverage_value: 数值
 
         Returns:
-            格式化的标签，如 'top10' 或 'weight70'
+            格式化的标签，如 'top10'、'weight70' 或 'all'
         """
+        if coverage_type == 'all':
+            return 'all'
         if coverage_type == 'top':
             return f'top{coverage_value}'
         elif coverage_type == 'weight':

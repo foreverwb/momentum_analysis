@@ -27,19 +27,17 @@ interface RelativeTrendChartProps {
   valueFormatter?: (value: number) => string;
   baseSymbol?: string;
   symbolRoleMap?: Record<string, TrendSymbolRole>;
+  isLoading?: boolean;
+  loadingText?: string;
 }
 
 const DEFAULT_COLORS = ['#22c55e', '#3b82f6', '#8b5cf6', '#94a3b8', '#64748b', '#f59e0b'];
 const MARKET_SYMBOLS = new Set(['SPY', 'QQQ', 'IWM', 'DIA']);
 const SYMBOL_COLOR_OVERRIDES: Record<string, string> = {
-  SPY: '#2563eb',
-  QQQ: '#0f766e',
+  SPY: '#4472C4',
+  QQQ: '#00B0A0',
 };
-const WARM_ROLE_PALETTES: Record<Exclude<TrendSymbolRole, 'market' | 'other'>, string[]> = {
-  stock: ['#ef4444', '#dc2626'],
-  sector: ['#f97316', '#ea580c', '#fb923c'],
-  industry: ['#f59e0b', '#d97706', '#fbbf24'],
-};
+const SPECTRUM_STOPS = ['#E53935', '#FB8C00', '#43A047', '#8E24AA', '#1E88E5', '#00ACC1'];
 const ROLE_LABEL: Record<TrendSymbolRole, string> = {
   market: '大盘',
   sector: '板块',
@@ -67,6 +65,35 @@ const toRgba = (hexColor: string, alpha: number): string => {
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 };
 
+const interpolateHexColor = (from: string, to: string, ratio: number): string => {
+  const start = toPositiveHex(from).replace('#', '');
+  const end = toPositiveHex(to).replace('#', '');
+  const clamped = Math.max(0, Math.min(1, ratio));
+
+  const r = Math.round(parseInt(start.slice(0, 2), 16) + (parseInt(end.slice(0, 2), 16) - parseInt(start.slice(0, 2), 16)) * clamped);
+  const g = Math.round(parseInt(start.slice(2, 4), 16) + (parseInt(end.slice(2, 4), 16) - parseInt(start.slice(2, 4), 16)) * clamped);
+  const b = Math.round(parseInt(start.slice(4, 6), 16) + (parseInt(end.slice(4, 6), 16) - parseInt(start.slice(4, 6), 16)) * clamped);
+
+  return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
+};
+
+const getSpectrumColorAt = (position: number): string => {
+  const clamped = Math.max(0, Math.min(1, position));
+  if (SPECTRUM_STOPS.length === 1) return SPECTRUM_STOPS[0];
+
+  const segments = SPECTRUM_STOPS.length - 1;
+  const scaled = clamped * segments;
+  const leftIndex = Math.min(segments - 1, Math.floor(scaled));
+  const ratio = scaled - leftIndex;
+  return interpolateHexColor(SPECTRUM_STOPS[leftIndex], SPECTRUM_STOPS[leftIndex + 1], ratio);
+};
+
+const buildSpectrumPalette = (count: number): string[] => {
+  if (count <= 0) return [];
+  if (count === 1) return [SPECTRUM_STOPS[0]];
+  return Array.from({ length: count }, (_, index) => getSpectrumColorAt(index / (count - 1)));
+};
+
 const normalizeMetricKey = (metric?: string): string => (metric || 'relative').toLowerCase().trim();
 
 const sanitizeSymbolKey = (symbol: string): string => symbol.toUpperCase().trim();
@@ -83,6 +110,8 @@ export function RelativeTrendChart({
   valueFormatter,
   baseSymbol,
   symbolRoleMap,
+  isLoading = false,
+  loadingText,
 }: RelativeTrendChartProps) {
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const [hiddenSymbols, setHiddenSymbols] = useState<Record<string, boolean>>({});
@@ -91,35 +120,23 @@ export function RelativeTrendChart({
   const padding = { top: 26, right: 56, bottom: 44, left: 56 };
 
   const resolvedSeries = useMemo(() => {
-    const roleColorCount = {
-      stock: 0,
-      sector: 0,
-      industry: 0,
-    };
-    const resolveSymbolRole = (symbol: string): TrendSymbolRole => {
-      const key = sanitizeSymbolKey(symbol);
-      const fromMap = symbolRoleMap?.[key];
-      if (fromMap) return fromMap;
-      if (baseSymbol && key === sanitizeSymbolKey(baseSymbol)) return 'market';
-      if (MARKET_SYMBOLS.has(key)) return 'market';
-      return 'other';
-    };
+    const normalizedSymbols = series
+      .map((item) => sanitizeSymbolKey(item.symbol || ''))
+      .filter((symbol) => symbol !== '');
+    const otherSymbols = Array.from(new Set(normalizedSymbols.filter((symbol) => !SYMBOL_COLOR_OVERRIDES[symbol])));
+    const otherPalette = buildSpectrumPalette(otherSymbols.length);
+    const otherColorMap: Record<string, string> = {};
+    otherSymbols.forEach((symbol, index) => {
+      otherColorMap[symbol] = otherPalette[index] || DEFAULT_COLORS[index % DEFAULT_COLORS.length];
+    });
 
     return series.map((item, index) => {
-      const symbol = (item.symbol || '').trim().toUpperCase();
-      const role = resolveSymbolRole(symbol);
+      const symbol = sanitizeSymbolKey(item.symbol || '');
       const overriddenColor = SYMBOL_COLOR_OVERRIDES[symbol];
-      let warmColor: string | null = null;
-      if (role === 'stock' || role === 'sector' || role === 'industry') {
-        const warmPalette = WARM_ROLE_PALETTES[role];
-        const nextIndex = roleColorCount[role];
-        roleColorCount[role] = nextIndex + 1;
-        warmColor = warmPalette[nextIndex % warmPalette.length];
-      }
       return {
         symbol,
         values: Array.isArray(item.values) ? item.values : [],
-        color: overriddenColor || warmColor || item.color || DEFAULT_COLORS[index % DEFAULT_COLORS.length],
+        color: overriddenColor || otherColorMap[symbol] || DEFAULT_COLORS[index % DEFAULT_COLORS.length],
       };
     }).filter((item) => item.symbol !== '');
   }, [baseSymbol, series, symbolRoleMap]);
@@ -460,7 +477,18 @@ export function RelativeTrendChart({
         className="relative w-full overflow-hidden"
         style={{ aspectRatio: `${chartWidth} / ${chartHeight}`, minHeight: 260 }}
       >
-        {!hasData ? (
+        {isLoading && (
+          <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-[var(--bg-primary)]/60 backdrop-blur-[1px] rounded-[var(--radius-md)]">
+            <div className="flex items-center gap-2.5">
+              <svg className="animate-spin h-4 w-4 text-[var(--accent-blue)]" viewBox="0 0 24 24" fill="none">
+                <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeLinecap="round" opacity="0.2" />
+                <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+              </svg>
+              <span className="text-sm text-[var(--text-muted)]">{loadingText || '加载中...'}</span>
+            </div>
+          </div>
+        )}
+        {!hasData && !isLoading ? (
           <div className="absolute inset-0 flex items-center justify-center text-sm text-[var(--text-muted)]">
             {!hasUnderlyingData ? '暂无可用走势数据' : '当前已隐藏全部曲线，请点击下方图例显示'}
           </div>

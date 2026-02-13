@@ -83,6 +83,11 @@ class IBKRConnection:
                 pass
         finally:
             self._connected = False
+            # 释放 worker 线程资源，防止线程泄漏
+            try:
+                self._executor.shutdown(wait=False)
+            except Exception:
+                pass
 
     def is_connected(self) -> bool:
         """Connection state with runtime verification."""

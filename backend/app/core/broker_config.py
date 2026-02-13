@@ -32,9 +32,16 @@ class FutuConfig:
 
 
 @dataclass(frozen=True)
+class RefreshConfig:
+    etf_cooldown_minutes: int = 15
+    holdings_cooldown_minutes: int = 60
+
+
+@dataclass(frozen=True)
 class BrokerConfig:
     ibkr: IBKRConfig = field(default_factory=IBKRConfig)
     futu: FutuConfig = field(default_factory=FutuConfig)
+    refresh: RefreshConfig = field(default_factory=RefreshConfig)
     config_path: Optional[str] = None
     loaded_from_file: bool = False
 
@@ -167,6 +174,7 @@ def load_broker_config(config_path: Optional[str] = None) -> BrokerConfig:
     payload = _load_yaml(path)
     ibkr_payload = payload.get("ibkr", {}) if isinstance(payload.get("ibkr"), dict) else {}
     futu_payload = payload.get("futu", {}) if isinstance(payload.get("futu"), dict) else {}
+    refresh_payload = payload.get("refresh", {}) if isinstance(payload.get("refresh"), dict) else {}
 
     config = BrokerConfig(
         ibkr=IBKRConfig(
@@ -180,6 +188,16 @@ def load_broker_config(config_path: Optional[str] = None) -> BrokerConfig:
             port=_to_int(futu_payload.get("port"), FutuConfig.port),
             market=_to_str(futu_payload.get("market"), FutuConfig.market),
         ),
+        refresh=RefreshConfig(
+            etf_cooldown_minutes=_to_int(
+                refresh_payload.get("etf_cooldown_minutes"),
+                RefreshConfig.etf_cooldown_minutes,
+            ),
+            holdings_cooldown_minutes=_to_int(
+                refresh_payload.get("holdings_cooldown_minutes"),
+                RefreshConfig.holdings_cooldown_minutes,
+            ),
+        ),
         config_path=str(path),
         loaded_from_file=True,
     )
@@ -190,6 +208,8 @@ def load_broker_config(config_path: Optional[str] = None) -> BrokerConfig:
         ibkr_port=config.ibkr.port,
         futu_host=config.futu.host,
         futu_port=config.futu.port,
+        etf_cooldown_minutes=config.refresh.etf_cooldown_minutes,
+        holdings_cooldown_minutes=config.refresh.holdings_cooldown_minutes,
     )
     return config
 

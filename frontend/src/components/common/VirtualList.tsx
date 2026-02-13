@@ -207,7 +207,7 @@ interface VirtualStockListProps<T> {
 export function VirtualStockList<T extends { symbol?: string; id?: string | number }>({
   stocks,
   itemHeight = 280, // StockCard 默认高度
-  maxHeight = 800,
+  maxHeight,
   renderStock,
   keyExtractor,
   emptyMessage = '暂无符合条件的股票',
@@ -217,7 +217,7 @@ export function VirtualStockList<T extends { symbol?: string; id?: string | numb
   isLoading = false,
 }: VirtualStockListProps<T>) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [containerHeight, setContainerHeight] = useState(maxHeight);
+  const [containerHeight, setContainerHeight] = useState(() => maxHeight ?? 800);
 
   // 动态计算容器高度
   useEffect(() => {
@@ -225,9 +225,15 @@ export function VirtualStockList<T extends { symbol?: string; id?: string | numb
       const updateHeight = () => {
         const rect = containerRef.current?.getBoundingClientRect();
         if (rect) {
-          // 使用窗口可用高度或 maxHeight 的较小值
-          const availableHeight = window.innerHeight - rect.top - 100; // 100px 底部边距
-          setContainerHeight(Math.min(maxHeight, Math.max(400, availableHeight)));
+          const MIN_CONTAINER_HEIGHT = 400;
+          const VIEWPORT_BOTTOM_GAP = 24;
+          const availableHeight = window.innerHeight - rect.top - VIEWPORT_BOTTOM_GAP;
+          const computedHeight = Math.max(MIN_CONTAINER_HEIGHT, availableHeight);
+          const nextHeight = typeof maxHeight === 'number'
+            ? Math.min(maxHeight, computedHeight)
+            : computedHeight;
+
+          setContainerHeight(nextHeight);
         }
       };
 

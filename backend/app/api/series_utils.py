@@ -1,9 +1,59 @@
 from __future__ import annotations
 
+from datetime import date as date_type, datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 from sqlalchemy.orm import Session
 
 from app.models import PriceHistory, ScoreSnapshot, Stock, ETF
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover - runtime fallback only
+    ZoneInfo = None  # type: ignore[assignment]
+
+
+def _coerce_to_date(value: Any) -> Optional[date_type]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date_type):
+        return value
+    if hasattr(value, "date"):
+        try:
+            return value.date()
+        except Exception:
+            return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        head = text[:10]
+        try:
+            return datetime.fromisoformat(head).date()
+        except ValueError:
+            return None
+    return None
+
+
+def _to_beijing_trade_label(trade_date: date_type) -> date_type:
+    # Daily bars are US RTH trade dates; map NY close-date label to Beijing calendar date.
+    if ZoneInfo is None:
+        return trade_date + timedelta(days=1)
+    ny_close = datetime(
+        trade_date.year,
+        trade_date.month,
+        trade_date.day,
+        16,
+        0,
+        tzinfo=ZoneInfo("America/New_York"),
+    )
+    return ny_close.astimezone(ZoneInfo("Asia/Shanghai")).date()
+
+
+def _normalize_label_timezone(label_tz: str) -> str:
+    normalized = (label_tz or "market").strip().lower()
+    return "beijing" if normalized == "beijing" else "market"
 
 
 def _load_price_map(db: Session, symbol: str, limit: int) -> Dict[Any, float]:
@@ -39,8 +89,17 @@ def _load_price_series(db: Session, symbol: str, limit: int) -> List[Tuple[Any, 
     return series
 
 
-def _format_date_labels(dates: List[Any]) -> List[str]:
-    return [f"{d.month}/{d.day}" if hasattr(d, "month") else str(d) for d in dates]
+def _format_date_labels(dates: List[Any], label_tz: str = "market") -> List[str]:
+    tz_mode = _normalize_label_timezone(label_tz)
+    labels: List[str] = []
+    for value in dates:
+        parsed = _coerce_to_date(value)
+        if parsed is None:
+            labels.append(str(value))
+            continue
+        display_date = _to_beijing_trade_label(parsed) if tz_mode == "beijing" else parsed
+        labels.append(f"{display_date.month}/{display_date.day}")
+    return labels
 
 
 def _resolve_symbol_types(db: Session, symbols: List[str]) -> Dict[str, str]:
@@ -67,6 +126,7 @@ def _build_price_metric_series(
     period: int,
     metric: str,
     extra_buffer: int,
+    label_tz: str = "market",
 ) -> Tuple[List[str], List[Dict[str, Any]]]:
     series_data: Dict[str, Dict[Any, float]] = {}
     limit = period + extra_buffer
@@ -103,7 +163,7 @@ def _build_price_metric_series(
     if len(all_dates) > period:
         all_dates = all_dates[-period:]
 
-    date_labels = _format_date_labels(all_dates)
+    date_labels = _format_date_labels(all_dates, label_tz=label_tz)
     series: List[Dict[str, Any]] = []
 
     for symbol in symbols:
@@ -135,6 +195,7 @@ def _build_score_series(
     db: Session,
     symbols: List[str],
     period: int,
+    label_tz: str = "market",
 ) -> Tuple[List[str], List[Dict[str, Any]]]:
     type_map = _resolve_symbol_types(db, symbols)
     data_map: Dict[str, Dict[Any, float]] = {symbol: {} for symbol in symbols}
@@ -158,7 +219,7 @@ def _build_score_series(
     if len(all_dates) > period:
         all_dates = all_dates[-period:]
 
-    date_labels = _format_date_labels(all_dates)
+    date_labels = _format_date_labels(all_dates, label_tz=label_tz)
     series: List[Dict[str, Any]] = []
 
     for symbol in symbols:
@@ -173,8 +234,16 @@ def build_relative_series(
     symbols: List[str],
     period: int,
     extra_buffer: int = 10,
+    label_tz: str = "market",
 ) -> Tuple[List[str], List[Dict[str, Any]]]:
-    return build_metric_series(db, symbols, period, metric="relative", extra_buffer=extra_buffer)
+    return build_metric_series(
+        db,
+        symbols,
+        period,
+        metric="relative",
+        extra_buffer=extra_buffer,
+        label_tz=label_tz,
+    )
 
 
 def build_sma20_comparison_series(
@@ -182,6 +251,7 @@ def build_sma20_comparison_series(
     symbols: List[str],
     period: int,
     extra_buffer: int = 30,
+    label_tz: str = "market",
 ) -> Tuple[List[str], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     cleaned = [s.upper() for s in symbols if s]
     if not cleaned or period <= 1:
@@ -210,7 +280,7 @@ def build_sma20_comparison_series(
     if len(all_dates) > period:
         all_dates = all_dates[-period:]
 
-    date_labels = _format_date_labels(all_dates)
+    date_labels = _format_date_labels(all_dates, label_tz=label_tz)
     price_series: List[Dict[str, Any]] = []
     sma20_series: List[Dict[str, Any]] = []
     deviation_series: List[Dict[str, Any]] = []
@@ -245,6 +315,7 @@ def build_metric_series(
     period: int,
     metric: str = "relative",
     extra_buffer: int = 30,
+    label_tz: str = "market",
 ) -> Tuple[List[str], List[Dict[str, Any]]]:
     cleaned = [s.upper() for s in symbols if s]
     if not cleaned or period <= 1:
@@ -252,9 +323,16 @@ def build_metric_series(
 
     metric_key = metric.lower().strip()
     if metric_key == "score":
-        return _build_score_series(db, cleaned, period)
+        return _build_score_series(db, cleaned, period, label_tz=label_tz)
 
     if metric_key not in ("relative", "sma20", "return20d"):
         metric_key = "relative"
 
-    return _build_price_metric_series(db, cleaned, period, metric_key, extra_buffer)
+    return _build_price_metric_series(
+        db,
+        cleaned,
+        period,
+        metric_key,
+        extra_buffer,
+        label_tz=label_tz,
+    )

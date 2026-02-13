@@ -38,7 +38,7 @@ export const StockList = memo(function StockList({
   onStockClick,
   onToggleSelect,
   virtualScrollThreshold = 50,
-  maxHeight = 800
+  maxHeight
 }: StockListProps) {
 
   // 使用 useCallback 缓存渲染函数

@@ -20,7 +20,7 @@ interface HoldingInfo {
   weight: number;
 }
 
-type CoverageType = 'top10' | 'top15' | 'top20' | 'top30' | 'weight60' | 'weight65' | 'weight70' | 'weight75' | 'weight80' | 'weight85';
+type CoverageType = 'top10' | 'top15' | 'top20' | 'top30' | 'weight60' | 'weight65' | 'weight70' | 'weight75' | 'weight80' | 'weight85' | 'all';
 
 const COVERAGE_OPTIONS: { value: CoverageType; label: string }[] = [
   { value: 'top10', label: 'Top 10 - 前10大持仓' },
@@ -33,6 +33,7 @@ const COVERAGE_OPTIONS: { value: CoverageType; label: string }[] = [
   { value: 'weight75', label: 'Weight 75% - 累计权重75%' },
   { value: 'weight80', label: 'Weight 80% - 累计权重80%' },
   { value: 'weight85', label: 'Weight 85% - 累计权重85%' },
+  { value: 'all', label: 'ALL - 全部 Holdings' },
 ];
 
 // 示例数据
@@ -53,6 +54,10 @@ export function HoldingsImportDrawer({
   selectedCoverage,
   onImport,
 }: HoldingsImportDrawerProps) {
+  const normalizedEtfSymbol = useMemo(
+    () => (etfSymbol || '').trim().toUpperCase(),
+    [etfSymbol]
+  );
   const [source, setSource] = useState<'finviz' | 'marketchameleon'>('finviz');
   const [coverage, setCoverage] = useState<CoverageType>('top10');
   const [jsonData, setJsonData] = useState('');
@@ -93,6 +98,10 @@ export function HoldingsImportDrawer({
   // 根据 coverage 过滤持仓
   const filteredHoldings = useMemo(() => {
     if (holdings.length === 0) return [];
+
+    if (coverage === 'all') {
+      return holdings;
+    }
 
     // Top N 模式
     if (coverage.startsWith('top')) {
@@ -209,9 +218,11 @@ export function HoldingsImportDrawer({
         <div className="px-6 py-5 border-b border-[var(--border-light)]">
           <div className="flex items-center justify-between">
             <div>
-              <h2 className="text-xl font-semibold">导入 Holdings 数据</h2>
+              <h2 className="text-xl font-semibold">
+                导入 {normalizedEtfSymbol || 'ETF'} Holdings 数据
+              </h2>
               <p className="text-sm text-[var(--text-muted)] mt-1">
-                导入 {etfSymbol} 的持仓数据
+                导入 {normalizedEtfSymbol || 'ETF'} 的持仓数据
               </p>
             </div>
             <button

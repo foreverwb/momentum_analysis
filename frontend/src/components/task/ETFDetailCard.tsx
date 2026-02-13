@@ -16,9 +16,14 @@ interface HoldingSummary {
   dataStatus?: 'complete' | 'pending' | 'missing' | 'loading';
   completeness?: number;  // 0-100 percentage
   score?: number | null; // 个股得分
+  price?: number | null;
+  deviationFrom20ma?: number | null;
+  aboveSma20?: boolean | null;
   dataSources?: Record<string, boolean>;  // { finviz, market_chameleon, market_data, options_data }
   updatedAt?: string | null;  // timestamp
 }
+
+type DmaFilterOption = 'above_spy' | 'above_qqq';
 
 interface ETFDetailCardProps {
   etf: {
@@ -39,13 +44,15 @@ interface ETFDetailCardProps {
   onImportHoldings?: (coverageId?: string) => void;
   onViewStockDetail?: (ticker: string) => void;
   refreshResult?: RefreshResult;
+  dmaFilter?: DmaFilterOption;
+  dmaBenchmarkBelow20?: boolean | null;
 }
 
 type CoverageOption = {
-  id: 'top10' | 'top15' | 'top20' | 'top30' | 'weight60' | 'weight65' | 'weight70' | 'weight75' | 'weight80' | 'weight85';
+  id: 'top10' | 'top15' | 'top20' | 'top30' | 'weight60' | 'weight65' | 'weight70' | 'weight75' | 'weight80' | 'weight85' | 'all';
   label: string;
-  type: 'top' | 'weight';
-  value: number;
+  type: 'top' | 'weight' | 'all';
+  value?: number;
 };
 
 const COVERAGE_OPTIONS: CoverageOption[] = [
@@ -59,6 +66,7 @@ const COVERAGE_OPTIONS: CoverageOption[] = [
   { id: 'weight75', label: 'Weight75%', type: 'weight', value: 75 },
   { id: 'weight80', label: 'Weight80%', type: 'weight', value: 80 },
   { id: 'weight85', label: 'Weight85%', type: 'weight', value: 85 },
+  { id: 'all', label: 'ALL', type: 'all' },
 ];
 
 const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000;
@@ -169,6 +177,16 @@ const formatWeight = (value: number): string => {
   return value.toFixed(2);
 };
 
+const isHoldingAbove20Dma = (holding: HoldingSummary): boolean => {
+  if (typeof holding.aboveSma20 === 'boolean') {
+    return holding.aboveSma20;
+  }
+  if (typeof holding.deviationFrom20ma === 'number' && Number.isFinite(holding.deviationFrom20ma)) {
+    return holding.deviationFrom20ma > 0;
+  }
+  return false;
+};
+
 const normalizeIsoTimestamp = (value?: string | null): string | null => {
   if (!value) return null;
   const trimmed = value.trim();
@@ -183,34 +201,46 @@ const normalizeIsoTimestamp = (value?: string | null): string | null => {
   return trimmed;
 };
 
+const BEIJING_DATETIME_FORMATTER = new Intl.DateTimeFormat('zh-CN', {
+  timeZone: 'Asia/Shanghai',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: false,
+});
+
 const formatUpdatedAt = (value?: string | null): string => {
   if (!value) return '--';
   const normalized = normalizeIsoTimestamp(value);
   if (!normalized) return '--';
   const date = new Date(normalized);
   if (Number.isNaN(date.getTime())) return '--';
-  const utc = date.getTime() + date.getTimezoneOffset() * 60 * 1000;
-  const beijing = new Date(utc + 8 * 60 * 60 * 1000);
-  const month = `${beijing.getUTCMonth() + 1}`.padStart(2, '0');
-  const day = `${beijing.getUTCDate()}`.padStart(2, '0');
-  const hours = `${beijing.getUTCHours()}`.padStart(2, '0');
-  const minutes = `${beijing.getUTCMinutes()}`.padStart(2, '0');
-  return `${month}-${day} ${hours}:${minutes}`;
+  const parts = BEIJING_DATETIME_FORMATTER.formatToParts(date);
+  const month = parts.find((part) => part.type === 'month')?.value ?? '--';
+  const day = parts.find((part) => part.type === 'day')?.value ?? '--';
+  const hour = parts.find((part) => part.type === 'hour')?.value ?? '--';
+  const minute = parts.find((part) => part.type === 'minute')?.value ?? '--';
+  return `${month}-${day} ${hour}:${minute}`;
 };
 
 const getCoverageHoldings = (holdings: HoldingSummary[], option: CoverageOption): HoldingSummary[] => {
   if (!holdings.length) {
     return [];
   }
+  if (option.type === 'all') {
+    return holdings;
+  }
+  const coverageValue = option.value ?? 0;
   if (option.type === 'top') {
-    return holdings.slice(0, option.value);
+    return holdings.slice(0, coverageValue);
   }
   let sum = 0;
   const picked: HoldingSummary[] = [];
   for (const holding of holdings) {
     picked.push(holding);
     sum += holding.weight;
-    if (sum >= option.value) {
+    if (sum >= coverageValue) {
       break;
     }
   }
@@ -279,16 +309,25 @@ const getHoldingSourceAvailable = (
 ): boolean | undefined => {
   const dataSources = holding.dataSources;
   if (!dataSources) return undefined;
+  const resolveAliasAvailability = (keys: string[]): boolean | undefined => {
+    const values = keys
+      .map((key) => dataSources[key])
+      .filter((value): value is boolean => typeof value === 'boolean');
+    if (!values.length) {
+      return undefined;
+    }
+    return values.some((value) => value === true);
+  };
   if (sourceKey === 'finviz') {
-    return dataSources.finviz;
+    return resolveAliasAvailability(['finviz']);
   }
   if (sourceKey === 'marketchameleon') {
-    return dataSources.marketchameleon ?? dataSources.market_chameleon ?? dataSources.mc_options;
+    return resolveAliasAvailability(['marketchameleon', 'market_chameleon', 'mc_options']);
   }
   if (sourceKey === 'ibkr') {
-    return dataSources.ibkr ?? dataSources.market_data ?? dataSources.ibkr_price ?? dataSources.ibkr_relmom ?? dataSources.ibkr_trend;
+    return resolveAliasAvailability(['ibkr', 'market_data', 'ibkr_price', 'ibkr_relmom', 'ibkr_trend']);
   }
-  return dataSources.futu ?? dataSources.options_data ?? dataSources.futu_iv;
+  return resolveAliasAvailability(['futu', 'options_data', 'futu_iv']);
 };
 
 const getCoverageAccentColor = (option: CoverageOption): string => {
@@ -301,6 +340,8 @@ const getCoverageAccentColor = (option: CoverageOption): string => {
       return '#3b82f6';
     case 'top30':
       return '#10b981';
+    case 'all':
+      return '#475569';
     default:
       return option.type === 'weight' ? '#8b5cf6' : 'var(--accent-blue)';
   }
@@ -314,6 +355,36 @@ const createProgressToken = (): string => {
   return `hld_${tokenCore}`;
 };
 
+const copyTextToClipboard = async (text: string): Promise<void> => {
+  if (
+    typeof navigator !== 'undefined' &&
+    navigator.clipboard &&
+    typeof navigator.clipboard.writeText === 'function'
+  ) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  if (typeof document === 'undefined') {
+    throw new Error('Clipboard API unavailable');
+  }
+
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', 'true');
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  textarea.style.pointerEvents = 'none';
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand('copy');
+  document.body.removeChild(textarea);
+
+  if (!copied) {
+    throw new Error('Copy command failed');
+  }
+};
+
 export function ETFDetailCard({
   etf,
   coverageRanges = [],
@@ -321,8 +392,11 @@ export function ETFDetailCard({
   onImportHoldings,
   onViewStockDetail,
   refreshResult,
+  dmaFilter: _dmaFilter = 'above_spy',
+  dmaBenchmarkBelow20 = null,
 }: ETFDetailCardProps) {
   const [activeCoverage, setActiveCoverage] = useState<CoverageOption['id']>('top10');
+  const [coverageCopyState, setCoverageCopyState] = useState<'idle' | 'success' | 'error'>('idle');
   const lastRefreshResult = refreshResult || null;
   const relMom = resolveDimension(lastRefreshResult?.breakdown, 'rel_mom');
   const trendQuality = resolveDimension(lastRefreshResult?.breakdown, 'trend_quality');
@@ -389,7 +463,7 @@ export function ETFDetailCard({
     if (!coverageRanges.length) {
       return [];
     }
-    const available = new Set(coverageRanges);
+    const available = new Set(coverageRanges.map((value) => value.trim().toLowerCase()));
     return COVERAGE_OPTIONS.filter((option) => available.has(option.id));
   }, [coverageRanges]);
 
@@ -401,6 +475,10 @@ export function ETFDetailCard({
       setActiveCoverage(availableCoverageOptions[0].id);
     }
   }, [activeCoverage, availableCoverageOptions]);
+
+  useEffect(() => {
+    setCoverageCopyState('idle');
+  }, [activeCoverage]);
 
   const showCoverageSection = availableCoverageOptions.length >= 1;
   const beijingResetBoundaryMs = useMemo(() => getBeijingResetBoundaryMs(clockNowMs), [clockNowMs]);
@@ -430,7 +508,15 @@ export function ETFDetailCard({
 
   const activeOption = availableCoverageOptions.find((option) => option.id === activeCoverage) || availableCoverageOptions[0] || COVERAGE_OPTIONS[0];
   const activeHoldings = getCoverageHoldings(sortedHoldings, activeOption);
-  const coverageSum = activeHoldings.reduce((sum, item) => sum + item.weight, 0);
+  const isDmaFilterActive = dmaBenchmarkBelow20 === true;
+  const dmaFilteredHoldings = useMemo(() => {
+    if (!isDmaFilterActive) {
+      return activeHoldings;
+    }
+    return activeHoldings.filter((holding) => isHoldingAbove20Dma(holding));
+  }, [activeHoldings, isDmaFilterActive]);
+  const displayedHoldings = isDmaFilterActive ? dmaFilteredHoldings : activeHoldings;
+  const displayCoverageSum = displayedHoldings.reduce((sum, item) => sum + item.weight, 0);
   const activeCoverageStats = coverageStatsByOption.get(activeOption.id) || {
     total: activeHoldings.length,
     completeCount: activeHoldings.filter((holding) => hasFreshHoldingData(holding, beijingResetBoundaryMs)).length,
@@ -446,18 +532,25 @@ export function ETFDetailCard({
     const latestUpdatedAt = Number.isFinite(latestMs) ? new Date(latestMs).toISOString() : null;
 
     return (Object.keys(COVERAGE_SOURCE_META) as CoverageSourceKey[]).map((sourceKey) => {
-      const hasCompleteCoverage =
-        activeHoldings.length > 0 &&
-        activeHoldings.every((holding) => typeof getHoldingSourceAvailable(holding, sourceKey) === 'boolean');
-      const isComplete =
-        hasCompleteCoverage &&
-        activeHoldings.every((holding) => isHoldingSourceFresh(holding, sourceKey, beijingResetBoundaryMs));
+      const totalCount = activeHoldings.length;
+      const knownCount = activeHoldings.filter(
+        (holding) => typeof getHoldingSourceAvailable(holding, sourceKey) === 'boolean'
+      ).length;
+      const freshCount = activeHoldings.filter(
+        (holding) => isHoldingSourceFresh(holding, sourceKey, beijingResetBoundaryMs)
+      ).length;
+      const isComplete = totalCount > 0 && knownCount === totalCount && freshCount === totalCount;
+      const isPartial = !isComplete && freshCount > 0;
+      const statusLabel = isComplete ? '完备' : isPartial ? '部分' : '缺失';
       return {
         key: sourceKey,
         label: COVERAGE_SOURCE_META[sourceKey].label,
         color: COVERAGE_SOURCE_META[sourceKey].color,
         isComplete,
-        statusLabel: isComplete ? '完备' : '缺失',
+        isPartial,
+        freshCount,
+        totalCount,
+        statusLabel,
         updatedAt: latestUpdatedAt,
       };
     });
@@ -478,6 +571,30 @@ export function ETFDetailCard({
 
   const delta3d = formatDelta(etf.delta3d);
   const delta5d = formatDelta(etf.delta5d);
+
+  useEffect(() => {
+    if (coverageCopyState === 'idle') {
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
+      setCoverageCopyState('idle');
+    }, 1600);
+    return () => window.clearTimeout(timer);
+  }, [coverageCopyState]);
+
+  const handleCopyCoverageSymbols = useCallback(async () => {
+    if (!displayedHoldings.length) {
+      return;
+    }
+    try {
+      const tickers = displayedHoldings.map((holding) => holding.ticker).join(', ');
+      await copyTextToClipboard(tickers);
+      setCoverageCopyState('success');
+    } catch (error) {
+      console.error('Failed to copy coverage symbols:', error);
+      setCoverageCopyState('error');
+    }
+  }, [displayedHoldings]);
 
   const handleRefreshHoldings = useCallback(async () => {
     // 防止重复点击
@@ -681,6 +798,8 @@ export function ETFDetailCard({
           return `${baseStyle} bg-[#dbeafe] border-[#3b82f6] text-[#1e40af]`;
         case 'top30':
           return `${baseStyle} bg-[#d1fae5] border-[#10b981] text-[#065f46]`;
+        case 'all':
+          return `${baseStyle} bg-[#e2e8f0] border-[#64748b] text-[#334155]`;
         default:
           if (option.type === 'weight') {
             return `${baseStyle} bg-[#ede9fe] border-[#8b5cf6] text-[#6d28d9]`;
@@ -693,9 +812,9 @@ export function ETFDetailCard({
   };
 
   return (
-    <div className="bg-[var(--bg-primary)] border border-[var(--border-light)] rounded-[var(--radius-lg)] shadow-sm overflow-hidden">
+    <div className="bg-[var(--bg-primary)] border border-[var(--border-light)] rounded-[var(--radius-lg)] shadow-sm overflow-hidden h-[860px] flex flex-col">
       {/* Header */}
-      <div className="p-5 pb-0">
+      <div className="p-5 pb-0 shrink-0">
         <div className="flex items-start justify-between gap-4">
           <div>
             <div className="flex items-center gap-2.5">
@@ -764,10 +883,10 @@ export function ETFDetailCard({
 
       {/* Coverage Tabs - Enhanced Version */}
       {showCoverageSection && (
-        <div className="px-5 py-5">
-          <div className="pt-0 border-t border-[var(--border-light)]">
+        <div className="px-5 py-5 flex-1 min-h-0 overflow-hidden flex flex-col">
+          <div className="pt-0 border-t border-[var(--border-light)] flex-1 min-h-0 flex flex-col">
             {/* Coverage Tab Buttons */}
-            <div className="flex items-center gap-2 flex-wrap mb-3 mt-3">
+            <div className="flex items-center gap-2 flex-wrap mb-3 mt-3 shrink-0">
               {availableCoverageOptions.map((option) => {
                 const isActive = option.id === activeCoverage;
                 const optionStats = coverageStatsByOption.get(option.id);
@@ -794,24 +913,64 @@ export function ETFDetailCard({
 
             {/* Coverage Detail Panel */}
             <div
-              className="border border-[var(--border-light)] rounded-[var(--radius-md)] overflow-hidden"
+              className="border border-[var(--border-light)] rounded-[var(--radius-md)] overflow-hidden flex flex-col flex-1 min-h-0"
             >
               {/* Panel Header */}
               <div
-                className="px-4 py-3 border-b border-[var(--border-light)]"
+                className="px-4 py-3 border-b border-[var(--border-light)] shrink-0"
                 style={{ background: 'linear-gradient(135deg, #fef3c7, #fce7f3)' }}
               >
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
-                    <span
-                      className="px-2.5 py-1 rounded-full text-[11px] font-semibold"
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void handleCopyCoverageSymbols();
+                      }}
+                      disabled={displayedHoldings.length === 0}
+                      className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[11px] font-semibold transition-colors ${
+                        displayedHoldings.length === 0
+                          ? 'cursor-not-allowed border-transparent opacity-50'
+                          : coverageCopyState === 'success'
+                            ? 'border-emerald-200 bg-emerald-50'
+                            : coverageCopyState === 'error'
+                              ? 'border-rose-200 bg-rose-50'
+                              : 'border-transparent hover:border-white/80'
+                      }`}
+                      title={displayedHoldings.length === 0 ? '当前覆盖范围暂无可复制标的' : '点击复制当前覆盖范围标的'}
+                      aria-label="复制当前覆盖范围标的"
                       style={{
-                        background: 'rgba(255,255,255,0.8)',
-                        color: activeOption.id.startsWith('top') ? '#b45309' : '#6d28d9',
+                        background:
+                          displayedHoldings.length === 0
+                            ? 'rgba(255,255,255,0.45)'
+                            : coverageCopyState === 'success'
+                              ? undefined
+                              : coverageCopyState === 'error'
+                                ? undefined
+                                : 'rgba(255,255,255,0.8)',
+                        color:
+                          coverageCopyState === 'success'
+                            ? '#059669'
+                            : coverageCopyState === 'error'
+                              ? '#e11d48'
+                              : activeOption.type === 'top'
+                                ? '#b45309'
+                                : activeOption.type === 'all'
+                                  ? '#334155'
+                                  : '#6d28d9',
                       }}
                     >
                       {activeOption.label}
-                    </span>
+                    </button>
+                    {coverageCopyState !== 'idle' && displayedHoldings.length > 0 && (
+                      <span
+                        className={`text-[10px] font-medium ${
+                          coverageCopyState === 'success' ? 'text-emerald-600' : 'text-rose-600'
+                        }`}
+                      >
+                        {coverageCopyState === 'success' ? '已复制' : '复制失败'}
+                      </span>
+                    )}
                   </div>
                   <div className="flex items-center gap-3 text-xs">
                     <div className="flex items-center gap-1.5">
@@ -820,12 +979,12 @@ export function ETFDetailCard({
                           key={indicator.key}
                           className="relative inline-flex h-2.5 w-2.5 items-center justify-center rounded-full border"
                           style={{
-                            borderColor: indicator.isComplete ? indicator.color : '#cbd5e1',
+                            borderColor: indicator.isComplete || indicator.isPartial ? indicator.color : '#cbd5e1',
                             background: indicator.isComplete ? indicator.color : 'transparent',
                           }}
-                          title={`${indicator.label}: ${indicator.statusLabel} · ${formatUpdatedAt(indicator.updatedAt)}`}
+                          title={`${indicator.label}: ${indicator.statusLabel} (${indicator.freshCount}/${indicator.totalCount}) · ${formatUpdatedAt(indicator.updatedAt)}`}
                         >
-                          {!indicator.isComplete && (
+                          {!indicator.isComplete && !indicator.isPartial && (
                             <svg
                               width="6"
                               height="6"
@@ -835,6 +994,12 @@ export function ETFDetailCard({
                             >
                               <path d="M1 1L7 7M7 1L1 7" stroke="#94a3b8" strokeWidth="1.25" strokeLinecap="round" />
                             </svg>
+                          )}
+                          {indicator.isPartial && (
+                            <span
+                              className="pointer-events-none block h-[1.25px] w-[6px] rounded"
+                              style={{ background: indicator.color }}
+                            />
                           )}
                         </span>
                       ))}
@@ -856,19 +1021,18 @@ export function ETFDetailCard({
               </div>
 
               {/* Panel Body */}
-              <div className="p-4">
-                <div className="flex items-center justify-between text-xs mb-3">
-                  <span className="text-[var(--text-muted)]">
-                    显示 {activeHoldings.length} / {sortedHoldings.length} 只股票
-                  </span>
-                  <span className="text-[var(--text-muted)]">
-                    累计权重 <span className="font-semibold text-[var(--text-primary)]">{formatWeight(coverageSum)}%</span>
-                  </span>
-                </div>
-
-                {activeHoldings.length > 0 ? (
+                <div className="p-4 flex-1 min-h-0 overflow-y-auto overscroll-contain">
+                  <div className="flex items-center justify-between text-xs mb-3">
+                    <span className="text-[var(--text-muted)]">
+                      显示 {displayedHoldings.length} / {activeHoldings.length} 只股票
+                    </span>
+                    <span className="text-[var(--text-muted)]">
+                      累计权重 <span className="font-semibold text-[var(--text-primary)]">{formatWeight(displayCoverageSum)}%</span>
+                    </span>
+                  </div>
+                {displayedHoldings.length > 0 ? (
                   <div className="flex flex-wrap gap-2">
-                    {activeHoldings.map((holding) => {
+                    {displayedHoldings.map((holding) => {
                       const isHoldingComplete = hasFreshHoldingData(holding, beijingResetBoundaryMs);
                       const statusColor = isHoldingComplete
                         ? 'var(--accent-green)'
@@ -876,22 +1040,25 @@ export function ETFDetailCard({
                           ? 'var(--accent-red)'
                           : 'var(--accent-amber)';
                       const completeness = holding.completeness || 0;
-                      const dataSources = holding.dataSources || {};
-
-                      // Data source labels in Chinese
-                      const dataSourceLabels: Record<string, string> = {
-                        finviz: 'Finviz 数据',
-                        market_chameleon: 'MarketChameleon 数据',
-                        market_data: '市场数据 (IBKR)',
-                        options_data: '期权数据 (Futu)',
-                      };
+                      const dataSourceLabels: Array<{ key: CoverageSourceKey; label: string }> = [
+                        { key: 'finviz', label: 'Finviz 数据' },
+                        { key: 'marketchameleon', label: 'MarketChameleon 数据' },
+                        { key: 'ibkr', label: '市场数据 (IBKR)' },
+                        { key: 'futu', label: '期权数据 (Futu)' },
+                      ];
 
                       // Build tooltip content
                       const tooltipLines = [];
                       tooltipLines.push(`完备度: ${Math.round(completeness)}%`);
+                      if (typeof holding.deviationFrom20ma === 'number' && Number.isFinite(holding.deviationFrom20ma)) {
+                        tooltipLines.push(`20DMA偏离: ${holding.deviationFrom20ma.toFixed(2)}%`);
+                      }
+                      if (typeof holding.aboveSma20 === 'boolean') {
+                        tooltipLines.push(`20DMA状态: ${holding.aboveSma20 ? '上方' : '下方'}`);
+                      }
 
-                      Object.entries(dataSourceLabels).forEach(([key, label]) => {
-                        const available = dataSources[key];
+                      dataSourceLabels.forEach(({ key, label }) => {
+                        const available = getHoldingSourceAvailable(holding, key);
                         const icon = available ? '✓' : '✗';
                         const status = available ? '可用' : '缺失';
                         tooltipLines.push(`${icon} ${label}: ${status}`);
@@ -941,12 +1108,12 @@ export function ETFDetailCard({
                   </div>
                 ) : (
                   <div className="text-xs text-[var(--text-muted)] text-center py-4">
-                    暂无持仓数据，请先导入 Holdings。
+                    {activeHoldings.length === 0 && '暂无持仓数据，请先导入 Holdings。'}
                   </div>
                 )}
 
                 {/* View All Link */}
-                {activeHoldings.length > 0 && onViewStockDetail && (
+                {displayedHoldings.length > 0 && onViewStockDetail && (
                   <div className="mt-3 pt-3 border-t border-[var(--border-light)]">
                     <button
                       className="text-xs text-[var(--accent-blue)] hover:underline flex items-center gap-1"
@@ -1034,7 +1201,7 @@ export function ETFDetailCard({
         </div>
       )}
       {/* Action Buttons - Footer */}
-      <div className="flex gap-3 px-5 py-4 border-t border-[var(--border-light)] bg-[var(--bg-secondary)]">
+      <div className="flex gap-3 px-5 py-4 border-t border-[var(--border-light)] bg-[var(--bg-secondary)] mt-auto shrink-0">
           <button
             onClick={() => handleRefreshHoldings()}
             disabled={holdingsRefreshState.isLoading}

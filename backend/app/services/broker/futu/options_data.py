@@ -72,6 +72,13 @@ class FutuOptionsDataFetcher:
         self.chain_limiter = chain_limiter or RateLimiter(max_calls=10, period_seconds=30)
         self.snapshot_limiter = snapshot_limiter or RateLimiter(max_calls=60, period_seconds=30)
 
+    @staticmethod
+    def default_option_types() -> List[Any]:
+        combined_type = getattr(OPTION_TYPE, "ALL", None)
+        if combined_type is not None:
+            return [combined_type]
+        return [OPTION_TYPE.CALL, OPTION_TYPE.PUT]
+
     def get_current_price(self, symbol: str) -> Optional[float]:
         client = self.connection.get_client()
         if client is None:
@@ -126,7 +133,7 @@ class FutuOptionsDataFetcher:
             return {}, meta
 
         if option_types is None:
-            option_types = [OPTION_TYPE.CALL, OPTION_TYPE.PUT]
+            option_types = self.default_option_types()
 
         code = self.format_code(symbol, self.connection.market)
         today = datetime.now().date()
@@ -424,7 +431,12 @@ class FutuOptionsDataFetcher:
             if key in seen_contracts:
                 continue
             seen_contracts.add(key)
-            expirations[expiry].append(OptionContract(code=option_code, option_type=option_type))
+            expirations[expiry].append(
+                OptionContract(
+                    code=option_code,
+                    option_type=self.get_record_option_type(record, fallback=option_type),
+                )
+            )
 
     def _record_chain_fetch_failure(
         self,
@@ -488,9 +500,16 @@ class FutuOptionsDataFetcher:
 
     @staticmethod
     def format_code(symbol: str, market: str) -> str:
-        if "." in symbol:
-            return symbol
-        return f"{market}.{symbol.upper()}"
+        normalized_symbol = str(symbol or "").strip().upper()
+        normalized_market = str(market or "").strip().upper()
+        if not normalized_symbol:
+            return normalized_symbol
+        if normalized_market and normalized_symbol.startswith(f"{normalized_market}."):
+            return normalized_symbol
+        if "." in normalized_symbol and normalized_symbol.split(".", 1)[0] in {"US", "HK", "SH", "SZ"}:
+            return normalized_symbol
+        market_prefix = normalized_market or "US"
+        return f"{market_prefix}.{normalized_symbol}"
 
     @staticmethod
     def dataframe_to_records(data: Any) -> List[Dict]:
@@ -515,6 +534,14 @@ class FutuOptionsDataFetcher:
             if value:
                 return str(value)
         return None
+
+    @staticmethod
+    def get_record_option_type(record: Dict, fallback: Any = None) -> Any:
+        for key in ("option_type", "type", "contract_type"):
+            value = record.get(key)
+            if value is not None:
+                return value
+        return fallback
 
     @staticmethod
     def get_snapshot_value(snapshot: Dict, keys: List[str]) -> Optional[float]:

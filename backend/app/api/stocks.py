@@ -3,14 +3,232 @@ Stock API 端点
 从数据库读取股票数据（已移除 mock 数据）
 """
 
+from collections import defaultdict
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_
+from sqlalchemy.exc import IntegrityError
 from typing import List, Optional, Dict, Any
 
-from app.models import get_db, Stock, ImportedData, ETFHolding, ETF, PriceHistory, IVData
+from app.models import get_db, Stock, ImportedData, ETFHolding, ETF, PriceHistory, IVData, ScoreSnapshot
 from app.api.series_utils import build_metric_series, build_sma20_comparison_series
+from app.services.parsers import normalize_heat_type
 router = APIRouter()
+
+
+HEAT_TYPE_FILTER_ALIASES = {
+    'trend': ['trend', 'trend_heat'],
+    'event': ['event', 'event_heat'],
+    'hedge': ['hedge', 'hedge_heat'],
+    'normal': ['normal'],
+}
+
+
+def _build_symbol_aliases(symbol: str) -> List[str]:
+    """
+    Build possible symbol aliases for class-share tickers.
+
+    Examples:
+    - BRK.B -> [BRK.B, BRKB, BRK B]
+    - BRK B -> [BRK B, BRK.B, BRKB]
+    - BRKB  -> [BRKB, BRK.B, BRK B]
+    """
+    normalized = str(symbol or "").strip().upper()
+    if not normalized:
+        return []
+
+    aliases: List[str] = [normalized]
+    compact = normalized.replace(" ", "").replace(".", "")
+
+    if "." in normalized:
+        aliases.append(normalized.replace(".", ""))
+        aliases.append(normalized.replace(".", " "))
+    elif " " in normalized:
+        aliases.append(normalized.replace(" ", "."))
+        aliases.append(normalized.replace(" ", ""))
+    elif len(normalized) >= 3 and normalized[-1] in {"A", "B"}:
+        aliases.append(f"{normalized[:-1]}.{normalized[-1]}")
+        aliases.append(f"{normalized[:-1]} {normalized[-1]}")
+
+    if compact and compact not in aliases:
+        aliases.append(compact)
+
+    deduped: List[str] = []
+    seen = set()
+    for item in aliases:
+        candidate = item.strip().upper()
+        if candidate and candidate not in seen:
+            deduped.append(candidate)
+            seen.add(candidate)
+    return deduped
+
+
+def _get_stock_by_symbol_alias(db: Session, symbol: str) -> Optional[Stock]:
+    aliases = _build_symbol_aliases(symbol)
+    if not aliases:
+        return None
+
+    # Prefer exact first.
+    exact = aliases[0]
+    stock = db.query(Stock).filter(func.upper(Stock.symbol) == exact).first()
+    if stock:
+        return stock
+
+    if len(aliases) == 1:
+        return None
+
+    alias_rank = {alias: idx for idx, alias in enumerate(aliases[1:])}
+    candidates = db.query(Stock).filter(func.upper(Stock.symbol).in_(aliases[1:])).all()
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda row: alias_rank.get(str(row.symbol or "").upper(), len(alias_rank)))
+    return candidates[0]
+
+
+def _get_latest_import_record_by_alias(
+    db: Session,
+    aliases: List[str],
+    source: str
+) -> Optional[ImportedData]:
+    if not aliases:
+        return None
+    return db.query(ImportedData).filter(
+        ImportedData.source == source,
+        func.upper(ImportedData.symbol).in_(aliases)
+    ).order_by(
+        ImportedData.date.desc(),
+        ImportedData.id.desc()
+    ).first()
+
+
+def _ensure_stock_by_symbol_alias(db: Session, symbol: str) -> Optional[Stock]:
+    """
+    Resolve stock by symbol aliases. If not present in `stocks`, try to bootstrap
+    a minimal row from imported/price/iv/holding tables so detail pages can render.
+    """
+    stock = _get_stock_by_symbol_alias(db, symbol)
+    if stock:
+        return stock
+
+    aliases = _build_symbol_aliases(symbol)
+    if not aliases:
+        return None
+
+    finviz_record = _get_latest_import_record_by_alias(db, aliases, "finviz")
+    mc_record = _get_latest_import_record_by_alias(db, aliases, "marketchameleon")
+    latest_price = db.query(PriceHistory).filter(
+        func.upper(PriceHistory.symbol).in_(aliases)
+    ).order_by(
+        PriceHistory.date.desc(),
+        PriceHistory.created_at.desc(),
+        PriceHistory.id.desc()
+    ).first()
+    latest_iv = db.query(IVData).filter(
+        func.upper(IVData.symbol).in_(aliases)
+    ).order_by(
+        IVData.date.desc(),
+        IVData.id.desc()
+    ).first()
+    latest_holding = db.query(ETFHolding).filter(
+        func.upper(ETFHolding.ticker).in_(aliases)
+    ).order_by(
+        ETFHolding.data_date.desc(),
+        ETFHolding.id.desc()
+    ).first()
+
+    if not any([finviz_record, mc_record, latest_price, latest_iv, latest_holding]):
+        return None
+
+    def _as_float(value: Any) -> Optional[float]:
+        try:
+            if value is None:
+                return None
+            parsed = float(value)
+            return parsed
+        except (TypeError, ValueError):
+            return None
+
+    finviz_data = finviz_record.data if finviz_record and isinstance(finviz_record.data, dict) else {}
+    mc_data = mc_record.data if mc_record and isinstance(mc_record.data, dict) else {}
+
+    symbol_candidates: List[str] = [
+        str(finviz_record.symbol).upper() if finviz_record and finviz_record.symbol else "",
+        str(latest_price.symbol).upper() if latest_price and latest_price.symbol else "",
+        str(latest_iv.symbol).upper() if latest_iv and latest_iv.symbol else "",
+        str(latest_holding.ticker).upper() if latest_holding and latest_holding.ticker else "",
+        aliases[0],
+    ]
+    resolved_symbol = next((item for item in symbol_candidates if item), aliases[0])
+
+    sector_value = finviz_data.get("sector")
+    industry_value = finviz_data.get("industry")
+    if (not sector_value) and latest_holding and latest_holding.etf_symbol:
+        etf_symbol = str(latest_holding.etf_symbol).upper()
+        etf = db.query(ETF).filter(ETF.symbol == etf_symbol).first()
+        if etf and etf.type == "sector":
+            sector_value = etf_symbol
+
+    heat_type_value = normalize_heat_type(
+        str(mc_data.get("heat_type") or mc_data.get("heatType") or "normal")
+    )
+    heat_score_value = _as_float(mc_data.get("heat_score") or mc_data.get("heatScore")) or 0.0
+    risk_score_value = _as_float(mc_data.get("risk_score") or mc_data.get("riskScore")) or 0.0
+
+    metrics_payload: Dict[str, Any] = {}
+    iv30_value = _as_float(getattr(latest_iv, "iv30", None))
+    if iv30_value is not None:
+        metrics_payload["iv30"] = iv30_value
+    ivr_value = _as_float(mc_data.get("ivr"))
+    if ivr_value is not None:
+        metrics_payload["ivr"] = ivr_value
+    total_oi_value = _as_float(getattr(latest_iv, "total_oi", None))
+    if total_oi_value is not None:
+        metrics_payload["openInterest"] = total_oi_value
+
+    name_value = (
+        finviz_data.get("company")
+        or finviz_data.get("name")
+        or finviz_data.get("ticker")
+        or resolved_symbol
+    )
+    if not isinstance(name_value, str) or not name_value.strip():
+        name_value = resolved_symbol
+
+    stock = Stock(
+        symbol=resolved_symbol,
+        name=name_value.strip(),
+        sector=str(sector_value).upper() if isinstance(sector_value, str) and sector_value.strip() else None,
+        industry=str(industry_value).strip() if isinstance(industry_value, str) and industry_value.strip() else None,
+        price=_as_float(getattr(latest_price, "close", None)),
+        score_total=0.0,
+        scores={
+            "momentum": 0,
+            "trend": 0,
+            "volume": 0,
+            "quality": 0,
+            "options": 0,
+        },
+        changes={
+            "delta3d": None,
+            "delta5d": None,
+        },
+        metrics=metrics_payload or None,
+        heat_type=heat_type_value,
+        heat_score=heat_score_value,
+        risk_score=risk_score_value,
+        thresholds_pass=True,
+        thresholds={},
+    )
+    db.add(stock)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return _get_stock_by_symbol_alias(db, symbol)
+    db.refresh(stock)
+    return stock
 
 
 def _get_latest_import_map(db: Session, symbols: List[str], source: str) -> Dict[str, Dict[str, Any]]:
@@ -35,7 +253,7 @@ def _get_latest_import_map(db: Session, symbols: List[str], source: str) -> Dict
     return {row.symbol: row.data for row in rows}
 
 
-def _get_industry_etf_map(db: Session, symbols: List[str]) -> Dict[str, List[str]]:
+def _get_related_etf_map(db: Session, symbols: List[str]) -> Dict[str, Dict[str, List[str]]]:
     if not symbols:
         return {}
     latest_dates = db.query(
@@ -45,7 +263,8 @@ def _get_industry_etf_map(db: Session, symbols: List[str]) -> Dict[str, List[str
 
     rows = db.query(
         ETFHolding.ticker,
-        ETFHolding.etf_symbol
+        ETFHolding.etf_symbol,
+        ETF.type,
     ).join(
         latest_dates,
         and_(
@@ -56,22 +275,50 @@ def _get_industry_etf_map(db: Session, symbols: List[str]) -> Dict[str, List[str
         ETF,
         ETF.symbol == ETFHolding.etf_symbol
     ).filter(
-        ETF.type == "industry",
+        ETF.type.in_(["sector", "industry"]),
         ETFHolding.ticker.in_(symbols)
     ).all()
 
-    mapping: Dict[str, List[str]] = {}
-    for ticker, etf_symbol in rows:
+    mapping: Dict[str, Dict[str, List[str]]] = {}
+    for ticker, etf_symbol, etf_type in rows:
         key = ticker.upper() if ticker else ticker
         value = etf_symbol.upper() if etf_symbol else etf_symbol
         if not key or not value:
             continue
-        mapping.setdefault(key, []).append(value)
+        bucket = str(etf_type or "").lower().strip()
+        if bucket not in ("sector", "industry"):
+            continue
+        mapping.setdefault(key, {"sector": [], "industry": []})[bucket].append(value)
 
-    for ticker, etfs in mapping.items():
-        mapping[ticker] = sorted(set(etfs))
+    for ticker, related in mapping.items():
+        related["sector"] = sorted(set(related.get("sector", [])))
+        related["industry"] = sorted(set(related.get("industry", [])))
 
     return mapping
+
+
+def _get_industry_etf_map(db: Session, symbols: List[str]) -> Dict[str, List[str]]:
+    related_map = _get_related_etf_map(db, symbols)
+    return {
+        ticker: related.get("industry", [])
+        for ticker, related in related_map.items()
+    }
+
+
+def _resolve_primary_sector_symbol(
+    stock_sector: Optional[str],
+    related_sector_etfs: List[str]
+) -> Optional[str]:
+    normalized_related = [s.upper() for s in (related_sector_etfs or []) if s]
+    if normalized_related:
+        return normalized_related[0]
+
+    if not stock_sector:
+        return None
+    candidate = stock_sector.strip().upper()
+    if candidate and candidate.isalpha() and len(candidate) <= 5:
+        return candidate
+    return None
 
 
 def _load_recent_closes(db: Session, symbol: str, limit: int = 30) -> Optional[List[float]]:
@@ -166,6 +413,7 @@ def _get_price_stats_map(db: Session, symbols: List[str]) -> Dict[str, Dict[str,
 
 def _build_comparisons(
     stock: Stock,
+    sector_symbol: Optional[str],
     industry_etfs: List[str],
     price_stats: Dict[str, Dict[str, Optional[float]]]
 ) -> List[Dict[str, Any]]:
@@ -193,12 +441,80 @@ def _build_comparisons(
     comparisons: List[Dict[str, Any]] = []
     for symbol in industry_etfs:
         comparisons.append(build_item(symbol, "industry"))
-    if stock.sector:
-        comparisons.append(build_item(stock.sector, "sector"))
+    if sector_symbol:
+        comparisons.append(build_item(sector_symbol, "sector"))
     for symbol in ("SPY", "QQQ"):
         comparisons.append(build_item(symbol, "market"))
 
     return comparisons
+
+
+def _compute_stock_deltas(db: Session, symbol: str) -> Dict[str, Optional[float]]:
+    snapshots = db.query(ScoreSnapshot).filter(
+        ScoreSnapshot.symbol == symbol.upper(),
+        ScoreSnapshot.symbol_type == 'stock'
+    ).order_by(ScoreSnapshot.date.desc(), ScoreSnapshot.id.desc()).limit(6).all()
+    return _compute_delta_payload_from_snapshots(snapshots)
+
+
+def _compute_stock_delta_map(db: Session, symbols: List[str]) -> Dict[str, Dict[str, Optional[float]]]:
+    normalized_symbols = sorted({str(symbol).upper() for symbol in symbols if str(symbol).strip()})
+    if not normalized_symbols:
+        return {}
+
+    rows = db.query(ScoreSnapshot).filter(
+        ScoreSnapshot.symbol.in_(normalized_symbols),
+        ScoreSnapshot.symbol_type == 'stock'
+    ).order_by(ScoreSnapshot.symbol.asc(), ScoreSnapshot.date.desc(), ScoreSnapshot.id.desc()).all()
+
+    snapshot_map: Dict[str, List[ScoreSnapshot]] = defaultdict(list)
+    for row in rows:
+        entries = snapshot_map[row.symbol]
+        if len(entries) < 6:
+            entries.append(row)
+
+    return {
+        symbol: _compute_delta_payload_from_snapshots(entries)
+        for symbol, entries in snapshot_map.items()
+    }
+
+
+def _compute_delta_payload_from_snapshots(
+    snapshots: List[ScoreSnapshot],
+) -> Dict[str, Optional[float]]:
+    if not snapshots:
+        return {"delta3d": None, "delta5d": None}
+
+    current = snapshots[0].total_score or 0
+    delta3d = None
+    delta5d = None
+
+    if len(snapshots) >= 4 and snapshots[3].total_score is not None:
+        delta3d = round(current - snapshots[3].total_score, 2)
+    if len(snapshots) >= 6 and snapshots[5].total_score is not None:
+        delta5d = round(current - snapshots[5].total_score, 2)
+
+    return {"delta3d": delta3d, "delta5d": delta5d}
+
+
+def _resolve_stock_changes(
+    stored_changes: Any,
+    computed_changes: Optional[Dict[str, Optional[float]]] = None,
+) -> Dict[str, Optional[float]]:
+    stored = stored_changes if isinstance(stored_changes, dict) else {}
+    computed = computed_changes or {}
+    delta3d = stored.get("delta3d")
+    delta5d = stored.get("delta5d")
+
+    if delta3d is None:
+        delta3d = computed.get("delta3d")
+    if delta5d is None:
+        delta5d = computed.get("delta5d")
+
+    return {
+        "delta3d": delta3d,
+        "delta5d": delta5d,
+    }
 
 
 def _build_stock_list_response(db: Session, stocks: List[Stock]) -> List[dict]:
@@ -206,32 +522,69 @@ def _build_stock_list_response(db: Session, stocks: List[Stock]) -> List[dict]:
         return []
     symbols = [stock.symbol for stock in stocks if stock.symbol]
     finviz_map = _get_latest_import_map(db, symbols, "finviz")
-    industry_map = _get_industry_etf_map(db, symbols)
+    related_map = _get_related_etf_map(db, symbols)
+    delta_map = _compute_stock_delta_map(db, symbols)
 
-    comparison_symbols = set()
+    resolved_related: Dict[str, Dict[str, Any]] = {}
+    comparison_symbols = {"SPY", "QQQ"}
     for stock in stocks:
-        if stock.sector:
-            comparison_symbols.add(stock.sector)
-        comparison_symbols.update(industry_map.get(stock.symbol, []))
-    comparison_symbols.update(["SPY", "QQQ"])
+        related = related_map.get(stock.symbol, {"sector": [], "industry": []})
+        sector_etfs = list(related.get("sector", []))
+        industry_etfs = list(related.get("industry", []))
+        primary_sector_symbol = _resolve_primary_sector_symbol(stock.sector, sector_etfs)
+        if primary_sector_symbol and primary_sector_symbol not in sector_etfs:
+            sector_etfs.append(primary_sector_symbol)
+
+        sector_etfs = sorted(set(sector_etfs))
+        industry_etfs = sorted(set(industry_etfs))
+
+        if primary_sector_symbol:
+            comparison_symbols.add(primary_sector_symbol)
+        comparison_symbols.update(industry_etfs)
+        resolved_related[stock.symbol] = {
+            "sector_etfs": sector_etfs,
+            "industry_etfs": industry_etfs,
+            "primary_sector_symbol": primary_sector_symbol,
+        }
+
     comparison_symbols = {symbol for symbol in comparison_symbols if symbol}
 
     price_stats = _get_price_stats_map(db, sorted(comparison_symbols))
+    responses: List[dict] = []
+    for stock in stocks:
+        related_payload = resolved_related.get(stock.symbol, {})
+        sector_etfs = list(related_payload.get("sector_etfs", []))
+        industry_etfs = list(related_payload.get("industry_etfs", []))
+        primary_sector_symbol = related_payload.get("primary_sector_symbol")
 
-    return [
-        format_stock_response(
+        payload = format_stock_response(
             stock,
+            changes_override=_resolve_stock_changes(
+                stock.changes,
+                delta_map.get(stock.symbol),
+            ),
             finviz_data=finviz_map.get(stock.symbol),
-            industry_etfs=industry_map.get(stock.symbol, []),
-            comparisons=_build_comparisons(stock, industry_map.get(stock.symbol, []), price_stats)
+            sector_etfs=sector_etfs,
+            industry_etfs=industry_etfs,
+            comparisons=_build_comparisons(
+                stock,
+                primary_sector_symbol,
+                industry_etfs,
+                price_stats,
+            )
         )
-        for stock in stocks
-    ]
+        if primary_sector_symbol:
+            payload["sector"] = primary_sector_symbol
+        responses.append(payload)
+
+    return responses
 
 
 def format_stock_response(
     stock: Stock,
+    changes_override: Optional[Dict[str, Optional[float]]] = None,
     finviz_data: Optional[Dict[str, Any]] = None,
+    sector_etfs: Optional[List[str]] = None,
     industry_etfs: Optional[List[str]] = None,
     comparisons: Optional[List[Dict[str, Any]]] = None
 ) -> dict:
@@ -282,17 +635,18 @@ def format_stock_response(
             "quality": 0,
             "options": 0
         },
-        "changes": stock.changes or {
+        "changes": changes_override or stock.changes or {
             "delta3d": None,
             "delta5d": None
         },
         "metrics": metrics,
         "rsi": metrics.get("rsi"),
         "beta": metrics.get("beta"),
+        "sectorEtfs": sector_etfs or [],
         "industryEtfs": industry_etfs or [],
         "comparisons": comparisons or [],
         # 新增热度标签相关字段
-        "heatType": stock.heat_type or "normal",
+        "heatType": normalize_heat_type(stock.heat_type),
         "heatScore": stock.heat_score or 0.0,
         "riskScore": stock.risk_score or 0.0,
         "thresholdsPass": stock.thresholds_pass if stock.thresholds_pass is not None else True,
@@ -400,7 +754,17 @@ async def compare_stocks(
     
     # 按请求顺序返回
     stock_map = {stock.symbol: stock for stock in stocks}
-    result = [format_stock_response(stock_map[symbol]) for symbol in symbols_upper]
+    delta_map = _compute_stock_delta_map(db, symbols_upper)
+    result = [
+        format_stock_response(
+            stock_map[symbol],
+            changes_override=_resolve_stock_changes(
+                stock_map[symbol].changes,
+                delta_map.get(symbol),
+            ),
+        )
+        for symbol in symbols_upper
+    ]
     
     return result
 
@@ -424,7 +788,7 @@ async def get_stocks_by_heat(
     - 按热度评分降序排列的股票列表
     """
     valid_heat_types = ['trend', 'event', 'hedge', 'normal']
-    heat_type_lower = heat_type.lower()
+    heat_type_lower = normalize_heat_type(heat_type)
     
     if heat_type_lower not in valid_heat_types:
         raise HTTPException(
@@ -432,7 +796,8 @@ async def get_stocks_by_heat(
             detail=f"无效的热度类型: {heat_type}。有效类型: {', '.join(valid_heat_types)}"
         )
     
-    query = db.query(Stock).filter(Stock.heat_type == heat_type_lower)
+    aliases = HEAT_TYPE_FILTER_ALIASES.get(heat_type_lower, [heat_type_lower])
+    query = db.query(Stock).filter(func.lower(Stock.heat_type).in_(aliases))
     
     if sector:
         query = query.filter(Stock.sector == sector.upper())
@@ -459,16 +824,47 @@ async def get_stock_detail(
     返回:
     - 基础信息 + scores breakdown + thresholds + heat_type
     """
-    stock = db.query(Stock).filter(Stock.symbol == symbol.upper()).first()
+    stock = _ensure_stock_by_symbol_alias(db, symbol)
     
     if not stock:
         raise HTTPException(
             status_code=404, 
             detail=f"未找到股票: {symbol}"
         )
-    
+
+    related_map = _get_related_etf_map(db, [stock.symbol])
+    related = related_map.get(stock.symbol, {"sector": [], "industry": []})
+    sector_etfs = list(related.get("sector", []))
+    industry_etfs = related.get("industry", [])
+    primary_sector_symbol = _resolve_primary_sector_symbol(stock.sector, sector_etfs)
+    if primary_sector_symbol and primary_sector_symbol not in sector_etfs:
+        sector_etfs.append(primary_sector_symbol)
+
+    comparison_symbols: List[str] = []
+    if primary_sector_symbol:
+        comparison_symbols.append(primary_sector_symbol)
+    comparison_symbols.extend(industry_etfs)
+    comparison_symbols.extend(["SPY", "QQQ"])
+    price_stats = _get_price_stats_map(db, sorted(set(comparison_symbols)))
+
     # 基础响应
-    response = format_stock_response(stock)
+    response = format_stock_response(
+        stock,
+        changes_override=_resolve_stock_changes(
+            stock.changes,
+            _compute_stock_deltas(db, stock.symbol),
+        ),
+        industry_etfs=industry_etfs,
+        comparisons=_build_comparisons(
+            stock,
+            primary_sector_symbol,
+            industry_etfs,
+            price_stats,
+        ),
+    )
+    if primary_sector_symbol:
+        response["sector"] = primary_sector_symbol
+    response["sectorEtfs"] = sector_etfs
 
     # 补充价格快照字段（用于前端综合概览渲染）
     price_rows = _load_recent_price_rows(db, stock.symbol)
@@ -547,7 +943,7 @@ async def get_stock_detail(
         },
         "thresholdDetails": stock.thresholds or {},
         "heatAnalysis": {
-            "type": stock.heat_type or "normal",
+            "type": normalize_heat_type(stock.heat_type),
             "score": stock.heat_score or 0.0,
             "riskScore": stock.risk_score or 0.0,
             "thresholdsPass": stock.thresholds_pass if stock.thresholds_pass is not None else True,
@@ -564,6 +960,7 @@ async def get_stock_trend_comparison(
     symbol: str,
     period: int = Query(20, description="对比周期（交易日）: 5/20/63"),
     metric: str = Query("relative", description="指标: relative/sma20/return20d/score"),
+    label_tz: str = Query("market", description="日期标签时区: market/beijing"),
     db: Session = Depends(get_db)
 ):
     """
@@ -573,18 +970,27 @@ async def get_stock_trend_comparison(
         raise HTTPException(status_code=400, detail="period must be one of 5, 20, 63")
     if metric not in ("relative", "sma20", "return20d", "score"):
         raise HTTPException(status_code=400, detail="metric must be one of relative, sma20, return20d, score")
+    normalized_label_tz = (label_tz or "market").strip().lower()
+    if normalized_label_tz not in ("market", "beijing"):
+        raise HTTPException(status_code=400, detail="label_tz must be one of market, beijing")
 
-    stock = db.query(Stock).filter(Stock.symbol == symbol.upper()).first()
+    stock = _ensure_stock_by_symbol_alias(db, symbol)
     if not stock:
         raise HTTPException(status_code=404, detail=f"未找到股票: {symbol}")
 
-    industry_map = _get_industry_etf_map(db, [stock.symbol])
-    industry_etfs = industry_map.get(stock.symbol, [])
+    related_map = _get_related_etf_map(db, [stock.symbol])
+    related = related_map.get(stock.symbol, {"sector": [], "industry": []})
+    industry_etfs = related.get("industry", [])
+    sector_etfs = related.get("sector", [])
+
+    primary_sector_symbol = _resolve_primary_sector_symbol(stock.sector, sector_etfs)
+    all_sector_etfs = list(sector_etfs)
+    if primary_sector_symbol and primary_sector_symbol not in all_sector_etfs:
+        all_sector_etfs.append(primary_sector_symbol)
 
     symbols: List[str] = [stock.symbol]
     symbols.extend(industry_etfs)
-    if stock.sector:
-        symbols.append(stock.sector.upper())
+    symbols.extend(all_sector_etfs)
     symbols.extend(["SPY", "QQQ"])
 
     deduped: List[str] = []
@@ -593,11 +999,17 @@ async def get_stock_trend_comparison(
             deduped.append(sym)
 
     if metric == "sma20":
-        dates, price_series, sma20_series, deviation_series = build_sma20_comparison_series(db, deduped, period)
+        dates, price_series, sma20_series, deviation_series = build_sma20_comparison_series(
+            db,
+            deduped,
+            period,
+            label_tz=normalized_label_tz,
+        )
         return {
             "symbol": stock.symbol,
             "period": period,
             "metric": metric,
+            "label_tz": normalized_label_tz,
             "symbols": deduped,
             "dates": dates,
             # 保持向后兼容：series 默认返回可读性更高的偏离度(%)
@@ -607,12 +1019,19 @@ async def get_stock_trend_comparison(
             "deviation_series": deviation_series,
         }
 
-    dates, series = build_metric_series(db, deduped, period, metric=metric)
+    dates, series = build_metric_series(
+        db,
+        deduped,
+        period,
+        metric=metric,
+        label_tz=normalized_label_tz,
+    )
 
     return {
         "symbol": stock.symbol,
         "period": period,
         "metric": metric,
+        "label_tz": normalized_label_tz,
         "symbols": deduped,
         "dates": dates,
         "series": series
@@ -629,7 +1048,13 @@ async def get_stock(stock_id: int, db: Session = Depends(get_db)):
     if not stock:
         raise HTTPException(status_code=404, detail="Stock not found")
     
-    return format_stock_response(stock)
+    return format_stock_response(
+        stock,
+        changes_override=_resolve_stock_changes(
+            stock.changes,
+            _compute_stock_deltas(db, stock.symbol),
+        ),
+    )
 
 
 @router.get("/symbol/{symbol}", response_model=dict)
@@ -637,12 +1062,18 @@ async def get_stock_by_symbol(symbol: str, db: Session = Depends(get_db)):
     """
     根据符号获取股票
     """
-    stock = db.query(Stock).filter(Stock.symbol == symbol.upper()).first()
+    stock = _ensure_stock_by_symbol_alias(db, symbol)
     
     if not stock:
         raise HTTPException(status_code=404, detail=f"Stock '{symbol}' not found")
     
-    return format_stock_response(stock)
+    return format_stock_response(
+        stock,
+        changes_override=_resolve_stock_changes(
+            stock.changes,
+            _compute_stock_deltas(db, stock.symbol),
+        ),
+    )
 
 
 @router.get("/top/{n}", response_model=List[dict])
@@ -677,7 +1108,7 @@ async def get_stock_options_overlay(
     返回:
     - 期权热度、风险定价、期限结构、持仓变化等数据
     """
-    stock = db.query(Stock).filter(Stock.symbol == symbol.upper()).first()
+    stock = _ensure_stock_by_symbol_alias(db, symbol)
     
     if not stock:
         raise HTTPException(
@@ -968,9 +1399,7 @@ async def get_stock_options_overlay(
     elif not positioning and supplemental_positioning:
         positioning.extend(supplemental_positioning.values())
 
-    heat_type = str(mc_data.get("heat_type") or stock.heat_type or "normal").strip().lower()
-    if heat_type not in {"trend", "event", "hedge", "normal"}:
-        heat_type = "normal"
+    heat_type = normalize_heat_type(mc_data.get("heat_type") or stock.heat_type or "normal")
 
     updated_candidates = []
     if stock.updated_at:
