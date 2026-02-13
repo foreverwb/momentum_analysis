@@ -414,7 +414,8 @@ export interface Task {
   id: number;
   title: string;
   type: TaskType;
-  baseIndex: 'SPY' | 'QQQ' | 'IWM';
+  baseIndex: string;
+  baseIndices?: string[];
   sector?: string;
   etfs: string[];
   createdAt: string;
@@ -425,7 +426,8 @@ export interface Task {
 export interface CreateTaskInput {
   title: string;
   type: TaskType;
-  baseIndex: 'SPY' | 'QQQ' | 'IWM';
+  baseIndex: string;
+  baseIndices?: string[];
   sector?: string;
   etfs: string[];
 }

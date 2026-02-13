@@ -35,6 +35,7 @@ import {
   refreshETF,
   getTasks,
   createTask,
+  updateTask,
   deleteTask,  
 } from '../services/api';
 
@@ -485,6 +486,22 @@ export function useCreateTask() {
     mutationFn: (input: CreateTaskInput) => createTask(input),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: taskQueryKeys.lists() });
+    },
+  });
+}
+
+/**
+ * Hook to update task
+ */
+export function useUpdateTask() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id, input }: { id: string | number; input: CreateTaskInput }) =>
+      updateTask(id, input),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: taskQueryKeys.lists() });
+      queryClient.invalidateQueries({ queryKey: taskQueryKeys.detail(variables.id) });
     },
   });
 }

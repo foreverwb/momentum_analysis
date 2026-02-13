@@ -1194,7 +1194,7 @@ function normalizeETF(raw: unknown): ETF {
     holdingsCount: toNumber(source.holdingsCount) ?? 0,
     holdings,
     coverageRanges: toStringArray(source.coverageRanges),
-    lastUpdated: toStringValue(source.lastUpdated),
+    lastUpdated: toStringValue(source.lastUpdated) ?? toStringValue(source.updatedAt) ?? toStringValue(source.updated_at),
   };
 }
 
@@ -1249,12 +1249,53 @@ function normalizeTaskType(value: unknown): Task['type'] {
   return 'rotation';
 }
 
-function normalizeTaskBaseIndex(value: unknown): Task['baseIndex'] {
-  const normalized = (toStringValue(value) || '').toUpperCase();
-  if (normalized === 'QQQ' || normalized === 'IWM') {
-    return normalized;
+function normalizeTaskBaseIndices(value: unknown): string[] {
+  const candidates: string[] = [];
+
+  if (Array.isArray(value)) {
+    value.forEach((item) => {
+      const normalized = (toStringValue(item) || String(item)).trim().toUpperCase();
+      if (normalized) {
+        candidates.push(normalized);
+      }
+    });
+  } else if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed) {
+      try {
+        const parsed: unknown = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+          parsed.forEach((item) => {
+            const normalized = (toStringValue(item) || String(item)).trim().toUpperCase();
+            if (normalized) {
+              candidates.push(normalized);
+            }
+          });
+        } else {
+          trimmed.split(',').forEach((item) => {
+            const normalized = item.trim().toUpperCase();
+            if (normalized) {
+              candidates.push(normalized);
+            }
+          });
+        }
+      } catch {
+        trimmed.split(',').forEach((item) => {
+          const normalized = item.trim().toUpperCase();
+          if (normalized) {
+            candidates.push(normalized);
+          }
+        });
+      }
+    }
   }
-  return 'SPY';
+
+  const deduped = Array.from(new Set(candidates));
+  return deduped.length > 0 ? deduped : ['SPY'];
+}
+
+function normalizeTaskBaseIndex(value: unknown): Task['baseIndex'] {
+  return normalizeTaskBaseIndices(value)[0] ?? 'SPY';
 }
 
 function normalizeTaskEtfs(value: unknown): string[] {
@@ -1290,11 +1331,13 @@ function normalizeTaskEtfs(value: unknown): string[] {
 
 function normalizeTask(raw: unknown): Task {
   const source = isRecord(raw) ? raw : {};
+  const baseIndices = normalizeTaskBaseIndices(source.baseIndices ?? source.baseIndex);
   return {
     id: toNumber(source.id) ?? 0,
     title: toStringValue(source.title) ?? '',
     type: normalizeTaskType(source.type),
-    baseIndex: normalizeTaskBaseIndex(source.baseIndex),
+    baseIndex: normalizeTaskBaseIndex(baseIndices),
+    baseIndices,
     sector: toStringValue(source.sector),
     etfs: normalizeTaskEtfs(source.etfs),
     createdAt: toStringValue(source.createdAt) ?? '',
@@ -1338,9 +1381,37 @@ export async function getTask(id: string | number): Promise<Task> {
  * Create a new task
  */
 export async function createTask(input: CreateTaskInput): Promise<Task> {
+  const normalizedBaseIndices = normalizeTaskBaseIndices(input.baseIndices ?? input.baseIndex);
+  const payload: Omit<CreateTaskInput, 'baseIndices'> = {
+    title: input.title,
+    type: input.type,
+    baseIndex: normalizedBaseIndices.join(','),
+    sector: input.sector,
+    etfs: input.etfs,
+  };
   const response = await fetchApi<unknown>('/tasks', {
     method: 'POST',
-    body: JSON.stringify(input),
+    body: JSON.stringify(payload),
+  });
+  return normalizeTask(response);
+}
+
+/**
+ * Update task
+ */
+export async function updateTask(id: string | number, input: CreateTaskInput): Promise<Task> {
+  const taskId = normalizeTaskId(id);
+  const normalizedBaseIndices = normalizeTaskBaseIndices(input.baseIndices ?? input.baseIndex);
+  const payload: Omit<CreateTaskInput, 'baseIndices'> = {
+    title: input.title,
+    type: input.type,
+    baseIndex: normalizedBaseIndices.join(','),
+    sector: input.sector,
+    etfs: input.etfs,
+  };
+  const response = await fetchApi<unknown>(`/tasks/${taskId}`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
   });
   return normalizeTask(response);
 }
@@ -1472,6 +1543,7 @@ export async function refreshTaskAllETFs(taskId: string | number): Promise<{
   total: number;
   completed: number;
   failed: number;
+  updated_at?: string;
   results: Array<{
     symbol: string;
     status: string;
@@ -1493,6 +1565,7 @@ export async function refreshTaskAllETFs(taskId: string | number): Promise<{
     total: number;
     completed: number;
     failed: number;
+    updated_at?: string;
     results: Array<{
       symbol: string;
       status: string;

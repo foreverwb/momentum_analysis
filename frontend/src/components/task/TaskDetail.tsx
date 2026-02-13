@@ -206,6 +206,12 @@ const formatUpdateDateTime = (value?: string | null): string => {
   return `${month}-${day} ${hours}:${minutes}`;
 };
 
+const parseTimestampMs = (value?: string | null): number => {
+  if (!value) return Number.NaN;
+  const ts = new Date(value).getTime();
+  return Number.isFinite(ts) ? ts : Number.NaN;
+};
+
 const formatBeijingBoundaryLabel = (boundaryUtcMs: number): string => {
   const beijing = new Date(boundaryUtcMs + BEIJING_OFFSET_MS);
   const year = beijing.getUTCFullYear();
@@ -239,6 +245,28 @@ const normalizeEtfs = (raw: unknown): string[] => {
   return [];
 };
 
+const normalizeBaseIndices = (raw: unknown): string[] => {
+  if (Array.isArray(raw)) {
+    const deduped = Array.from(
+      new Set(
+        raw
+          .map((item) => String(item).trim().toUpperCase())
+          .filter((item) => item.length > 0)
+      )
+    );
+    return deduped.length > 0 ? deduped : ['SPY'];
+  }
+  if (typeof raw === 'string') {
+    const values = raw
+      .split(',')
+      .map((item) => item.trim().toUpperCase())
+      .filter((item) => item.length > 0);
+    const deduped = Array.from(new Set(values));
+    return deduped.length > 0 ? deduped : ['SPY'];
+  }
+  return ['SPY'];
+};
+
 const getSymbolsKey = (symbols: string[]): string => symbols.join('|');
 
 function getETFName(symbol: string): string {
@@ -253,6 +281,7 @@ interface ETFDetailData {
   symbol: string;
   name: string;
   type: 'sector' | 'industry';
+  lastUpdated: string | null;
   score: number | null;
   rank: number | null;
   totalCount: number;
@@ -294,6 +323,12 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
   const [coverageRangesByETF, setCoverageRangesByETF] = useState<Record<string, string[]>>({});
   const [resolvedEtfs, setResolvedEtfs] = useState<string[]>(() => normalizeEtfs(task.etfs));
   const resolvedEtfsKey = useMemo(() => getSymbolsKey(resolvedEtfs), [resolvedEtfs]);
+  const taskBaseIndices = useMemo(
+    () => normalizeBaseIndices(task.baseIndices ?? task.baseIndex),
+    [task.baseIndices, task.baseIndex]
+  );
+  const taskBaseIndicesKey = useMemo(() => getSymbolsKey(taskBaseIndices), [taskBaseIndices]);
+  const primaryBaseIndex = taskBaseIndices[0] || 'SPY';
 
   // API 数据状态
   const [etfDetails, setEtfDetails] = useState<ETFDetailData[]>([]);
@@ -318,6 +353,7 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
   const [refreshError, setRefreshError] = useState(false);
   const [refreshComplete, setRefreshComplete] = useState(false);
   const [latestRefreshResults, setLatestRefreshResults] = useState<Record<string, RefreshResult>>({});
+  const [lastRefreshAllAt, setLastRefreshAllAt] = useState<string | null>(task.updatedAt ?? null);
   const [sourceUpdatedAtMap, setSourceUpdatedAtMap] = useState<Partial<Record<SourceKey, string>>>(
     () => loadStoredSourceUpdatedAt(task.id)
   );
@@ -326,6 +362,7 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
     symbol,
     name: getETFName(symbol),
     type: getETFType(symbol),
+    lastUpdated: null,
     score: null,
     rank: null,
     totalCount,
@@ -359,6 +396,7 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
               symbol: etf.symbol,
               name: etf.name || getETFName(symbol),
               type: (etf.type as 'sector' | 'industry') || getETFType(symbol),
+              lastUpdated: etf.lastUpdated ?? null,
               score: etf.score > 0 ? etf.score : null,
               rank: etf.rank > 0 ? etf.rank : null,
               totalCount: symbols.length,
@@ -413,6 +451,10 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
   useEffect(() => {
     setSourceUpdatedAtMap(loadStoredSourceUpdatedAt(task.id));
   }, [task.id]);
+
+  useEffect(() => {
+    setLastRefreshAllAt(task.updatedAt ?? null);
+  }, [task.id, task.updatedAt]);
 
   useEffect(() => {
     saveStoredSourceUpdatedAt(task.id, sourceUpdatedAtMap);
@@ -491,15 +533,16 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
     }
     let cancelled = false;
     const periodValue = trendPeriod === '5d' ? 5 : trendPeriod === '20d' ? 20 : 63;
-    const baseSymbol = task.baseIndex?.toUpperCase();
+    const baseSymbols = taskBaseIndices.map((symbol) => symbol.toUpperCase());
+    const baseSymbol = baseSymbols[0];
     const sectorSymbol = task.sector?.toUpperCase();
     const reservedColors: Record<string, string> = {
       SPY: '#94a3b8',
       QQQ: '#64748b',
     };
-    if (baseSymbol) {
-      reservedColors[baseSymbol] = '#94a3b8';
-    }
+    baseSymbols.forEach((symbol, index) => {
+      reservedColors[symbol] = index === 0 ? '#94a3b8' : '#64748b';
+    });
     if (sectorSymbol) {
       reservedColors[sectorSymbol] = '#8b5cf6';
     }
@@ -527,7 +570,7 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
     const loadTrendData = async () => {
       try {
         const marketSymbols = Array.from(
-          new Set([baseSymbol, 'SPY', 'QQQ'].filter((symbol): symbol is string => Boolean(symbol)))
+          new Set([...baseSymbols, 'SPY', 'QQQ'].filter((symbol): symbol is string => Boolean(symbol)))
         );
         const warmupPromise =
           trendMetric === 'score' || marketSymbols.length === 0
@@ -620,7 +663,7 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
     return () => {
       cancelled = true;
     };
-  }, [task.id, task.baseIndex, task.sector, trendPeriod, trendMetric]);
+  }, [task.id, taskBaseIndicesKey, task.sector, trendPeriod, trendMetric]);
 
   useEffect(() => {
     if (!resolvedEtfs.length) {
@@ -714,7 +757,20 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
   };
 
   const etfSymbols = resolvedEtfs;
-  const latestUpdatedAt = task.updatedAt || task.createdAt;
+  const latestUpdatedAt = useMemo(() => {
+    const refreshEventTs = parseTimestampMs(lastRefreshAllAt);
+    if (Number.isFinite(refreshEventTs)) {
+      return new Date(refreshEventTs).toISOString();
+    }
+    const latestEtfTs = etfDetails.reduce<number>((latest, etf) => {
+      const ts = parseTimestampMs(etf.lastUpdated);
+      return Number.isFinite(ts) && ts > latest ? ts : latest;
+    }, Number.NaN);
+    if (Number.isFinite(latestEtfTs)) {
+      return new Date(latestEtfTs).toISOString();
+    }
+    return task.updatedAt || task.createdAt;
+  }, [lastRefreshAllAt, etfDetails, task.updatedAt, task.createdAt]);
   const latestUpdatedAtLabel = useMemo(() => formatUpdateDate(latestUpdatedAt), [latestUpdatedAt]);
   const resetBoundaryMs = useMemo(() => getBeijingResetBoundaryMs(clockNowMs), [clockNowMs]);
   const trendSymbolRoleMap = useMemo(() => {
@@ -724,9 +780,9 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
       IWM: 'market',
       DIA: 'market',
     };
-    if (task.baseIndex) {
-      roleMap[task.baseIndex.toUpperCase()] = 'market';
-    }
+    taskBaseIndices.forEach((symbol) => {
+      roleMap[symbol.toUpperCase()] = 'market';
+    });
     if (task.sector) {
       roleMap[task.sector.toUpperCase()] = 'sector';
     }
@@ -734,7 +790,7 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
       roleMap[etf.symbol.toUpperCase()] = etf.type === 'sector' ? 'sector' : 'industry';
     });
     return roleMap;
-  }, [etfDetails, task.baseIndex, task.sector]);
+  }, [etfDetails, taskBaseIndicesKey, task.sector]);
 
   const sourceIndicators = useMemo(() => {
     return (Object.keys(SOURCE_CIRCLE_META) as SourceKey[]).map((sourceKey) => {
@@ -842,6 +898,7 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
       if (updatedSources.size > 0) {
         markSourcesUpdated(Array.from(updatedSources));
       }
+      setLastRefreshAllAt(resp.updated_at || new Date().toISOString());
 
       setRefreshProgress({
         completed: resp.completed ?? etfSymbols.length,
@@ -1126,7 +1183,7 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
               </span>
             </div>
             <div className="flex items-center gap-4 mt-1 text-sm text-[var(--text-muted)]">
-              <span>基准: {task.baseIndex}</span>
+              <span>基准: {taskBaseIndices.join(' / ')}</span>
               {task.sector && <span>板块: {task.sector}</span>}
               <span className="inline-flex items-center gap-1.5">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -1216,7 +1273,7 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
           metricOptions={TREND_METRIC_OPTIONS}
           onMetricChange={(value) => setTrendMetric(value as typeof trendMetric)}
           valueFormatter={trendValueFormatter}
-          baseSymbol={task.baseIndex}
+          baseSymbol={primaryBaseIndex}
           symbolRoleMap={trendSymbolRoleMap}
         />
         {isTrendLoading && (

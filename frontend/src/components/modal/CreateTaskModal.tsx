@@ -2,6 +2,8 @@ import React, { useState } from 'react';
 import { Modal } from './Modal';
 import type { TaskType } from '../../types';
 
+type BaseIndexSymbol = 'SPY' | 'QQQ' | 'IWM';
+
 interface CreateTaskModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -14,7 +16,8 @@ export interface CreateTaskData {
   title: string;
   etfs: string[];
   sector: string | null;
-  baseIndex: 'SPY' | 'QQQ' | 'IWM';
+  baseIndex: string;
+  baseIndices: BaseIndexSymbol[];
 }
 
 // ETF Data
@@ -71,7 +74,7 @@ const INDUSTRY_ETFS: Record<string, { symbol: string; name: string }[]> = {
   ],
 };
 
-const BASE_INDICES = [
+const BASE_INDICES: { value: BaseIndexSymbol; name: string; description: string }[] = [
   { value: 'SPY', name: 'SPY', description: '标普500 - 大盘基准' },
   { value: 'QQQ', name: 'QQQ', description: '纳斯达克100 - 成长股基准' },
   { value: 'IWM', name: 'IWM', description: '罗素2000 - 小盘股基准' },
@@ -104,7 +107,7 @@ export function CreateTaskModal({ isOpen, onClose, onSubmit }: CreateTaskModalPr
   const [taskType, setTaskType] = useState<TaskType>('rotation');
   const [selectedETFs, setSelectedETFs] = useState<string[]>([]);
   const [selectedSector, setSelectedSector] = useState<string | null>(null);
-  const [baseIndex, setBaseIndex] = useState<'SPY' | 'QQQ' | 'IWM'>('SPY');
+  const [baseIndices, setBaseIndices] = useState<BaseIndexSymbol[]>(['SPY']);
 
   const resetForm = () => {
     setCurrentStep(1);
@@ -112,7 +115,7 @@ export function CreateTaskModal({ isOpen, onClose, onSubmit }: CreateTaskModalPr
     setTaskType('rotation');
     setSelectedETFs([]);
     setSelectedSector(null);
-    setBaseIndex('SPY');
+    setBaseIndices(['SPY']);
   };
 
   const handleClose = () => {
@@ -133,14 +136,17 @@ export function CreateTaskModal({ isOpen, onClose, onSubmit }: CreateTaskModalPr
   };
 
   const handleSubmit = () => {
-    const taskTitle = taskName.trim() || generateTaskTitle();
+    const normalizedTaskName = taskName.trim();
+    const normalizedBaseIndices: BaseIndexSymbol[] = baseIndices.length > 0 ? baseIndices : ['SPY'];
+    const taskTitle = normalizedTaskName || generateTaskTitle();
     onSubmit({
       type: taskType,
-      name: taskName.trim(),
+      name: normalizedTaskName,
       title: taskTitle,
       etfs: selectedETFs,
       sector: selectedSector,
-      baseIndex,
+      baseIndex: normalizedBaseIndices.join(','),
+      baseIndices: normalizedBaseIndices,
     });
     handleClose();
   };
@@ -164,6 +170,17 @@ export function CreateTaskModal({ isOpen, onClose, onSubmit }: CreateTaskModalPr
     );
   };
 
+  const toggleBaseIndex = (index: BaseIndexSymbol) => {
+    setBaseIndices((prev) => {
+      const next = prev.includes(index)
+        ? prev.length > 1
+          ? prev.filter((item) => item !== index)
+          : prev
+        : [...prev, index];
+      return BASE_INDICES.map((item) => item.value).filter((item) => next.includes(item));
+    });
+  };
+
   const canProceed = () => {
     switch (currentStep) {
       case 1:
@@ -174,7 +191,7 @@ export function CreateTaskModal({ isOpen, onClose, onSubmit }: CreateTaskModalPr
         if (taskType === 'momentum') return selectedSector && selectedETFs.length >= 1;
         return false;
       case 3:
-        return true;
+        return baseIndices.length > 0;
       case 4:
         return true;
       default:
@@ -202,8 +219,8 @@ export function CreateTaskModal({ isOpen, onClose, onSubmit }: CreateTaskModalPr
       case 3:
         return (
           <StepSelectAnchor
-            baseIndex={baseIndex}
-            onSelect={setBaseIndex}
+            baseIndices={baseIndices}
+            onToggle={toggleBaseIndex}
             taskType={taskType}
             selectedETFs={selectedETFs}
             selectedSector={selectedSector}
@@ -215,8 +232,10 @@ export function CreateTaskModal({ isOpen, onClose, onSubmit }: CreateTaskModalPr
             taskType={taskType}
             selectedETFs={selectedETFs}
             selectedSector={selectedSector}
-            baseIndex={baseIndex}
-            title={taskName.trim() || generateTaskTitle()}
+            baseIndices={baseIndices}
+            taskName={taskName}
+            onNameChange={setTaskName}
+            defaultTitle={generateTaskTitle()}
           />
         );
       default:
@@ -477,30 +496,32 @@ function StepConfigureETFs({
 
 // Step 3: Select Anchor/Baseline
 function StepSelectAnchor({
-  baseIndex,
-  onSelect,
+  baseIndices,
+  onToggle,
   taskType,
   selectedETFs,
   selectedSector,
 }: {
-  baseIndex: 'SPY' | 'QQQ' | 'IWM';
-  onSelect: (index: 'SPY' | 'QQQ' | 'IWM') => void;
+  baseIndices: BaseIndexSymbol[];
+  onToggle: (index: BaseIndexSymbol) => void;
   taskType: TaskType;
   selectedETFs: string[];
   selectedSector: string | null;
 }) {
+  const baseIndexLabel = baseIndices.join(' / ');
+
   return (
     <div>
       <h3 className="text-base font-semibold mb-2">选择基准指数</h3>
-      <p className="text-sm text-[var(--text-muted)] mb-4">选择用于相对强弱比较的基准</p>
+      <p className="text-sm text-[var(--text-muted)] mb-4">选择用于相对强弱比较的基准（支持多选）</p>
       <div className="grid grid-cols-3 gap-4 mb-6">
         {BASE_INDICES.map((index) => (
           <button
             key={index.value}
-            onClick={() => onSelect(index.value as 'SPY' | 'QQQ' | 'IWM')}
+            onClick={() => onToggle(index.value)}
             className={`
               p-4 text-left border-2 rounded-[var(--radius-md)] cursor-pointer transition-all
-              ${baseIndex === index.value
+              ${baseIndices.includes(index.value)
                 ? 'border-[var(--accent-blue)] bg-blue-50/50'
                 : 'border-[var(--border-light)] hover:border-[var(--accent-blue)]'
               }
@@ -510,6 +531,9 @@ function StepSelectAnchor({
             <div className="text-[13px] text-[var(--text-muted)]">{index.description}</div>
           </button>
         ))}
+      </div>
+      <div className="mb-6 text-sm text-[var(--text-muted)]">
+        已选择 {baseIndices.length} 个基准：{baseIndexLabel || '--'}
       </div>
 
       <div className="p-4 bg-[var(--bg-secondary)] rounded-[var(--radius-md)] border border-[var(--border-light)]">
@@ -523,7 +547,7 @@ function StepSelectAnchor({
           </div>
           <div>
             <span className="text-[var(--text-muted)]">基准指数:</span>
-            <span className="ml-2 font-medium">{baseIndex}</span>
+            <span className="ml-2 font-medium">{baseIndexLabel || '--'}</span>
           </div>
           {selectedSector && (
             <div>
@@ -546,15 +570,21 @@ function StepConfirm({
   taskType,
   selectedETFs,
   selectedSector,
-  baseIndex,
-  title,
+  baseIndices,
+  taskName,
+  onNameChange,
+  defaultTitle,
 }: {
   taskType: TaskType;
   selectedETFs: string[];
   selectedSector: string | null;
-  baseIndex: string;
-  title: string;
+  baseIndices: BaseIndexSymbol[];
+  taskName: string;
+  onNameChange: (name: string) => void;
+  defaultTitle: string;
 }) {
+  const finalTitle = taskName.trim() || defaultTitle;
+
   return (
     <div>
       <div className="text-center mb-6">
@@ -565,9 +595,19 @@ function StepConfirm({
 
       <div className="p-5 bg-[var(--bg-secondary)] rounded-[var(--radius-lg)] border border-[var(--border-light)]">
         <div className="space-y-4">
-          <div className="flex justify-between items-center py-2 border-b border-[var(--border-light)]">
-            <span className="text-[var(--text-muted)]">任务名称</span>
-            <span className="font-semibold">{title}</span>
+          <div className="py-2 border-b border-[var(--border-light)]">
+            <span className="text-[var(--text-muted)] block mb-2">任务名称（可修改）</span>
+            <input
+              type="text"
+              value={taskName}
+              onChange={(e) => onNameChange(e.target.value)}
+              placeholder={defaultTitle}
+              className="w-full px-3 py-2 text-sm border border-[var(--border-light)] rounded-[var(--radius-sm)] focus:outline-none focus:border-[var(--accent-blue)] bg-[var(--bg-primary)]"
+            />
+            <div className="mt-2 text-sm">
+              <span className="text-[var(--text-muted)]">最终名称：</span>
+              <span className="font-semibold">{finalTitle}</span>
+            </div>
           </div>
           <div className="flex justify-between items-center py-2 border-b border-[var(--border-light)]">
             <span className="text-[var(--text-muted)]">任务类型</span>
@@ -577,7 +617,7 @@ function StepConfirm({
           </div>
           <div className="flex justify-between items-center py-2 border-b border-[var(--border-light)]">
             <span className="text-[var(--text-muted)]">基准指数</span>
-            <span className="font-semibold">{baseIndex}</span>
+            <span className="font-semibold">{baseIndices.join(' / ') || '--'}</span>
           </div>
           {selectedSector && (
             <div className="flex justify-between items-center py-2 border-b border-[var(--border-light)]">

@@ -24,14 +24,17 @@ router = APIRouter()
 
 def format_task_response(task: Task) -> dict:
     """格式化任务响应数据"""
+    base_indices = _normalize_base_indices(task.base_index)
     return {
         "id": task.id,
         "title": task.title,
         "type": task.type,
-        "baseIndex": task.base_index,
+        "baseIndex": ",".join(base_indices),
+        "baseIndices": base_indices,
         "sector": task.sector,
         "etfs": task.etfs or [],
-        "createdAt": task.created_at.strftime("%Y-%m-%d") if task.created_at else None
+        "createdAt": task.created_at.strftime("%Y-%m-%d") if task.created_at else None,
+        "updatedAt": task.updated_at.isoformat() if task.updated_at else None,
     }
 
 
@@ -59,6 +62,15 @@ def _normalize_symbols(raw: Any) -> List[str]:
             pass
         return [item.strip().upper() for item in text.split(',') if item.strip()]
     return []
+
+
+def _normalize_base_indices(raw: Any) -> List[str]:
+    symbols = _normalize_symbols(raw)
+    deduped: List[str] = []
+    for symbol in symbols:
+        if symbol and symbol not in deduped:
+            deduped.append(symbol)
+    return deduped or ["SPY"]
 
 
 def _load_price_history(db: Session, symbol: str, min_rows: int = 60) -> Optional[pd.DataFrame]:
@@ -196,8 +208,7 @@ async def get_task_trend_comparison(
     symbols = _normalize_symbols(task.etfs)
     if task.sector:
         symbols.append(task.sector.upper())
-    if task.base_index:
-        symbols.append(task.base_index.upper())
+    symbols.extend(_normalize_base_indices(task.base_index))
     symbols.extend(["SPY", "QQQ"])
 
     # 去重并保持顺序
@@ -238,10 +249,11 @@ async def create_task(task: TaskCreate, db: Session = Depends(get_db)):
     """
     创建新的监控任务
     """
+    base_indices = _normalize_base_indices(task.baseIndex)
     new_task = Task(
         title=task.title,
         type=task.type.value,
-        base_index=task.baseIndex,
+        base_index=",".join(base_indices),
         sector=task.sector,
         etfs=task.etfs,
         created_at=datetime.utcnow()
@@ -268,9 +280,10 @@ async def update_task(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     
+    base_indices = _normalize_base_indices(task_update.baseIndex)
     task.title = task_update.title
     task.type = task_update.type.value
-    task.base_index = task_update.baseIndex
+    task.base_index = ",".join(base_indices)
     task.sector = task_update.sector
     task.etfs = task_update.etfs
     
@@ -329,6 +342,9 @@ async def refresh_all_etfs(task_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Task not found")
 
     if not task.etfs:
+        refresh_finished_at = datetime.utcnow()
+        task.updated_at = refresh_finished_at
+        db.commit()
         return {
             "status": "success",
             "task_id": task_id,
@@ -336,7 +352,8 @@ async def refresh_all_etfs(task_id: int, db: Session = Depends(get_db)):
             "completed": 0,
             "failed": 0,
             "results": [],
-            "message": "任务中没有 ETF"
+            "message": "任务中没有 ETF",
+            "updated_at": refresh_finished_at.isoformat(),
         }
 
     results = []
@@ -359,6 +376,10 @@ async def refresh_all_etfs(task_id: int, db: Session = Depends(get_db)):
                 "data_sources": {}
             })
 
+    refresh_finished_at = datetime.utcnow()
+    task.updated_at = refresh_finished_at
+    db.commit()
+
     return {
         "status": "success" if failed_count == 0 else "partial_success",
         "task_id": task_id,
@@ -366,7 +387,8 @@ async def refresh_all_etfs(task_id: int, db: Session = Depends(get_db)):
         "completed": len(task.etfs) - failed_count,
         "failed": failed_count,
         "results": results,
-        "message": f"刷新完成: {len(task.etfs) - failed_count} 成功, {failed_count} 失败"
+        "message": f"刷新完成: {len(task.etfs) - failed_count} 成功, {failed_count} 失败",
+        "updated_at": refresh_finished_at.isoformat(),
     }
 
 

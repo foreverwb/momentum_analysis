@@ -223,7 +223,10 @@ def format_etf_response(etf: ETF, include_holdings: bool = False, db: Session = 
         "delta": etf.delta or {"delta3d": None, "delta5d": None},
         "completeness": etf.completeness or 0.0,
         "holdingsCount": etf.holdings_count or 0,
-        "coverageRanges": ordered_coverage_ranges
+        "coverageRanges": ordered_coverage_ranges,
+        # 兼容旧字段(lastUpdated)并提供统一字段(updatedAt)
+        "updatedAt": etf.updated_at.isoformat() if etf.updated_at else None,
+        "lastUpdated": etf.updated_at.isoformat() if etf.updated_at else None,
     }
 
     if etf.type == "industry" and etf.parent_sector:
