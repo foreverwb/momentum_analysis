@@ -1908,20 +1908,38 @@ async def refresh_holdings_by_coverage(
             symbol.upper(),
             coverage_label,
         )
+    ibkr_price_timeout_seconds = 30
     if sector_df is None and ibkr_connected:
         try:
-            sector_fetched = await orchestrator.get_ohlcv_data(sector_symbol, '1 Y')
+            sector_fetched = await asyncio.wait_for(
+                orchestrator.get_ohlcv_data(sector_symbol, '1 Y'),
+                timeout=ibkr_price_timeout_seconds,
+            )
             if sector_fetched is not None and not sector_fetched.empty:
                 _save_price_history(sector_symbol, sector_fetched)
                 sector_df = sector_fetched
+        except asyncio.TimeoutError:
+            logger.warning(
+                "refresh_holdings_sector_price_timeout symbol=%s timeout_seconds=%s",
+                sector_symbol,
+                ibkr_price_timeout_seconds,
+            )
         except Exception as e:
             logger.warning(f"Failed to get sector price data for {sector_symbol}: {e}")
 
     updated_stocks = []
     ordered_log_rows: List[Dict[str, Any]] = []
     stock_semaphore = asyncio.Semaphore(5)  # 限制并发数为 5
+    futu_iv_timeout_seconds = 20
+    futu_fetch_semaphore = asyncio.Semaphore(1)  # 避免同一连接并发拉取 option chain 导致阻塞放大
+    futu_failure_threshold = 2
+    futu_failure_count = 0
+    futu_skip_remaining = False
+    futu_circuit_open_logged = False
+    futu_state_lock = asyncio.Lock()
 
     async def fetch_stock_data(holding: ETFHolding, idx: int, total_count: int):
+        nonlocal futu_failure_count, futu_skip_remaining, futu_circuit_open_logged
         async with stock_semaphore:
             try:
                 ticker = str(holding.ticker).upper()
@@ -1951,7 +1969,10 @@ async def refresh_holdings_by_coverage(
                 if ibkr_connected:
                     try:
                         # 获取股票的日线数据（用于动能评分）
-                        stock_df = await orchestrator.get_ohlcv_data(holding.ticker, '1 Y')
+                        stock_df = await asyncio.wait_for(
+                            orchestrator.get_ohlcv_data(holding.ticker, '1 Y'),
+                            timeout=ibkr_price_timeout_seconds,
+                        )
                         if stock_df is not None and not stock_df.empty:
                             latest_row = stock_df.iloc[-1]
                             price_data = float(latest_row.get('close', 0))
@@ -1974,6 +1995,13 @@ async def refresh_holdings_by_coverage(
                                     change_1d = ((price_data - prev_close) / prev_close) * 100
                         else:
                             ibkr_price_log = "N/A (empty_data)"
+                    except asyncio.TimeoutError:
+                        ibkr_price_log = "N/A (request_timeout)"
+                        logger.warning(
+                            "ibkr_holding_price_fetch_timeout symbol=%s timeout_seconds=%s",
+                            ticker,
+                            ibkr_price_timeout_seconds,
+                        )
                     except Exception as e:
                         ibkr_price_log = "N/A (request_failed)"
                         logger.warning("ibkr_holding_price_fetch_failed symbol=%s error=%s", ticker, str(e))
@@ -2000,37 +2028,85 @@ async def refresh_holdings_by_coverage(
                 put_oi_bucket_0_7 = None
                 put_oi_bucket_8_30 = None
                 put_oi_bucket_31_90 = None
+                futu_failed = False
                 if orchestrator._futu and orchestrator._futu.is_connected():
-                    try:
-                        iv_results = await asyncio.to_thread(
-                            orchestrator._futu.fetch_iv_terms,
-                            [holding.ticker],
-                            max_days=120,
-                            progress_total=total_count,
-                            progress_offset=idx - 1,
-                            log_progress=False,
-                            log_fetch_summary=False,
-                        )
-                        if holding.ticker in iv_results:
-                            iv_data = iv_results[holding.ticker]
-                            if iv_data.is_valid():
-                                iv30 = iv_data.iv30
-                                iv7 = iv_data.iv7
-                                iv60 = iv_data.iv60
-                                iv90 = iv_data.iv90
-                                total_oi = iv_data.total_oi
-                                oi_bucket_0_7 = iv_data.oi_bucket_0_7
-                                oi_bucket_8_30 = iv_data.oi_bucket_8_30
-                                oi_bucket_31_90 = iv_data.oi_bucket_31_90
-                                call_oi_bucket_0_7 = getattr(iv_data, 'call_oi_bucket_0_7', None)
-                                call_oi_bucket_8_30 = getattr(iv_data, 'call_oi_bucket_8_30', None)
-                                call_oi_bucket_31_90 = getattr(iv_data, 'call_oi_bucket_31_90', None)
-                                put_oi_bucket_0_7 = getattr(iv_data, 'put_oi_bucket_0_7', None)
-                                put_oi_bucket_8_30 = getattr(iv_data, 'put_oi_bucket_8_30', None)
-                                put_oi_bucket_31_90 = getattr(iv_data, 'put_oi_bucket_31_90', None)
-                                data_sources.append('futu')
-                    except Exception as e:
-                        logger.warning(f"Failed to get IV data for {holding.ticker}: {e}")
+                    async with futu_state_lock:
+                        skip_futu_for_ticker = futu_skip_remaining
+                    if not skip_futu_for_ticker:
+                        async with futu_fetch_semaphore:
+                            async with futu_state_lock:
+                                skip_futu_for_ticker = futu_skip_remaining
+                            if not skip_futu_for_ticker:
+                                try:
+                                    iv_results = await asyncio.wait_for(
+                                        asyncio.to_thread(
+                                            orchestrator._futu.fetch_iv_terms,
+                                            [holding.ticker],
+                                            max_days=120,
+                                            max_retries=0,
+                                            progress_total=total_count,
+                                            progress_offset=idx - 1,
+                                            log_progress=False,
+                                            log_fetch_summary=False,
+                                        ),
+                                        timeout=futu_iv_timeout_seconds,
+                                    )
+                                    if holding.ticker in iv_results:
+                                        iv_data = iv_results[holding.ticker]
+                                        if iv_data.is_valid():
+                                            iv30 = iv_data.iv30
+                                            iv7 = iv_data.iv7
+                                            iv60 = iv_data.iv60
+                                            iv90 = iv_data.iv90
+                                            total_oi = iv_data.total_oi
+                                            oi_bucket_0_7 = iv_data.oi_bucket_0_7
+                                            oi_bucket_8_30 = iv_data.oi_bucket_8_30
+                                            oi_bucket_31_90 = iv_data.oi_bucket_31_90
+                                            call_oi_bucket_0_7 = getattr(iv_data, 'call_oi_bucket_0_7', None)
+                                            call_oi_bucket_8_30 = getattr(iv_data, 'call_oi_bucket_8_30', None)
+                                            call_oi_bucket_31_90 = getattr(iv_data, 'call_oi_bucket_31_90', None)
+                                            put_oi_bucket_0_7 = getattr(iv_data, 'put_oi_bucket_0_7', None)
+                                            put_oi_bucket_8_30 = getattr(iv_data, 'put_oi_bucket_8_30', None)
+                                            put_oi_bucket_31_90 = getattr(iv_data, 'put_oi_bucket_31_90', None)
+                                            data_sources.append('futu')
+                                        else:
+                                            futu_failed = True
+                                    else:
+                                        futu_failed = True
+                                except asyncio.TimeoutError:
+                                    futu_failed = True
+                                    logger.warning(
+                                        "refresh_holdings_futu_iv_timeout symbol=%s ticker=%s timeout_seconds=%s",
+                                        symbol.upper(),
+                                        ticker,
+                                        futu_iv_timeout_seconds,
+                                    )
+                                except Exception as e:
+                                    futu_failed = True
+                                    logger.warning(f"Failed to get IV data for {holding.ticker}: {e}")
+
+                                if futu_failed:
+                                    async with futu_state_lock:
+                                        futu_failure_count += 1
+                                        if futu_failure_count >= futu_failure_threshold:
+                                            futu_skip_remaining = True
+                                            if not futu_circuit_open_logged:
+                                                futu_circuit_open_logged = True
+                                                logger.warning(
+                                                    "refresh_holdings_futu_circuit_open symbol=%s coverage=%s failures=%s",
+                                                    symbol.upper(),
+                                                    coverage_label,
+                                                    futu_failure_count,
+                                                )
+                                                if progress_token:
+                                                    _patch_holdings_refresh_progress(
+                                                        progress_token,
+                                                        {
+                                                            "message": "Futu 连接不稳定，后续标的将跳过期权数据以加快完成。",
+                                                        },
+                                                    )
+                    else:
+                        futu_failed = True
 
                 data_sources = list(dict.fromkeys(data_sources))
 
@@ -2070,6 +2146,7 @@ async def refresh_holdings_by_coverage(
                     "_log_idx": idx,
                     "_log_total": total_count,
                     "_log_ibkr": ibkr_price_log,
+                    "_futu_failed": futu_failed,
                 }
 
             except Exception as e:
@@ -2106,6 +2183,7 @@ async def refresh_holdings_by_coverage(
                     "_log_idx": idx,
                     "_log_total": total_count,
                     "_log_ibkr": "N/A (fetch_failed)",
+                    "_futu_failed": False,
                 }
 
     # 并发获取所有股票数据（按完成顺序处理，便于前端实时读取进度）
@@ -2116,6 +2194,7 @@ async def refresh_holdings_by_coverage(
 
     # 计算数据完整度
     completeness_calculator = DataCompletenessCalculator(db)
+    futu_failed_count = 0
 
     for future in asyncio.as_completed(fetch_tasks):
         try:
@@ -2142,6 +2221,9 @@ async def refresh_holdings_by_coverage(
             log_idx = int(result.pop('_log_idx', 0) or 0)
             log_total = int(result.pop('_log_total', total_targets) or total_targets)
             ibkr_price_log = str(result.pop('_log_ibkr', 'N/A'))
+            futu_failed_flag = bool(result.pop('_futu_failed', False))
+            if futu_failed_flag:
+                futu_failed_count += 1
             if progress_token:
                 _patch_holdings_refresh_progress(
                     progress_token,
@@ -2604,6 +2686,8 @@ async def refresh_holdings_by_coverage(
 
     total_weight = sum(h.weight for h in filtered_holdings)
     final_message = f"已刷新 {len(filtered_holdings)} 只持仓股票数据，平均完备度 {round(coverage_completeness.average_completeness, 1)}%"
+    if futu_failed_count > 0:
+        final_message += f"（Futu 期权数据部分缺失 {futu_failed_count} 只）"
 
     if progress_token:
         _patch_holdings_refresh_progress(
@@ -2624,6 +2708,7 @@ async def refresh_holdings_by_coverage(
         "coverage": coverage_label,
         "stocks_count": len(filtered_holdings),
         "total_weight": round(total_weight, 2),
+        "futu_failed_count": futu_failed_count,
         "completeness": coverage_completeness.to_dict(),
         "updated_stocks": updated_stocks,
         "updated_at": _utc_now_iso(),

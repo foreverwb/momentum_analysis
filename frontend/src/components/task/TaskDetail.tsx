@@ -245,6 +245,32 @@ const normalizeEtfs = (raw: unknown): string[] => {
   return [];
 };
 
+const dedupeSymbols = (symbols: string[]): string[] => {
+  const ordered: string[] = [];
+  symbols.forEach((symbol) => {
+    const normalized = symbol.trim().toUpperCase();
+    if (!normalized || ordered.includes(normalized)) return;
+    ordered.push(normalized);
+  });
+  return ordered;
+};
+
+const resolveMonitoredEtfs = (
+  rawEtfs: unknown,
+  taskType: Task['type'],
+  sector?: string
+): string[] => {
+  const normalizedEtfs = dedupeSymbols(normalizeEtfs(rawEtfs));
+  if (taskType !== 'drilldown') {
+    return normalizedEtfs;
+  }
+  const sectorSymbol = (sector || '').trim().toUpperCase();
+  if (!sectorSymbol) {
+    return normalizedEtfs;
+  }
+  return [sectorSymbol, ...normalizedEtfs.filter((symbol) => symbol !== sectorSymbol)];
+};
+
 const normalizeBaseIndices = (raw: unknown): string[] => {
   if (Array.isArray(raw)) {
     const deduped = Array.from(
@@ -321,7 +347,9 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
   const [selectedETF, setSelectedETF] = useState<string>('');
   const [selectedCoverage, setSelectedCoverage] = useState<string | undefined>();
   const [coverageRangesByETF, setCoverageRangesByETF] = useState<Record<string, string[]>>({});
-  const [resolvedEtfs, setResolvedEtfs] = useState<string[]>(() => normalizeEtfs(task.etfs));
+  const [resolvedEtfs, setResolvedEtfs] = useState<string[]>(
+    () => resolveMonitoredEtfs(task.etfs, task.type, task.sector)
+  );
   const resolvedEtfsKey = useMemo(() => getSymbolsKey(resolvedEtfs), [resolvedEtfs]);
   const taskBaseIndices = useMemo(
     () => normalizeBaseIndices(task.baseIndices ?? task.baseIndex),
@@ -437,16 +465,13 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
   };
 
   useEffect(() => {
-    const normalized = normalizeEtfs(task.etfs);
-    if (!(Array.isArray(task.etfs) || typeof task.etfs === 'string')) {
-      return;
-    }
+    const normalized = resolveMonitoredEtfs(task.etfs, task.type, task.sector);
     setResolvedEtfs((prev) => {
       const prevKey = getSymbolsKey(prev);
       const nextKey = getSymbolsKey(normalized);
       return prevKey === nextKey ? prev : normalized;
     });
-  }, [task.etfs]);
+  }, [task.etfs, task.type, task.sector]);
 
   useEffect(() => {
     setSourceUpdatedAtMap(loadStoredSourceUpdatedAt(task.id));
@@ -478,7 +503,11 @@ export function TaskDetail({ task, onBack }: TaskDetailProps) {
       try {
         const latestTask = await api.getTaskById(task.id);
         if (cancelled) return;
-        const normalized = normalizeEtfs(latestTask?.etfs);
+        const normalized = resolveMonitoredEtfs(
+          latestTask?.etfs,
+          latestTask?.type ?? task.type,
+          latestTask?.sector ?? task.sector
+        );
         if (normalized.length) {
           setResolvedEtfs(normalized);
         } else {

@@ -73,6 +73,25 @@ def _normalize_base_indices(raw: Any) -> List[str]:
     return deduped or ["SPY"]
 
 
+def _task_monitored_etf_symbols(task: Task) -> List[str]:
+    """
+    返回任务详情页应监控的 ETF 列表。
+    - 默认使用 task.etfs
+    - drilldown 任务额外包含 task.sector（若存在），并置于首位
+    """
+    symbols = _normalize_symbols(task.etfs)
+    if str(task.type or "").lower() == "drilldown" and task.sector:
+        sector_symbol = str(task.sector).strip().upper()
+        if sector_symbol:
+            symbols = [sector_symbol] + symbols
+
+    deduped: List[str] = []
+    for symbol in symbols:
+        if symbol and symbol not in deduped:
+            deduped.append(symbol)
+    return deduped
+
+
 def _load_price_history(db: Session, symbol: str, min_rows: int = 60) -> Optional[pd.DataFrame]:
     rows = db.query(PriceHistory).filter(
         PriceHistory.symbol == symbol.upper()
@@ -341,7 +360,9 @@ async def refresh_all_etfs(task_id: int, db: Session = Depends(get_db)):
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    if not task.etfs:
+    etf_symbols = _task_monitored_etf_symbols(task)
+
+    if not etf_symbols:
         refresh_finished_at = datetime.utcnow()
         task.updated_at = refresh_finished_at
         db.commit()
@@ -359,7 +380,7 @@ async def refresh_all_etfs(task_id: int, db: Session = Depends(get_db)):
     results = []
     failed_count = 0
 
-    for symbol in task.etfs:
+    for symbol in etf_symbols:
         try:
             result = await refresh_etf_data(symbol, db)
             results.append(result)
@@ -383,11 +404,11 @@ async def refresh_all_etfs(task_id: int, db: Session = Depends(get_db)):
     return {
         "status": "success" if failed_count == 0 else "partial_success",
         "task_id": task_id,
-        "total": len(task.etfs),
-        "completed": len(task.etfs) - failed_count,
+        "total": len(etf_symbols),
+        "completed": len(etf_symbols) - failed_count,
         "failed": failed_count,
         "results": results,
-        "message": f"刷新完成: {len(task.etfs) - failed_count} 成功, {failed_count} 失败",
+        "message": f"刷新完成: {len(etf_symbols) - failed_count} 成功, {failed_count} 失败",
         "updated_at": refresh_finished_at.isoformat(),
     }
 
@@ -638,7 +659,7 @@ async def websocket_refresh_stream(websocket: WebSocket, task_id: int, db: Sessi
             await websocket.close()
             return
 
-        etf_symbols = task.etfs or []
+        etf_symbols = _task_monitored_etf_symbols(task)
 
         # 如果没有 ETF，直接完成
         if not etf_symbols:
