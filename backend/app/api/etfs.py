@@ -15,7 +15,7 @@ import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 from datetime import date, datetime, timedelta, timezone
 from time import perf_counter
 from pydantic import BaseModel
@@ -24,7 +24,16 @@ from app.models import (
     get_db, ETF, ETFHolding, VALID_SECTOR_SYMBOLS, Stock, ImportedData,
     PriceHistory, IVData, ScoreSnapshot
 )
+from app.api.series_utils import resolve_latest_trade_date
 from app.core.broker_config import load_broker_config
+from app.core.time_utils import (
+    beijing_today,
+    format_beijing_datetime,
+    get_beijing_cutoff_boundary,
+    utc_isoformat,
+    utc_now_iso as core_utc_now_iso,
+    utc_now_naive,
+)
 from app.services.parsers import normalize_heat_type
 
 router = APIRouter()
@@ -55,13 +64,14 @@ ETF_REFRESH_COOLDOWN_MINUTES = _refresh_config.etf_cooldown_minutes
 ETF_REFRESH_COOLDOWN = timedelta(minutes=ETF_REFRESH_COOLDOWN_MINUTES)
 HOLDINGS_REFRESH_COOLDOWN_MINUTES = _refresh_config.holdings_cooldown_minutes
 HOLDINGS_REFRESH_COOLDOWN = timedelta(minutes=HOLDINGS_REFRESH_COOLDOWN_MINUTES)
+HOLDINGS_FUTU_BATCH_SYMBOLS = 4
 _HOLDINGS_REFRESH_PROGRESS: Dict[str, Dict[str, Any]] = {}
 _HOLDINGS_REFRESH_PROGRESS_LOCK = threading.Lock()
 _SHARE_CLASS_ALIAS_PATTERN = re.compile(r"^([A-Z][A-Z0-9]{0,5})[.-]([A-Z])$")
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return core_utc_now_iso()
 
 
 def _normalize_progress_token(value: Optional[str]) -> Optional[str]:
@@ -199,16 +209,7 @@ def _iso_utc(value: Optional[datetime]) -> Optional[str]:
 
 
 def _beijing_import_boundary(now_utc: Optional[datetime] = None) -> Dict[str, Any]:
-    now_dt = _coerce_datetime(now_utc) or datetime.utcnow()
-    now_beijing = now_dt + timedelta(hours=8)
-    boundary_beijing = now_beijing.replace(hour=8, minute=0, second=0, microsecond=0)
-    if now_beijing < boundary_beijing:
-        boundary_beijing -= timedelta(days=1)
-    return {
-        "boundary_utc": boundary_beijing - timedelta(hours=8),
-        "boundary_date": boundary_beijing.date(),
-        "boundary_beijing": boundary_beijing,
-    }
+    return get_beijing_cutoff_boundary(_coerce_datetime(now_utc))
 
 
 def _is_fresh_for_boundary(
@@ -345,10 +346,7 @@ def _build_etf_source_updated_at(
 
 
 def _format_beijing_time(value: Optional[datetime]) -> Optional[str]:
-    dt = _coerce_datetime(value)
-    if dt is None:
-        return None
-    return (dt + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
+    return format_beijing_datetime(_coerce_datetime(value))
 
 
 def _build_refresh_gate_state(
@@ -357,7 +355,7 @@ def _build_refresh_gate_state(
     cooldown: Optional[timedelta] = None,
 ) -> Dict[str, Any]:
     cooldown_window = cooldown or ETF_REFRESH_COOLDOWN
-    now_dt = _coerce_datetime(now_utc) or datetime.utcnow()
+    now_dt = _coerce_datetime(now_utc) or utc_now_naive()
     latest_dt = _coerce_datetime(latest_at)
     if latest_dt is None:
         return {
@@ -406,6 +404,41 @@ def _build_refresh_gate_payload(state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _normalize_refresh_source(value: Any) -> Literal["all", "ibkr", "futu"]:
+    token = str(value or "all").strip().lower()
+    if token in {"ibkr", "futu"}:
+        return token
+    return "all"
+
+
+def _refresh_source_label(refresh_source: Literal["all", "ibkr", "futu"]) -> str:
+    if refresh_source == "ibkr":
+        return "IBKR"
+    if refresh_source == "futu":
+        return "Futu"
+    return "IBKR 与 Futu"
+
+
+def _refresh_source_data_label(refresh_source: Literal["all", "ibkr", "futu"]) -> str:
+    if refresh_source == "ibkr":
+        return "市场数据"
+    if refresh_source == "futu":
+        return "期权数据"
+    return "市场+期权数据"
+
+
+def _selected_refresh_gate_states(
+    refresh_source: Literal["all", "ibkr", "futu"],
+    ibkr_gate_state: Dict[str, Any],
+    futu_gate_state: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    if refresh_source == "ibkr":
+        return [ibkr_gate_state]
+    if refresh_source == "futu":
+        return [futu_gate_state]
+    return [ibkr_gate_state, futu_gate_state]
+
+
 def _filter_holdings_by_coverage(
     holdings: List[ETFHolding],
     coverage_type: str,
@@ -435,13 +468,82 @@ def _format_coverage_label(coverage_type: str, coverage_value: int) -> str:
     return f"{coverage_kind}{coverage_value}"
 
 
+def _normalize_coverage_label(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return None
+    if normalized == "all" or normalized in COVERAGE_RANGE_PRIORITY:
+        return normalized
+    return None
+
+
+def _parse_persisted_coverage_ranges(raw_value: Any) -> List[str]:
+    raw_items: List[Any] = []
+    if isinstance(raw_value, list):
+        raw_items = raw_value
+    elif isinstance(raw_value, str):
+        try:
+            parsed = json.loads(raw_value)
+            if isinstance(parsed, list):
+                raw_items = parsed
+            else:
+                raw_items = [raw_value]
+        except Exception:
+            raw_items = [raw_value]
+
+    normalized_ranges: List[str] = []
+    seen = set()
+    for item in raw_items:
+        normalized = _normalize_coverage_label(item if isinstance(item, str) else None)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            normalized_ranges.append(normalized)
+    return normalized_ranges
+
+
+def _promote_etf_coverage_range(etf: Optional[ETF], coverage_label: Optional[str]) -> Optional[str]:
+    if etf is None:
+        return None
+    normalized = _normalize_coverage_label(coverage_label)
+    if not normalized:
+        return None
+
+    existing_ranges = _parse_persisted_coverage_ranges(getattr(etf, "coverage_ranges", None))
+    ordered_ranges = [normalized, *[item for item in existing_ranges if item != normalized]]
+    if ordered_ranges != existing_ranges:
+        etf.coverage_ranges = ordered_ranges
+    return normalized
+
+
 class HoldingsCoverageRequest(BaseModel):
     coverage_type: str
     coverage_value: int
     sources: Optional[List[str]] = None
+    refresh_source: Literal["all", "ibkr", "futu"] = "all"
     concurrent: Optional[bool] = None
     progress_token: Optional[str] = None
     related_etf_symbols: Optional[List[str]] = None
+    exclude_symbols: Optional[List[str]] = None
+
+
+def _normalize_symbol_list(values: Any) -> List[str]:
+    normalized: List[str] = []
+    seen: set[str] = set()
+    if not isinstance(values, list):
+        return normalized
+
+    for value in values:
+        text = str(value or "").strip().upper()
+        if not text:
+            continue
+        canonical = _canonical_symbol_key(text)
+        if not canonical or canonical in seen:
+            continue
+        seen.add(canonical)
+        normalized.append(canonical)
+    return normalized
 
 
 def _default_etf_score_result() -> Dict[str, Dict[str, Any]]:
@@ -477,6 +579,43 @@ def _load_etf_score_result(payload: Any) -> Dict[str, Dict[str, Any]]:
     for key in score_result:
         score_result[key] = _normalize_etf_dimension(score_result[key], payload.get(key))
     return score_result
+
+
+def _build_existing_etf_score_view(
+    etf: ETF,
+    latest_snapshot: Optional[ScoreSnapshot],
+    *,
+    latest_ibkr_created_at: Optional[datetime] = None,
+    latest_futu_created_at: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    from app.services.calculators.etf_score import ETFScoreCalculator
+
+    score_result = _load_etf_score_result(
+        latest_snapshot.score_breakdown if latest_snapshot and isinstance(latest_snapshot.score_breakdown, dict) else None
+    )
+    calculator = ETFScoreCalculator()
+    thresholds_payload = calculator.check_thresholds(
+        rel_mom_data=score_result["rel_mom"],
+        trend_data=score_result["trend_quality"],
+        breadth_data=score_result["breadth"],
+    )
+    normalized_sources = {
+        "ibkr_price": latest_ibkr_created_at is not None,
+        "ibkr_relmom": score_result["rel_mom"].get("data") is not None,
+        "ibkr_trend": score_result["trend_quality"].get("data") is not None,
+        "futu_iv": latest_futu_created_at is not None or score_result["options_confirm"].get("data") is not None,
+        "finviz_breadth": score_result["breadth"].get("data") is not None,
+        "mc_options": False,
+    }
+    return {
+        "score": etf.score,
+        "rank": etf.rank,
+        "completeness": etf.completeness,
+        "thresholds_pass": latest_snapshot.thresholds_pass if latest_snapshot else bool(thresholds_payload.get("all_pass")),
+        "thresholds": thresholds_payload.get("details") or {},
+        "breakdown": score_result,
+        "data_sources": normalized_sources,
+    }
 
 
 def _get_latest_import_payload(
@@ -549,6 +688,175 @@ def _compute_snapshot_deltas(
     return {"delta3d": delta3d, "delta5d": delta5d}
 
 
+def _load_price_history_frame(
+    db: Session,
+    symbol: str,
+    *,
+    min_rows: int = 1,
+    source: str = "ibkr",
+) -> Optional[pd.DataFrame]:
+    rows = db.query(PriceHistory).filter(
+        PriceHistory.symbol == symbol.upper(),
+        PriceHistory.source == source,
+    ).order_by(PriceHistory.date.asc()).all()
+    if len(rows) < min_rows:
+        return None
+    return pd.DataFrame(
+        [
+            {
+                "date": row.date,
+                "open": row.open,
+                "high": row.high,
+                "low": row.low,
+                "close": row.close,
+                "volume": row.volume,
+            }
+            for row in rows
+        ]
+    )
+
+
+def _build_rel_mom_dimension(relmom_result: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(relmom_result, dict) or relmom_result.get("error"):
+        return None
+
+    rel_mom_raw = relmom_result.get("RelMom")
+    if not isinstance(rel_mom_raw, (int, float)):
+        return None
+
+    rel_mom = float(rel_mom_raw)
+    rel_mom_score = (rel_mom + 0.1) / 0.25 * 100
+    rel_mom_score = min(100.0, max(0.0, rel_mom_score))
+
+    strength = "NEUTRAL"
+    description = "中性,与大盘同步"
+    if rel_mom > 0.05:
+        strength = "STRONG"
+        description = "强势，显著跑赢大盘"
+    elif rel_mom > 0.02:
+        strength = "MODERATE_STRONG"
+        description = "较强,略微跑赢大盘"
+    elif rel_mom > -0.02:
+        strength = "NEUTRAL"
+        description = "中性,与大盘同步"
+    elif rel_mom > -0.05:
+        strength = "MODERATE_WEAK"
+        description = "较弱,略微跑输大盘"
+    else:
+        strength = "WEAK"
+        description = "弱势,显著跑输大盘"
+
+    return {
+        "score": round(rel_mom_score, 2),
+        "data": {
+            "RS": relmom_result.get("RS"),
+            "RS_5D": relmom_result.get("RS_5D"),
+            "RS_20D": relmom_result.get("RS_20D"),
+            "RS_63D": relmom_result.get("RS_63D"),
+            "RelMom": rel_mom,
+            "strength": strength,
+            "description": description,
+        },
+    }
+
+
+def _build_trend_quality_dimension(price_df: Optional[pd.DataFrame]) -> Optional[Dict[str, Any]]:
+    from app.services.calculators.technical import calculate_sma, calculate_sma_slope, calculate_max_drawdown
+
+    if price_df is None or price_df.empty or "close" not in price_df.columns or len(price_df) < 50:
+        return None
+
+    prices = pd.to_numeric(price_df["close"], errors="coerce").dropna().reset_index(drop=True)
+    if len(prices) < 50:
+        return None
+
+    sma20 = calculate_sma(prices, 20)
+    sma50 = calculate_sma(prices, 50)
+
+    current_price = float(prices.iloc[-1])
+    current_sma20 = float(sma20.iloc[-1])
+    current_sma50 = float(sma50.iloc[-1])
+    price_above_sma50 = current_price > current_sma50
+    sma20_above_sma50 = current_sma20 > current_sma50
+    sma20_slope = float(calculate_sma_slope(sma20, period=5))
+    max_dd = float(calculate_max_drawdown(prices, 20))
+
+    trend_score = 0.0
+    if price_above_sma50:
+        trend_score += 25.0
+    if sma20_above_sma50:
+        trend_score += 25.0
+    if sma20_slope > 0:
+        trend_score += 25.0
+    if max_dd > -0.10:
+        trend_score += 25.0
+
+    return {
+        "score": round(trend_score, 2),
+        "data": {
+            "price": round(current_price, 2),
+            "sma20": round(current_sma20, 2),
+            "sma50": round(current_sma50, 2),
+            "price_above_sma50": price_above_sma50,
+            "sma20_above_sma50": sma20_above_sma50,
+            "sma20_slope": round(sma20_slope, 4),
+            "max_drawdown_20d": round(max_dd, 4),
+        },
+    }
+
+
+def _backfill_etf_price_dimensions_from_db(
+    db: Session,
+    symbol: str,
+    score_result: Dict[str, Dict[str, Any]],
+    data_sources: Dict[str, bool],
+    *,
+    benchmark: str = "SPY",
+) -> None:
+    needs_rel_mom = score_result["rel_mom"].get("data") is None
+    needs_trend = score_result["trend_quality"].get("data") is None
+    if not needs_rel_mom and not needs_trend:
+        return
+
+    price_df = _load_price_history_frame(db, symbol, min_rows=50, source="ibkr")
+    if price_df is None:
+        return
+
+    data_sources["ibkr_price"] = True
+
+    if needs_trend:
+        trend_result = _build_trend_quality_dimension(price_df)
+        if trend_result is not None:
+            score_result["trend_quality"] = _normalize_etf_dimension(
+                score_result["trend_quality"],
+                trend_result,
+            )
+            data_sources["ibkr_trend"] = True
+
+    if needs_rel_mom:
+        benchmark_df = _load_price_history_frame(db, benchmark, min_rows=64, source="ibkr")
+        if benchmark_df is None:
+            return
+        try:
+            from app.services.calculators.momentum import MomentumCalculator
+
+            relmom_result = MomentumCalculator.calculate_relative_momentum(
+                price_df[["date", "close"]],
+                benchmark_df[["date", "close"]],
+            )
+        except Exception as exc:
+            logger.warning("etf_relmom_backfill_failed symbol=%s benchmark=%s error=%s", symbol, benchmark, str(exc))
+            return
+
+        rel_mom_dimension = _build_rel_mom_dimension(relmom_result)
+        if rel_mom_dimension is not None:
+            score_result["rel_mom"] = _normalize_etf_dimension(
+                score_result["rel_mom"],
+                rel_mom_dimension,
+            )
+            data_sources["ibkr_relmom"] = True
+
+
 def _recalculate_etf_score_from_db(
     etf: ETF,
     db: Session,
@@ -595,6 +903,8 @@ def _recalculate_etf_score_from_db(
         for key in data_sources:
             if key in base_data_sources:
                 data_sources[key] = bool(base_data_sources[key])
+
+    _backfill_etf_price_dimensions_from_db(db, etf.symbol, score_result, data_sources)
 
     holdings = _get_latest_etf_holdings(db, etf.symbol)
     if holdings:
@@ -647,13 +957,16 @@ def _recalculate_etf_score_from_db(
 
     etf.score = total_score
     etf.completeness = completeness
-    etf.updated_at = datetime.utcnow()
+    etf.updated_at = utc_now_naive()
 
-    today = date.today()
+    snapshot_date = resolve_latest_trade_date(
+        db.query(func.max(PriceHistory.date)).filter(PriceHistory.symbol == etf.symbol).scalar(),
+        fallback=beijing_today(),
+    ) or beijing_today()
     existing_snapshot = db.query(ScoreSnapshot).filter(
         ScoreSnapshot.symbol == etf.symbol,
         ScoreSnapshot.symbol_type == 'etf',
-        ScoreSnapshot.date == today,
+        ScoreSnapshot.date == snapshot_date,
     ).first()
 
     if existing_snapshot:
@@ -664,7 +977,7 @@ def _recalculate_etf_score_from_db(
         db.add(ScoreSnapshot(
             symbol=etf.symbol,
             symbol_type='etf',
-            date=today,
+            date=snapshot_date,
             total_score=total_score,
             score_breakdown=score_result,
             thresholds_pass=thresholds_pass,
@@ -698,31 +1011,17 @@ def format_etf_response(etf: ETF, include_holdings: bool = False, db: Session = 
     """格式化 ETF 响应数据"""
 
     # coverageRanges = 持久化导入范围 + 持仓动态推导范围（去重并按优先级排序）
-    coverage_ranges: List[str] = []
     coverage_seen = set()
+    persisted_coverage_ranges = _parse_persisted_coverage_ranges(getattr(etf, 'coverage_ranges', None))
+    preferred_coverage = persisted_coverage_ranges[0] if persisted_coverage_ranges else None
 
     def add_coverage(value: Optional[str]):
-        if not value:
-            return
-        normalized = str(value).strip().lower()
-        if normalized in COVERAGE_RANGE_PRIORITY and normalized not in coverage_seen:
+        normalized = _normalize_coverage_label(value)
+        if normalized and normalized not in coverage_seen:
             coverage_seen.add(normalized)
-            coverage_ranges.append(normalized)
 
-    persisted_ranges = getattr(etf, 'coverage_ranges', None)
-    if isinstance(persisted_ranges, list):
-        for item in persisted_ranges:
-            add_coverage(item if isinstance(item, str) else None)
-    elif isinstance(persisted_ranges, str):
-        parsed_ranges: List[str] = []
-        try:
-            parsed = json.loads(persisted_ranges)
-            if isinstance(parsed, list):
-                parsed_ranges = [str(item) for item in parsed if isinstance(item, str)]
-        except Exception:
-            parsed_ranges = []
-        for item in parsed_ranges:
-            add_coverage(item)
+    for item in persisted_coverage_ranges:
+        add_coverage(item)
 
     # 从持仓数据动态计算 coverageRanges
     if etf.holdings:
@@ -765,10 +1064,11 @@ def format_etf_response(etf: ETF, include_holdings: bool = False, db: Session = 
         "completeness": etf.completeness or 0.0,
         "holdingsCount": etf.holdings_count or 0,
         "coverageRanges": ordered_coverage_ranges,
+        "preferredCoverage": preferred_coverage,
         "sourceUpdatedAt": _build_etf_source_updated_at(etf.symbol, db),
         # 兼容旧字段(lastUpdated)并提供统一字段(updatedAt)
-        "updatedAt": etf.updated_at.isoformat() if etf.updated_at else None,
-        "lastUpdated": etf.updated_at.isoformat() if etf.updated_at else None,
+        "updatedAt": utc_isoformat(etf.updated_at),
+        "lastUpdated": utc_isoformat(etf.updated_at),
     }
 
     if etf.type == "industry" and etf.parent_sector:
@@ -828,13 +1128,9 @@ def format_etf_response(etf: ETF, include_holdings: bool = False, db: Session = 
                             stock_price_map[resolved_ticker] = stock_price_value
 
                         # 北京时间 08:00 为日切边界
-                        now_utc = datetime.utcnow()
-                        now_beijing = now_utc + timedelta(hours=8)
-                        boundary_beijing = now_beijing.replace(hour=8, minute=0, second=0, microsecond=0)
-                        if now_beijing < boundary_beijing:
-                            boundary_beijing -= timedelta(days=1)
-                        boundary_utc = boundary_beijing - timedelta(hours=8)
-                        boundary_date = boundary_beijing.date()
+                        boundary = get_beijing_cutoff_boundary()
+                        boundary_utc = boundary["boundary_utc"]
+                        boundary_date = boundary["boundary_date"]
 
                         source_map = {
                             ticker: {
@@ -1306,6 +1602,7 @@ async def get_valid_sector_symbols():
 @router.post("/symbol/{symbol}/refresh", response_model=dict)
 async def refresh_etf_data(
     symbol: str,
+    refresh_source: Literal["all", "ibkr", "futu"] = "all",
     db: Session = Depends(get_db)
 ):
     """
@@ -1330,6 +1627,10 @@ async def refresh_etf_data(
     
     if not etf:
         raise HTTPException(status_code=404, detail=f"ETF '{symbol}' not found")
+
+    refresh_source = _normalize_refresh_source(refresh_source)
+    refresh_ibkr = refresh_source in {"all", "ibkr"}
+    refresh_futu = refresh_source in {"all", "futu"}
     
     # 跟踪数据完整性
     data_sources = {
@@ -1351,7 +1652,7 @@ async def refresh_etf_data(
     if latest_snapshot and isinstance(latest_snapshot.score_breakdown, dict):
         score_result = _load_etf_score_result(latest_snapshot.score_breakdown)
 
-    now_utc = datetime.utcnow()
+    now_utc = utc_now_naive()
     latest_ibkr_created_at = _coerce_datetime(
         db.query(func.max(PriceHistory.created_at)).filter(
             PriceHistory.symbol == etf.symbol,
@@ -1371,11 +1672,13 @@ async def refresh_etf_data(
         and score_result['trend_quality'].get('data') is not None
     )
     has_cached_futu_breakdown = score_result['options_confirm'].get('data') is not None
-    skip_ibkr_refresh = bool(ibkr_gate_state.get("is_recent")) and has_cached_ibkr_breakdown
-    skip_futu_refresh = bool(futu_gate_state.get("is_recent")) and (
+    skip_ibkr_refresh = refresh_ibkr and bool(ibkr_gate_state.get("is_recent")) and has_cached_ibkr_breakdown
+    skip_futu_refresh = refresh_futu and bool(futu_gate_state.get("is_recent")) and (
         has_cached_futu_breakdown or latest_futu_created_at is not None
     )
-    next_refresh_at = _pick_next_refresh_at([ibkr_gate_state, futu_gate_state])
+    next_refresh_at = _pick_next_refresh_at(
+        _selected_refresh_gate_states(refresh_source, ibkr_gate_state, futu_gate_state)
+    )
 
     if skip_ibkr_refresh:
         data_sources['ibkr_price'] = latest_ibkr_created_at is not None
@@ -1387,21 +1690,49 @@ async def refresh_etf_data(
             or score_result['options_confirm'].get('data') is not None
         )
 
-    if skip_ibkr_refresh and skip_futu_refresh:
+    if (not refresh_ibkr or skip_ibkr_refresh) and (not refresh_futu or skip_futu_refresh):
+        next_refresh_bjt = _format_beijing_time(next_refresh_at)
+        skip_message = (
+            f"{_refresh_source_label(refresh_source)} 数据在 {ETF_REFRESH_COOLDOWN_MINUTES} 分钟内已刷新，已跳过。"
+            + (f"下次可刷新时间（北京时间）{next_refresh_bjt}" if next_refresh_bjt else "")
+        )
+        if refresh_source == "ibkr":
+            current_view = _build_existing_etf_score_view(
+                etf,
+                latest_snapshot,
+                latest_ibkr_created_at=latest_ibkr_created_at,
+                latest_futu_created_at=latest_futu_created_at,
+            )
+            return {
+                "status": "snapshot",
+                "symbol": etf.symbol,
+                "refresh_source": refresh_source,
+                "message": skip_message,
+                "score": current_view["score"],
+                "rank": current_view["rank"],
+                "completeness": current_view["completeness"],
+                "thresholds_pass": current_view["thresholds_pass"],
+                "thresholds": current_view["thresholds"],
+                "breakdown": current_view["breakdown"],
+                "data_sources": current_view["data_sources"],
+                "next_refresh_at": _iso_utc(next_refresh_at),
+                "refresh_gate": {
+                    "cooldown_minutes": ETF_REFRESH_COOLDOWN_MINUTES,
+                    "ibkr": _build_refresh_gate_payload(ibkr_gate_state),
+                    "futu": _build_refresh_gate_payload(futu_gate_state),
+                },
+                "warnings": [skip_message],
+            }
         recalculated = _recalculate_etf_score_from_db(
             etf,
             db,
             base_breakdown=score_result,
             base_data_sources=data_sources,
         )
-        next_refresh_bjt = _format_beijing_time(next_refresh_at)
-        skip_message = (
-            f"IBKR 与 Futu 数据在 {ETF_REFRESH_COOLDOWN_MINUTES} 分钟内已刷新，已跳过。"
-            + (f"下次可刷新时间（北京时间）{next_refresh_bjt}" if next_refresh_bjt else "")
-        )
         return {
             "status": "snapshot",
             "symbol": etf.symbol,
+            "refresh_source": refresh_source,
             "message": skip_message,
             "score": recalculated["score"],
             "rank": recalculated["rank"],
@@ -1419,13 +1750,13 @@ async def refresh_etf_data(
         }
 
     warnings = []
-    if skip_ibkr_refresh:
+    if refresh_ibkr and skip_ibkr_refresh:
         next_ibkr_text = _format_beijing_time(_coerce_datetime(ibkr_gate_state.get("next_refresh_at")))
         warnings.append(
             f"IBKR 数据在 {ETF_REFRESH_COOLDOWN_MINUTES} 分钟内已刷新，跳过 IBKR 拉取"
             + (f"（北京时间可刷新时间 {next_ibkr_text}）" if next_ibkr_text else "")
         )
-    if skip_futu_refresh:
+    if refresh_futu and skip_futu_refresh:
         next_futu_text = _format_beijing_time(_coerce_datetime(futu_gate_state.get("next_refresh_at")))
         warnings.append(
             f"Futu 数据在 {ETF_REFRESH_COOLDOWN_MINUTES} 分钟内已刷新，跳过 Futu 拉取"
@@ -1437,9 +1768,9 @@ async def refresh_etf_data(
 
     price_df = None
     ibkr_started_at = perf_counter()
-    ibkr_price_log = "N/A (not_started)"
-    ibkr_relmom_log = "N/A (not_started)"
-    ibkr_trend_log = "N/A (not_started)"
+    ibkr_price_log = "N/A (not_requested)"
+    ibkr_relmom_log = "N/A (not_requested)"
+    ibkr_trend_log = "N/A (not_requested)"
 
     def _fmt_float(value: Optional[Any], digits: int = 2) -> str:
         if isinstance(value, (int, float)):
@@ -1450,8 +1781,8 @@ async def refresh_etf_data(
     ibkr_status = broker_status.get('ibkr', {})
     ibkr_connected = ibkr_status.get('is_connected', False)
     ibkr_disconnect_reason = ibkr_status.get('last_error')
-    
-    if (not skip_ibkr_refresh) and (not ibkr_connected):
+
+    if refresh_ibkr and (not skip_ibkr_refresh) and (not ibkr_connected):
         # 尝试连接 IBKR
         try:
             ibkr_connected = await orchestrator.connect_ibkr()
@@ -1463,7 +1794,9 @@ async def refresh_etf_data(
             warnings.append(f"IBKR 连接失败: {str(e)}")
             ibkr_disconnect_reason = str(e)
     
-    if skip_ibkr_refresh:
+    if not refresh_ibkr:
+        pass
+    elif skip_ibkr_refresh:
         ibkr_refresh_time = _format_beijing_time(_coerce_datetime(ibkr_gate_state.get("next_refresh_at")))
         ibkr_price_log = (
             f"N/A (skip_cooldown_until_bjt={ibkr_refresh_time})"
@@ -1481,16 +1814,16 @@ async def refresh_etf_data(
                 ibkr_rows = len(price_df)
                 ibkr_new_rows = 0
                 last_date = price_df['date'].iloc[-1]
+                last_row_date = last_date.date() if hasattr(last_date, 'date') else last_date
                 last_date_str = (
                     last_date.strftime('%Y-%m-%d')
                     if hasattr(last_date, 'strftime')
                     else str(last_date)
                 )
                 last_close = price_df['close'].iloc[-1]
+                refreshed_at = utc_now_naive()
                 
                 # 保存价格数据到数据库
-                from datetime import date as date_type
-                today = date_type.today()
                 for _, row in price_df.iterrows():
                     try:
                         row_date = row['date'].date() if hasattr(row['date'], 'date') else row['date']
@@ -1498,6 +1831,19 @@ async def refresh_etf_data(
                             PriceHistory.symbol == etf.symbol,
                             PriceHistory.date == row_date
                         ).first()
+                        if existing:
+                            if row_date == last_row_date:
+                                # Reuse the existing latest bar but refresh its timestamp so
+                                # task/source status reflects a successful intraday pull even
+                                # when IBKR returns the same latest trading day.
+                                existing.open = float(row['open'])
+                                existing.high = float(row['high'])
+                                existing.low = float(row['low'])
+                                existing.close = float(row['close'])
+                                existing.volume = int(row['volume'])
+                                existing.source = 'ibkr'
+                                existing.created_at = refreshed_at
+                            continue
                         if not existing:
                             price_record = PriceHistory(
                                 symbol=etf.symbol,
@@ -1507,7 +1853,8 @@ async def refresh_etf_data(
                                 low=float(row['low']),
                                 close=float(row['close']),
                                 volume=int(row['volume']),
-                                source='ibkr'
+                                source='ibkr',
+                                created_at=refreshed_at,
                             )
                             db.add(price_record)
                             ibkr_new_rows += 1
@@ -1663,8 +2010,8 @@ async def refresh_etf_data(
     
     # ==================== 2. 从 Futu 获取 IV 数据 ====================
     futu_connected = broker_status.get('futu', {}).get('is_connected', False)
-    
-    if (not skip_futu_refresh) and (not futu_connected):
+
+    if refresh_futu and (not skip_futu_refresh) and (not futu_connected):
         # 尝试连接 Futu
         try:
             futu_connected = await orchestrator.connect_futu()
@@ -1673,7 +2020,9 @@ async def refresh_etf_data(
         except Exception:
             pass  # Futu 是可选的
 
-    if skip_futu_refresh:
+    if not refresh_futu:
+        pass
+    elif skip_futu_refresh:
         pass
     elif futu_connected and orchestrator._futu:
         futu = orchestrator._futu
@@ -1687,7 +2036,7 @@ async def refresh_etf_data(
                     
                     # 保存 IV 数据
                     from datetime import date as date_type
-                    today = date_type.today()
+                    today = beijing_today()
                     existing_iv = db.query(IVData).filter(
                         IVData.symbol == etf.symbol,
                         IVData.date == today
@@ -1760,6 +2109,44 @@ async def refresh_etf_data(
     else:
         warnings.append("Futu 未连接，使用默认期权评分")
     
+    score_should_recalculate = refresh_source in {"all", "ibkr"} or (
+        refresh_source == "futu"
+        and (skip_futu_refresh or data_sources["futu_iv"])
+    )
+    if not score_should_recalculate:
+        if refresh_source == "futu":
+            warnings.append("未获取到可用于评分的期权数据，已跳过评分计算")
+        current_view = _build_existing_etf_score_view(
+            etf,
+            latest_snapshot,
+            latest_ibkr_created_at=(
+                utc_now_naive() if data_sources["ibkr_price"] else latest_ibkr_created_at
+            ),
+            latest_futu_created_at=(
+                utc_now_naive() if data_sources["futu_iv"] else latest_futu_created_at
+            ),
+        )
+        return {
+            "status": "success",
+            "symbol": etf.symbol,
+            "refresh_source": refresh_source,
+            "message": f"ETF {etf.symbol} 的{_refresh_source_data_label(refresh_source)}已刷新，未触发评分计算",
+            "score": current_view["score"],
+            "rank": current_view["rank"],
+            "completeness": current_view["completeness"],
+            "thresholds_pass": current_view["thresholds_pass"],
+            "thresholds": current_view["thresholds"],
+            "breakdown": current_view["breakdown"],
+            "data_sources": current_view["data_sources"],
+            "warnings": warnings if warnings else None,
+            "next_refresh_at": _iso_utc(next_refresh_at),
+            "refresh_gate": {
+                "cooldown_minutes": ETF_REFRESH_COOLDOWN_MINUTES,
+                "ibkr": _build_refresh_gate_payload(ibkr_gate_state),
+                "futu": _build_refresh_gate_payload(futu_gate_state),
+            },
+        }
+
     recalculated = _recalculate_etf_score_from_db(
         etf,
         db,
@@ -1770,7 +2157,8 @@ async def refresh_etf_data(
     return {
         "status": "success",
         "symbol": etf.symbol,
-        "message": f"ETF {etf.symbol} 数据已刷新",
+        "refresh_source": refresh_source,
+        "message": f"ETF {etf.symbol} 的{_refresh_source_data_label(refresh_source)}已刷新并完成评分计算",
         "score": recalculated["score"],
         "rank": recalculated["rank"],
         "completeness": recalculated["completeness"],
@@ -1824,7 +2212,7 @@ async def refresh_holdings_data(
     ).scalar()
     
     etf.holdings_count = holdings_count
-    etf.updated_at = datetime.now()
+    etf.updated_at = utc_now_naive()
 
     db.commit()
     
@@ -1878,7 +2266,7 @@ async def calculate_etf_score(
             'delta3d': result.get('delta3d'),
             'delta5d': result.get('delta5d')
         }
-        etf.updated_at = datetime.now()
+        etf.updated_at = utc_now_naive()
         
         # 重新计算排名
         etfs_of_same_type = db.query(ETF).filter(
@@ -2146,6 +2534,9 @@ async def refresh_holdings_by_coverage(
 
     coverage_type = request.coverage_type
     coverage_value = request.coverage_value
+    refresh_source = _normalize_refresh_source(request.refresh_source)
+    refresh_ibkr = refresh_source in {"all", "ibkr"}
+    refresh_futu = refresh_source in {"all", "futu"}
 
     # 获取最新的持仓数据
     from sqlalchemy import func
@@ -2168,6 +2559,7 @@ async def refresh_holdings_by_coverage(
     filtered_holdings = _filter_holdings_by_coverage(all_holdings, coverage_type, coverage_value)
 
     coverage_label = _format_coverage_label(coverage_type, coverage_value)
+    _promote_etf_coverage_range(etf, coverage_label)
     progress_token = _normalize_progress_token(request.progress_token)
     if request.progress_token and not progress_token:
         raise HTTPException(status_code=400, detail="Invalid progress_token")
@@ -2187,24 +2579,21 @@ async def refresh_holdings_by_coverage(
                 "total": total_targets,
                 "failed": 0,
                 "current_item": "",
-                "message": "正在校验导入数据...",
+                "message": (
+                    "正在校验导入数据..."
+                    if refresh_source != "ibkr"
+                    else "正在准备 IBKR 刷新任务..."
+                ),
                 "started_at": _utc_now_iso(),
                 "finished_at": None,
             },
         )
 
-    # 刷新前置校验：当前覆盖范围下，Finviz + MarketChameleon 必须是北京时间 08:00 起算后的最新导入数据
+    # 评分型刷新前置校验：当前覆盖范围下，Finviz + MarketChameleon
+    # 必须是北京时间 08:00 起算后的最新导入数据。
+    # 对 source=ibkr 的纯价格刷新，只发现 fresh imports，不阻塞执行。
     def _beijing_import_boundary() -> Dict[str, Any]:
-        now_utc = datetime.utcnow()
-        now_beijing = now_utc + timedelta(hours=8)
-        boundary_beijing = now_beijing.replace(hour=8, minute=0, second=0, microsecond=0)
-        if now_beijing < boundary_beijing:
-            boundary_beijing -= timedelta(days=1)
-        return {
-            "boundary_utc": boundary_beijing - timedelta(hours=8),
-            "boundary_beijing": boundary_beijing,
-            "boundary_date": boundary_beijing.date(),
-        }
+        return get_beijing_cutoff_boundary()
 
     def _summarize_missing(symbols: List[str], max_items: int = 6) -> str:
         if not symbols:
@@ -2214,6 +2603,12 @@ async def refresh_holdings_by_coverage(
         return f"{', '.join(symbols[:max_items])} 等{len(symbols)}只"
 
     coverage_symbols = list(dict.fromkeys(h.ticker.upper() for h in filtered_holdings if h.ticker))
+    excluded_symbol_keys = set(_normalize_symbol_list(request.exclude_symbols))
+    excluded_coverage_symbols = [
+        symbol_name
+        for symbol_name in coverage_symbols
+        if _canonical_symbol_key(symbol_name) in excluded_symbol_keys
+    ]
     coverage_key_to_symbol: Dict[str, str] = {}
     for symbol_name in coverage_symbols:
         symbol_key = _canonical_symbol_key(symbol_name)
@@ -2227,6 +2622,7 @@ async def refresh_holdings_by_coverage(
         }
     )
     coverage_fresh_imports: Dict[str, set] = {}
+    require_scoring_imports = refresh_source != "ibkr"
     if coverage_symbols and coverage_query_symbols:
         boundary = _beijing_import_boundary()
         boundary_utc = boundary["boundary_utc"]
@@ -2265,10 +2661,19 @@ async def refresh_holdings_by_coverage(
                 fresh_imports.add((resolved_symbol, source_name))
                 fresh_imports_by_symbol.setdefault(resolved_symbol, set()).add(source_name)
 
-        missing_finviz = [s for s in coverage_symbols if (s, "finviz") not in fresh_imports]
-        missing_mc = [s for s in coverage_symbols if (s, "marketchameleon") not in fresh_imports]
+        missing_finviz = [
+            s for s in coverage_symbols
+            if (s, "finviz") not in fresh_imports
+            and _canonical_symbol_key(s) not in excluded_symbol_keys
+        ]
+        missing_mc = [
+            s for s in coverage_symbols
+            if (s, "marketchameleon") not in fresh_imports
+            and _canonical_symbol_key(s) not in excluded_symbol_keys
+        ]
+        coverage_fresh_imports = fresh_imports_by_symbol
 
-        if missing_finviz or missing_mc:
+        if require_scoring_imports and (missing_finviz or missing_mc):
             detail_parts = [
                 f"请先导入当前覆盖范围（{coverage_label}）Finviz 与 MarketChameleon 最新数据（北京时间 {boundary_bjt} 起算）"
             ]
@@ -2288,21 +2693,39 @@ async def refresh_holdings_by_coverage(
                 )
             raise HTTPException(status_code=400, detail=detail)
 
-        logger.info(
-            "refresh_holdings_import_guard_passed symbol=%s coverage=%s boundary_bjt=%s symbols=%s",
-            symbol.upper(),
-            coverage_label,
-            boundary_bjt,
-            len(coverage_symbols),
-        )
-        coverage_fresh_imports = fresh_imports_by_symbol
-        if progress_token:
-            _patch_holdings_refresh_progress(
-                progress_token,
-                {
-                    "message": f"导入校验通过，准备刷新 {len(filtered_holdings)} 个标的...",
-                },
+        if require_scoring_imports:
+            logger.info(
+                "refresh_holdings_import_guard_passed symbol=%s coverage=%s boundary_bjt=%s symbols=%s excluded_symbols=%s",
+                symbol.upper(),
+                coverage_label,
+                boundary_bjt,
+                len(coverage_symbols),
+                len(excluded_coverage_symbols),
             )
+            if progress_token:
+                _patch_holdings_refresh_progress(
+                    progress_token,
+                    {
+                        "message": f"导入校验通过，准备刷新 {len(filtered_holdings)} 个标的...",
+                    },
+                )
+        else:
+            logger.info(
+                "refresh_holdings_import_guard_skipped symbol=%s coverage=%s refresh_source=%s fresh_finviz=%s fresh_mc=%s excluded_symbols=%s",
+                symbol.upper(),
+                coverage_label,
+                refresh_source,
+                len([s for s in coverage_symbols if (s, "finviz") in fresh_imports]),
+                len([s for s in coverage_symbols if (s, "marketchameleon") in fresh_imports]),
+                len(excluded_coverage_symbols),
+            )
+            if progress_token:
+                _patch_holdings_refresh_progress(
+                    progress_token,
+                    {
+                        "message": f"IBKR-only 刷新跳过导入校验，准备刷新 {len(filtered_holdings)} 个标的...",
+                    },
+                )
 
     related_etf_symbols: List[str] = []
     if isinstance(request.related_etf_symbols, list):
@@ -2349,7 +2772,7 @@ async def refresh_holdings_by_coverage(
             len(duplicate_scope_symbols),
         )
 
-    now_utc = datetime.utcnow()
+    now_utc = utc_now_naive()
     ibkr_latest_rows = []
     futu_latest_rows = []
     if coverage_symbols:
@@ -2398,13 +2821,22 @@ async def refresh_holdings_by_coverage(
     futu_recent_all = bool(coverage_symbols) and all(
         bool(state.get("is_recent")) for state in futu_gate_by_symbol.values()
     )
-    if (not has_related_etf_scope) and ibkr_recent_all and futu_recent_all:
-        _recalculate_etf_score_from_db(etf, db)
-        all_gate_states = list(ibkr_gate_by_symbol.values()) + list(futu_gate_by_symbol.values())
-        next_refresh_at = _pick_next_refresh_at(all_gate_states)
+    selected_gate_states = (
+        list(ibkr_gate_by_symbol.values()) if refresh_source == "ibkr"
+        else list(futu_gate_by_symbol.values()) if refresh_source == "futu"
+        else list(ibkr_gate_by_symbol.values()) + list(futu_gate_by_symbol.values())
+    )
+    all_requested_recent = (
+        (not refresh_ibkr or ibkr_recent_all)
+        and (not refresh_futu or futu_recent_all)
+    )
+    if (not has_related_etf_scope) and all_requested_recent:
+        if refresh_source != "ibkr":
+            _recalculate_etf_score_from_db(etf, db)
+        next_refresh_at = _pick_next_refresh_at(selected_gate_states)
         next_refresh_bjt = _format_beijing_time(next_refresh_at)
         skip_message = (
-            f"IBKR 与 Futu 数据在 {HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟内已刷新，已跳过。"
+            f"{_refresh_source_label(refresh_source)} 数据在 {HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟内已刷新，已跳过。"
             + (f"下次可刷新时间（北京时间）{next_refresh_bjt}" if next_refresh_bjt else "")
         )
         if progress_token:
@@ -2420,9 +2852,11 @@ async def refresh_holdings_by_coverage(
                 },
             )
         total_weight = sum(h.weight for h in filtered_holdings)
+        db.commit()
         return {
             "status": "snapshot",
             "symbol": symbol.upper(),
+            "refresh_source": refresh_source,
             "coverage": coverage_label,
             "stocks_count": len(filtered_holdings),
             "total_weight": round(total_weight, 2),
@@ -2457,8 +2891,8 @@ async def refresh_holdings_by_coverage(
     recent_skip_symbol_set = {
         ticker
         for ticker in cooldown_scope_symbols
-        if bool(ibkr_gate_by_symbol.get(ticker, {}).get("is_recent"))
-        and bool(futu_gate_by_symbol.get(ticker, {}).get("is_recent"))
+        if (not refresh_ibkr or bool(ibkr_gate_by_symbol.get(ticker, {}).get("is_recent")))
+        and (not refresh_futu or bool(futu_gate_by_symbol.get(ticker, {}).get("is_recent")))
     }
     if has_related_etf_scope:
         ibkr_recent_duplicates = sum(
@@ -2468,13 +2902,14 @@ async def refresh_holdings_by_coverage(
             1 for ticker in cooldown_scope_symbols if bool(futu_gate_by_symbol.get(ticker, {}).get("is_recent"))
         )
         logger.info(
-            "refresh_holdings_duplicate_cooldown_eval symbol=%s coverage=%s duplicates=%s both_recent=%s ibkr_recent=%s futu_recent=%s",
+            "refresh_holdings_duplicate_cooldown_eval symbol=%s coverage=%s duplicates=%s requested_recent=%s ibkr_recent=%s futu_recent=%s refresh_source=%s",
             symbol.upper(),
             coverage_label,
             len(cooldown_scope_symbols),
             len(recent_skip_symbol_set),
             ibkr_recent_duplicates,
             futu_recent_duplicates,
+            refresh_source,
         )
     skipped_recent_holdings: List[ETFHolding] = []
     holdings_to_refresh: List[ETFHolding] = []
@@ -2495,10 +2930,13 @@ async def refresh_holdings_by_coverage(
         if has_related_etf_scope:
             skip_reason = (
                 f"同任务重复标的共 {duplicate_scope_count} 只，"
-                f"其中 {skipped_recent_count} 只在 {HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟冷却内已具备市场+期权数据"
+                f"其中 {skipped_recent_count} 只在 {HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟冷却内已具备{_refresh_source_data_label(refresh_source)}"
             )
         else:
-            skip_reason = f"已跳过 {skipped_recent_count} 只（{HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟内已有市场+期权数据）"
+            skip_reason = (
+                f"已跳过 {skipped_recent_count} 只"
+                f"（{HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟内已有{_refresh_source_data_label(refresh_source)}）"
+            )
         logger.info(
             "refresh_holdings_symbol_skip_recent symbol=%s coverage=%s skipped=%s total=%s cooldown_scope=%s preview=%s",
             symbol.upper(),
@@ -2703,14 +3141,17 @@ async def refresh_holdings_by_coverage(
             data_sources.append("finviz")
         if "marketchameleon" in imported_sources:
             data_sources.extend(["marketchameleon", "market_chameleon", "mc"])
-        data_sources.extend(["ibkr", "market_data", "futu", "options_data"])
+        if refresh_ibkr and bool(ibkr_gate_by_symbol.get(ticker, {}).get("is_recent")):
+            data_sources.extend(["ibkr", "market_data"])
+        if refresh_futu and bool(futu_gate_by_symbol.get(ticker, {}).get("is_recent")):
+            data_sources.extend(["futu", "options_data"])
         data_sources = list(dict.fromkeys(data_sources))
 
         latest_candidates = [
             dt
             for dt in (
-                ibkr_latest_map.get(ticker),
-                futu_latest_map.get(ticker),
+                ibkr_latest_map.get(ticker) if refresh_ibkr else None,
+                futu_latest_map.get(ticker) if refresh_futu else None,
             )
             if isinstance(dt, datetime)
         ]
@@ -2766,8 +3207,9 @@ async def refresh_holdings_by_coverage(
     skipped_recent_results = [_build_skipped_recent_result(holding) for holding in skipped_recent_holdings]
     for item in skipped_recent_results:
         logger.info(
-            "HOLDINGS- [SKIP] %s - 市场数据与期权数据在 %s 分钟冷却内，跳过抓取",
+            "HOLDINGS- [SKIP] %s - %s在 %s 分钟冷却内，跳过抓取",
             str(item.get("ticker") or "").upper(),
+            _refresh_source_data_label(refresh_source),
             HOLDINGS_REFRESH_COOLDOWN_MINUTES,
         )
 
@@ -2780,18 +3222,18 @@ async def refresh_holdings_by_coverage(
         _patch_holdings_refresh_progress(
             progress_token,
             {
-                "message": "正在连接/检查 IBKR 与 Futu...",
+                "message": f"正在连接/检查{_refresh_source_label(refresh_source)}...",
             },
         )
 
     broker_status = orchestrator.get_broker_status()
-    if not broker_status.get("ibkr", {}).get("is_connected", False):
+    if refresh_ibkr and not broker_status.get("ibkr", {}).get("is_connected", False):
         try:
             await orchestrator.connect_ibkr()
         except Exception as e:
             logger.warning(f"IBKR connect failed: {e}")
 
-    if not broker_status.get("futu", {}).get("is_connected", False):
+    if refresh_futu and not broker_status.get("futu", {}).get("is_connected", False):
         try:
             await orchestrator.connect_futu()
         except Exception as e:
@@ -2808,7 +3250,7 @@ async def refresh_holdings_by_coverage(
                 )
             else:
                 start_fetch_message = (
-                    f"已跳过 {skipped_recent_count} 只（{HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟内已有市场+期权数据），"
+                    f"已跳过 {skipped_recent_count} 只（{HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟内已有{_refresh_source_data_label(refresh_source)}），"
                     f"开始抓取剩余 {refresh_targets_count} 只..."
                 )
         _patch_holdings_refresh_progress(
@@ -2822,14 +3264,14 @@ async def refresh_holdings_by_coverage(
     sector_symbol = etf.parent_sector if etf.type == "industry" and etf.parent_sector else etf.symbol
     sector_df = _load_price_history(sector_symbol)
     ibkr_connected = orchestrator.get_broker_status().get("ibkr", {}).get("is_connected", False)
-    if not ibkr_connected:
+    if refresh_ibkr and not ibkr_connected:
         logger.warning(
             "refresh_holdings_ibkr_unavailable symbol=%s coverage=%s",
             symbol.upper(),
             coverage_label,
         )
     ibkr_price_timeout_seconds = 30
-    if sector_df is None and ibkr_connected:
+    if sector_df is None and refresh_ibkr and ibkr_connected:
         logger.info(
             "refresh_holdings_sector_prefetch symbol=%s coverage=%s sector_symbol=%s",
             symbol.upper(),
@@ -2862,110 +3304,206 @@ async def refresh_holdings_by_coverage(
 
     updated_stocks = list(skipped_recent_results)
     stock_semaphore = asyncio.Semaphore(5)  # 限制并发数为 5
-    futu_symbols = list(
-        dict.fromkeys(
-            str(holding.ticker).upper()
-            for holding in holdings_to_refresh
-            if isinstance(getattr(holding, "ticker", None), str) and holding.ticker.strip()
+    futu_symbols = (
+        list(
+            dict.fromkeys(
+                str(holding.ticker).upper()
+                for holding in holdings_to_refresh
+                if isinstance(getattr(holding, "ticker", None), str) and holding.ticker.strip()
+            )
         )
+        if refresh_futu
+        else []
     )
-    estimated_futu_seconds = estimate_iv_fetch_time(symbol_count=max(1, len(futu_symbols)))
-    futu_iv_timeout_seconds = max(45, int(estimated_futu_seconds + 15))
-    logger.info(
-        "refresh_holdings_futu_timeout_budget symbol=%s coverage=%s timeout_seconds=%s tickers=%s",
-        symbol.upper(),
-        coverage_label,
-        futu_iv_timeout_seconds,
-        len(futu_symbols),
-    )
+    estimated_futu_seconds = estimate_iv_fetch_time(symbol_count=max(1, len(futu_symbols))) if futu_symbols else 0
+    futu_iv_timeout_seconds = max(45, int(estimated_futu_seconds + 15)) if futu_symbols else 45
+    futu_chunk_count = math.ceil(len(futu_symbols) / HOLDINGS_FUTU_BATCH_SYMBOLS) if futu_symbols else 0
+    if futu_symbols:
+        logger.info(
+            "refresh_holdings_futu_timeout_budget symbol=%s coverage=%s timeout_seconds=%s tickers=%s chunk_size=%s chunks=%s",
+            symbol.upper(),
+            coverage_label,
+            futu_iv_timeout_seconds,
+            len(futu_symbols),
+            HOLDINGS_FUTU_BATCH_SYMBOLS,
+            futu_chunk_count,
+        )
 
-    async def _fetch_futu_iv_batch(symbols: List[str]) -> Dict[str, Any]:
+    def _has_futu_payload(payload: Any) -> bool:
+        if payload is None:
+            return False
+        try:
+            if payload.is_valid():
+                return True
+        except Exception:
+            pass
+        for attr_name in (
+            "total_oi",
+            "delta_oi_1d",
+            "oi_bucket_0_7",
+            "oi_bucket_8_30",
+            "oi_bucket_31_90",
+            "call_oi_bucket_0_7",
+            "call_oi_bucket_8_30",
+            "call_oi_bucket_31_90",
+            "put_oi_bucket_0_7",
+            "put_oi_bucket_8_30",
+            "put_oi_bucket_31_90",
+        ):
+            if getattr(payload, attr_name, None) is not None:
+                return True
+        return False
+
+    async def _fetch_futu_iv_batches(symbols: List[str]) -> tuple[Dict[str, Any], set[str], Optional[str]]:
         normalized_symbols = list(dict.fromkeys(str(item).upper() for item in symbols if str(item).strip()))
         if not normalized_symbols or not orchestrator._futu or not orchestrator._futu.is_connected():
-            return {}
+            return {}, set(normalized_symbols), "futu_not_connected"
 
-        batch_started_at = perf_counter()
-        logger.info(
-            "refresh_holdings_futu_batch_start symbol=%s coverage=%s tickers=%s",
-            symbol.upper(),
-            coverage_label,
-            len(normalized_symbols),
-        )
-        try:
-            iv_results = await asyncio.wait_for(
-                asyncio.to_thread(
-                    orchestrator._futu.fetch_iv_terms,
-                    normalized_symbols,
-                    max_days=120,
-                    max_retries=0,
-                    progress_total=len(normalized_symbols),
-                    progress_offset=0,
-                    log_progress=False,
-                    log_fetch_summary=False,
-                ),
-                timeout=futu_iv_timeout_seconds,
+        aggregated_payload: Dict[str, Any] = {}
+        failed_symbols: set[str] = set()
+        total_symbols = len(normalized_symbols)
+        total_chunks = max(1, math.ceil(total_symbols / HOLDINGS_FUTU_BATCH_SYMBOLS))
+
+        for chunk_index, chunk_start in enumerate(range(0, total_symbols, HOLDINGS_FUTU_BATCH_SYMBOLS), start=1):
+            chunk_symbols = normalized_symbols[chunk_start:chunk_start + HOLDINGS_FUTU_BATCH_SYMBOLS]
+            chunk_timeout_seconds = max(
+                45,
+                int(estimate_iv_fetch_time(symbol_count=max(1, len(chunk_symbols))) + 15),
             )
-        except asyncio.TimeoutError:
-            elapsed_ms = (perf_counter() - batch_started_at) * 1000
-            logger.warning(
-                "refresh_holdings_futu_iv_timeout_batch symbol=%s coverage=%s tickers=%s timeout_seconds=%s elapsed_ms=%s",
+            batch_started_at = perf_counter()
+            logger.info(
+                "refresh_holdings_futu_batch_start symbol=%s coverage=%s chunk=%s/%s tickers=%s timeout_seconds=%s",
                 symbol.upper(),
                 coverage_label,
-                len(normalized_symbols),
-                futu_iv_timeout_seconds,
-                round(elapsed_ms, 1),
+                chunk_index,
+                total_chunks,
+                len(chunk_symbols),
+                chunk_timeout_seconds,
             )
             if progress_token:
                 _patch_holdings_refresh_progress(
                     progress_token,
                     {
-                        "message": "Futu 批量期权数据获取超时，将继续完成其余流程。",
+                        "message": (
+                            f"Futu 期权数据抓取中：第 {chunk_index}/{total_chunks} 批，"
+                            f"{min(chunk_start + len(chunk_symbols), total_symbols)}/{total_symbols} 只..."
+                        ),
                     },
                 )
-            return {}
-        except Exception as exc:
-            elapsed_ms = (perf_counter() - batch_started_at) * 1000
-            logger.warning(
-                "refresh_holdings_futu_batch_failed symbol=%s coverage=%s tickers=%s elapsed_ms=%s error=%s",
-                symbol.upper(),
-                coverage_label,
-                len(normalized_symbols),
-                round(elapsed_ms, 1),
-                str(exc),
-            )
-            if progress_token:
-                _patch_holdings_refresh_progress(
-                    progress_token,
-                    {
-                        "message": "Futu 批量期权数据获取失败，将继续完成其余流程。",
-                    },
-                )
-            return {}
 
-        payload = iv_results if isinstance(iv_results, dict) else {}
-        ok_count = 0
-        for ticker in normalized_symbols:
-            item = payload.get(ticker)
             try:
-                if item is not None and item.is_valid():
+                iv_results = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        orchestrator._futu.fetch_iv_terms,
+                        chunk_symbols,
+                        max_days=120,
+                        max_retries=0,
+                        progress_total=total_symbols,
+                        progress_offset=chunk_start,
+                        log_progress=True,
+                        log_fetch_summary=False,
+                    ),
+                    timeout=chunk_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                elapsed_ms = (perf_counter() - batch_started_at) * 1000
+                remaining_symbols = normalized_symbols[chunk_start:]
+                failed_symbols.update(remaining_symbols)
+                logger.warning(
+                    "refresh_holdings_futu_iv_timeout_batch symbol=%s coverage=%s chunk=%s/%s tickers=%s timeout_seconds=%s elapsed_ms=%s",
+                    symbol.upper(),
+                    coverage_label,
+                    chunk_index,
+                    total_chunks,
+                    len(chunk_symbols),
+                    chunk_timeout_seconds,
+                    round(elapsed_ms, 1),
+                )
+                if progress_token:
+                    _patch_holdings_refresh_progress(
+                        progress_token,
+                        {
+                            "message": "Futu 期权数据抓取超时，剩余标的将跳过 Futu 数据。",
+                        },
+                    )
+                return aggregated_payload, failed_symbols, "futu_timeout"
+            except Exception as exc:
+                elapsed_ms = (perf_counter() - batch_started_at) * 1000
+                remaining_symbols = normalized_symbols[chunk_start:]
+                failed_symbols.update(remaining_symbols)
+                logger.warning(
+                    "refresh_holdings_futu_batch_failed symbol=%s coverage=%s chunk=%s/%s tickers=%s elapsed_ms=%s error=%s",
+                    symbol.upper(),
+                    coverage_label,
+                    chunk_index,
+                    total_chunks,
+                    len(chunk_symbols),
+                    round(elapsed_ms, 1),
+                    str(exc),
+                )
+                if progress_token:
+                    _patch_holdings_refresh_progress(
+                        progress_token,
+                        {
+                            "message": "Futu 期权数据抓取失败，剩余标的将跳过 Futu 数据。",
+                        },
+                    )
+                return aggregated_payload, failed_symbols, str(exc)
+
+            payload = iv_results if isinstance(iv_results, dict) else {}
+            ok_count = 0
+            fail_count = 0
+            for ticker in chunk_symbols:
+                item = payload.get(ticker)
+                if item is not None:
+                    aggregated_payload[ticker] = item
+                if _has_futu_payload(item):
                     ok_count += 1
-            except Exception:
-                continue
-        elapsed_ms = (perf_counter() - batch_started_at) * 1000
-        logger.info(
-            "refresh_holdings_futu_batch_done symbol=%s coverage=%s tickers=%s ok=%s fail=%s elapsed_ms=%s",
-            symbol.upper(),
-            coverage_label,
-            len(normalized_symbols),
-            ok_count,
-            max(0, len(normalized_symbols) - ok_count),
-            round(elapsed_ms, 1),
-        )
-        return payload
+                    failed_symbols.discard(ticker)
+                else:
+                    fail_count += 1
+                    failed_symbols.add(ticker)
+
+            elapsed_ms = (perf_counter() - batch_started_at) * 1000
+            logger.info(
+                "refresh_holdings_futu_batch_done symbol=%s coverage=%s chunk=%s/%s tickers=%s ok=%s fail=%s elapsed_ms=%s",
+                symbol.upper(),
+                coverage_label,
+                chunk_index,
+                total_chunks,
+                len(chunk_symbols),
+                ok_count,
+                fail_count,
+                round(elapsed_ms, 1),
+            )
+
+        return aggregated_payload, failed_symbols, None
 
     futu_iv_task: Optional[asyncio.Task] = None
-    if futu_symbols and orchestrator._futu and orchestrator._futu.is_connected():
-        futu_iv_task = asyncio.create_task(_fetch_futu_iv_batch(futu_symbols))
+    futu_unavailable_reason: Optional[str] = None
+    futu_status = orchestrator.get_broker_status().get("futu", {})
+    futu_connected = bool(futu_status.get("is_connected", False))
+    if refresh_futu and futu_symbols:
+        if futu_connected and orchestrator._futu and orchestrator._futu.is_connected():
+            futu_iv_task = asyncio.create_task(_fetch_futu_iv_batches(futu_symbols))
+        else:
+            futu_unavailable_reason = str(
+                futu_status.get("last_error") or "Futu not connected"
+            )
+            logger.warning(
+                "refresh_holdings_futu_unavailable symbol=%s coverage=%s reason=%s tickers=%s",
+                symbol.upper(),
+                coverage_label,
+                futu_unavailable_reason,
+                len(futu_symbols),
+            )
+            if progress_token:
+                _patch_holdings_refresh_progress(
+                    progress_token,
+                    {
+                        "message": f"Futu 不可用（{futu_unavailable_reason}），将仅完成 IBKR 与导入数据刷新。",
+                    },
+                )
 
     async def fetch_stock_data(holding: ETFHolding, idx: int, total_count: int):
         async with stock_semaphore:
@@ -2993,8 +3531,8 @@ async def refresh_holdings_by_coverage(
                 data_sources = list(dict.fromkeys(data_sources))
 
                 stock_df = None
-                ibkr_price_log = "N/A (not_connected)"
-                if ibkr_connected:
+                ibkr_price_log = "N/A (not_requested)"
+                if refresh_ibkr and ibkr_connected:
                     try:
                         # 获取股票的日线数据（用于动能评分）
                         stock_df = await asyncio.wait_for(
@@ -3039,45 +3577,10 @@ async def refresh_holdings_by_coverage(
                         latest_row = stock_df.iloc[-1]
                         price_data = float(latest_row.get('close', 0))
                         volume_data = float(latest_row.get('volume', 0))
-                        ibkr_price_log = f"N/A (not_connected; cache_rows={len(stock_df)})"
-
-                # 从 Futu 获取 IV 数据（可选）
-                iv30 = None
-                iv7 = None
-                iv60 = None
-                iv90 = None
-                total_oi = None
-                oi_bucket_0_7 = None
-                oi_bucket_8_30 = None
-                oi_bucket_31_90 = None
-                call_oi_bucket_0_7 = None
-                call_oi_bucket_8_30 = None
-                call_oi_bucket_31_90 = None
-                put_oi_bucket_0_7 = None
-                put_oi_bucket_8_30 = None
-                put_oi_bucket_31_90 = None
-                futu_failed = False
-                if futu_iv_task is not None:
-                    iv_results = await asyncio.shield(futu_iv_task)
-                    iv_data = iv_results.get(ticker)
-                    if iv_data is not None and iv_data.is_valid():
-                        iv30 = iv_data.iv30
-                        iv7 = iv_data.iv7
-                        iv60 = iv_data.iv60
-                        iv90 = iv_data.iv90
-                        total_oi = iv_data.total_oi
-                        oi_bucket_0_7 = iv_data.oi_bucket_0_7
-                        oi_bucket_8_30 = iv_data.oi_bucket_8_30
-                        oi_bucket_31_90 = iv_data.oi_bucket_31_90
-                        call_oi_bucket_0_7 = getattr(iv_data, 'call_oi_bucket_0_7', None)
-                        call_oi_bucket_8_30 = getattr(iv_data, 'call_oi_bucket_8_30', None)
-                        call_oi_bucket_31_90 = getattr(iv_data, 'call_oi_bucket_31_90', None)
-                        put_oi_bucket_0_7 = getattr(iv_data, 'put_oi_bucket_0_7', None)
-                        put_oi_bucket_8_30 = getattr(iv_data, 'put_oi_bucket_8_30', None)
-                        put_oi_bucket_31_90 = getattr(iv_data, 'put_oi_bucket_31_90', None)
-                        data_sources.append('futu')
-                    else:
-                        futu_failed = True
+                        if refresh_ibkr:
+                            ibkr_price_log = f"N/A (not_connected; cache_rows={len(stock_df)})"
+                        else:
+                            ibkr_price_log = f"N/A (not_requested; cache_rows={len(stock_df)})"
 
                 data_sources = list(dict.fromkeys(data_sources))
 
@@ -3086,7 +3589,7 @@ async def refresh_holdings_by_coverage(
                     'price_data': price_data,
                     'volume': volume_data,
                     'change_1d': change_1d,
-                    'iv30': iv30,
+                    'iv30': None,
                     'data_sources': data_sources,
                     'updated_at': _utc_now_iso()
                 }
@@ -3097,27 +3600,26 @@ async def refresh_holdings_by_coverage(
                     "price": price_data,
                     "change_1d": change_1d,
                     "data_sources": data_sources,
-                    "iv7": iv7,
-                    "iv30": iv30,
-                    "iv60": iv60,
-                    "iv90": iv90,
-                    "total_oi": total_oi,
-                    "oi_bucket_0_7": oi_bucket_0_7,
-                    "oi_bucket_8_30": oi_bucket_8_30,
-                    "oi_bucket_31_90": oi_bucket_31_90,
-                    "call_oi_bucket_0_7": call_oi_bucket_0_7,
-                    "call_oi_bucket_8_30": call_oi_bucket_8_30,
-                    "call_oi_bucket_31_90": call_oi_bucket_31_90,
-                    "put_oi_bucket_0_7": put_oi_bucket_0_7,
-                    "put_oi_bucket_8_30": put_oi_bucket_8_30,
-                    "put_oi_bucket_31_90": put_oi_bucket_31_90,
+                    "iv7": None,
+                    "iv30": None,
+                    "iv60": None,
+                    "iv90": None,
+                    "total_oi": None,
+                    "oi_bucket_0_7": None,
+                    "oi_bucket_8_30": None,
+                    "oi_bucket_31_90": None,
+                    "call_oi_bucket_0_7": None,
+                    "call_oi_bucket_8_30": None,
+                    "call_oi_bucket_31_90": None,
+                    "put_oi_bucket_0_7": None,
+                    "put_oi_bucket_8_30": None,
+                    "put_oi_bucket_31_90": None,
                     "price_df": stock_df,
                     "holding_data": holding_data,
                     "updated_at": _utc_now_iso(),
                     "_log_idx": idx,
                     "_log_total": total_count,
                     "_log_ibkr": ibkr_price_log,
-                    "_futu_failed": futu_failed,
                 }
 
             except Exception as e:
@@ -3154,7 +3656,6 @@ async def refresh_holdings_by_coverage(
                     "_log_idx": idx,
                     "_log_total": total_count,
                     "_log_ibkr": "N/A (fetch_failed)",
-                    "_futu_failed": False,
                 }
 
     # 并发获取所有股票数据（按完成顺序处理，便于前端实时读取进度）
@@ -3164,6 +3665,8 @@ async def refresh_holdings_by_coverage(
     ]
 
     futu_failed_count = 0
+    prefetched_results: List[Dict[str, Any]] = []
+    market_fetch_completed = 0
 
     for future in asyncio.as_completed(fetch_tasks):
         try:
@@ -3184,418 +3687,13 @@ async def refresh_holdings_by_coverage(
             continue
 
         if isinstance(result, dict):
-            holding_data = result.pop('holding_data', {})
-            price_df = result.pop('price_df', None)
-            ticker_text = str(result.get('ticker') or '').upper()
-            log_idx = int(result.pop('_log_idx', 0) or 0)
-            log_total = int(result.pop('_log_total', total_targets) or total_targets)
-            ibkr_price_log = str(result.pop('_log_ibkr', 'N/A'))
-            futu_failed_flag = bool(result.pop('_futu_failed', False))
-            if futu_failed_flag:
-                futu_failed_count += 1
+            prefetched_results.append(result)
+            market_fetch_completed += 1
             if progress_token:
                 _patch_holdings_refresh_progress(
                     progress_token,
                     {
-                        "current_item": ticker_text,
-                        "message": f"正在计算 {ticker_text} 的评分...",
-                    },
-                )
-
-            # 计算单只持仓的完整度
-            completeness_status = completeness_calculator.calculate_holding_data_completeness(
-                result['ticker'],
-                holding_data
-            )
-
-            # 添加完整度信息到结果
-            result['data_status'] = completeness_status.status
-            result['completeness'] = completeness_status.completeness_score
-
-            # 计算动能股评分并更新数据库
-            score_value = None
-            data_sources_list = result.get('data_sources') or []
-
-            # 即使 IBKR 价格缺失，也应持久化已抓取的 Futu IV，避免前端静默重拉后回退为“缺失”。
-            if 'futu' in data_sources_list:
-                today = date.today()
-                ticker_upper = str(result['ticker']).upper()
-                total_oi_int = _as_int(result.get('total_oi'))
-                bucket_totals = _extract_bucket_totals(result)
-                delta_payload = _compute_bucket_delta_payload(
-                    ticker=ticker_upper,
-                    today=today,
-                    bucket_totals=bucket_totals,
-                    total_oi_value=total_oi_int,
-                )
-
-                for suffix in ("0_7", "8_30", "31_90"):
-                    result[f"oi_bucket_{suffix}"] = bucket_totals[suffix]["net"]
-                    result[f"call_oi_bucket_{suffix}"] = bucket_totals[suffix]["call"]
-                    result[f"put_oi_bucket_{suffix}"] = bucket_totals[suffix]["put"]
-                    result[f"net_delta_oi_{suffix}"] = delta_payload["by_bucket"][suffix]["net_1d"]
-                    result[f"call_delta_oi_{suffix}"] = delta_payload["by_bucket"][suffix]["call_1d"]
-                    result[f"put_delta_oi_{suffix}"] = delta_payload["by_bucket"][suffix]["put_1d"]
-                    result[f"net_delta3d_{suffix}"] = delta_payload["by_bucket"][suffix]["net_3d"]
-                    result[f"net_delta5d_{suffix}"] = delta_payload["by_bucket"][suffix]["net_5d"]
-                result["delta_oi_1d"] = delta_payload.get("total_oi_1d")
-
-                existing_iv = db.query(IVData).filter(
-                    IVData.symbol == ticker_upper,
-                    IVData.date == today,
-                ).first()
-                if existing_iv:
-                    existing_iv.iv7 = result.get('iv7')
-                    existing_iv.iv30 = result.get('iv30')
-                    existing_iv.iv60 = result.get('iv60')
-                    existing_iv.iv90 = result.get('iv90')
-                    existing_iv.total_oi = result.get('total_oi')
-                    existing_iv.delta_oi_1d = result.get('delta_oi_1d')
-                    existing_iv.oi_bucket_0_7 = result.get('oi_bucket_0_7')
-                    existing_iv.oi_bucket_8_30 = result.get('oi_bucket_8_30')
-                    existing_iv.oi_bucket_31_90 = result.get('oi_bucket_31_90')
-                    existing_iv.call_oi_bucket_0_7 = result.get('call_oi_bucket_0_7')
-                    existing_iv.call_oi_bucket_8_30 = result.get('call_oi_bucket_8_30')
-                    existing_iv.call_oi_bucket_31_90 = result.get('call_oi_bucket_31_90')
-                    existing_iv.put_oi_bucket_0_7 = result.get('put_oi_bucket_0_7')
-                    existing_iv.put_oi_bucket_8_30 = result.get('put_oi_bucket_8_30')
-                    existing_iv.put_oi_bucket_31_90 = result.get('put_oi_bucket_31_90')
-                    existing_iv.net_delta_oi_0_7 = result.get('net_delta_oi_0_7')
-                    existing_iv.net_delta_oi_8_30 = result.get('net_delta_oi_8_30')
-                    existing_iv.net_delta_oi_31_90 = result.get('net_delta_oi_31_90')
-                    existing_iv.call_delta_oi_0_7 = result.get('call_delta_oi_0_7')
-                    existing_iv.call_delta_oi_8_30 = result.get('call_delta_oi_8_30')
-                    existing_iv.call_delta_oi_31_90 = result.get('call_delta_oi_31_90')
-                    existing_iv.put_delta_oi_0_7 = result.get('put_delta_oi_0_7')
-                    existing_iv.put_delta_oi_8_30 = result.get('put_delta_oi_8_30')
-                    existing_iv.put_delta_oi_31_90 = result.get('put_delta_oi_31_90')
-                    existing_iv.source = 'futu'
-                    existing_iv.created_at = datetime.utcnow()
-                else:
-                    db.add(IVData(
-                        symbol=ticker_upper,
-                        date=today,
-                        iv7=result.get('iv7'),
-                        iv30=result.get('iv30'),
-                        iv60=result.get('iv60'),
-                        iv90=result.get('iv90'),
-                        total_oi=result.get('total_oi'),
-                        delta_oi_1d=result.get('delta_oi_1d'),
-                        oi_bucket_0_7=result.get('oi_bucket_0_7'),
-                        oi_bucket_8_30=result.get('oi_bucket_8_30'),
-                        oi_bucket_31_90=result.get('oi_bucket_31_90'),
-                        call_oi_bucket_0_7=result.get('call_oi_bucket_0_7'),
-                        call_oi_bucket_8_30=result.get('call_oi_bucket_8_30'),
-                        call_oi_bucket_31_90=result.get('call_oi_bucket_31_90'),
-                        put_oi_bucket_0_7=result.get('put_oi_bucket_0_7'),
-                        put_oi_bucket_8_30=result.get('put_oi_bucket_8_30'),
-                        put_oi_bucket_31_90=result.get('put_oi_bucket_31_90'),
-                        net_delta_oi_0_7=result.get('net_delta_oi_0_7'),
-                        net_delta_oi_8_30=result.get('net_delta_oi_8_30'),
-                        net_delta_oi_31_90=result.get('net_delta_oi_31_90'),
-                        call_delta_oi_0_7=result.get('call_delta_oi_0_7'),
-                        call_delta_oi_8_30=result.get('call_delta_oi_8_30'),
-                        call_delta_oi_31_90=result.get('call_delta_oi_31_90'),
-                        put_delta_oi_0_7=result.get('put_delta_oi_0_7'),
-                        put_delta_oi_8_30=result.get('put_delta_oi_8_30'),
-                        put_delta_oi_31_90=result.get('put_delta_oi_31_90'),
-                        source='futu',
-                    ))
-
-            if price_df is None:
-                price_df = _load_price_history(result['ticker'])
-
-            if price_df is not None and not price_df.empty:
-                if 'ibkr' in data_sources_list:
-                    _save_price_history(result['ticker'], price_df)
-
-                finviz_data = _get_imported(result['ticker'], 'finviz')
-                mc_data = _get_imported(result['ticker'], 'marketchameleon')
-                iv_data = _get_latest_iv(result['ticker'])
-
-                pool_payload = await orchestrator.calculate_momentum_pool_score(
-                    symbol=result['ticker'],
-                    sector_etf=sector_symbol,
-                    finviz_data=finviz_data,
-                    mc_data=mc_data,
-                    iv_data=iv_data,
-                    duration='1 Y',
-                )
-
-                if pool_payload and pool_payload.get('total_score') is not None:
-                    score_value = pool_payload.get('total_score')
-                    pool_scores = pool_payload.get('scores') or {}
-                    pool_metrics = pool_payload.get('metrics') or {}
-                    extra_metrics: Dict[str, Any] = {}
-
-                    def _to_float(value: Any) -> Optional[float]:
-                        try:
-                            return float(value) if value is not None else None
-                        except (TypeError, ValueError):
-                            return None
-
-                    if result.get('iv7') is not None:
-                        extra_metrics['iv7'] = _to_float(result.get('iv7'))
-                    if result.get('iv30') is not None:
-                        extra_metrics['iv30'] = _to_float(result.get('iv30'))
-                    if result.get('iv60') is not None:
-                        extra_metrics['iv60'] = _to_float(result.get('iv60'))
-                    if result.get('iv90') is not None:
-                        extra_metrics['iv90'] = _to_float(result.get('iv90'))
-                    if result.get('total_oi') is not None:
-                        extra_metrics['openInterest'] = result.get('total_oi')
-
-                    bucket_payload = [
-                        {
-                            'suffix': '0_7',
-                            'label': '0-7',
-                            'net_total': _to_float(result.get('oi_bucket_0_7')),
-                            'call_total': _to_float(result.get('call_oi_bucket_0_7')),
-                            'put_total': _to_float(result.get('put_oi_bucket_0_7')),
-                            'net_delta_1d': _to_float(result.get('net_delta_oi_0_7')),
-                            'call_delta_1d': _to_float(result.get('call_delta_oi_0_7')),
-                            'put_delta_1d': _to_float(result.get('put_delta_oi_0_7')),
-                            'net_delta_3d': _to_float(result.get('net_delta3d_0_7')),
-                            'net_delta_5d': _to_float(result.get('net_delta5d_0_7')),
-                        },
-                        {
-                            'suffix': '8_30',
-                            'label': '8-30',
-                            'net_total': _to_float(result.get('oi_bucket_8_30')),
-                            'call_total': _to_float(result.get('call_oi_bucket_8_30')),
-                            'put_total': _to_float(result.get('put_oi_bucket_8_30')),
-                            'net_delta_1d': _to_float(result.get('net_delta_oi_8_30')),
-                            'call_delta_1d': _to_float(result.get('call_delta_oi_8_30')),
-                            'put_delta_1d': _to_float(result.get('put_delta_oi_8_30')),
-                            'net_delta_3d': _to_float(result.get('net_delta3d_8_30')),
-                            'net_delta_5d': _to_float(result.get('net_delta5d_8_30')),
-                        },
-                        {
-                            'suffix': '31_90',
-                            'label': '31-90',
-                            'net_total': _to_float(result.get('oi_bucket_31_90')),
-                            'call_total': _to_float(result.get('call_oi_bucket_31_90')),
-                            'put_total': _to_float(result.get('put_oi_bucket_31_90')),
-                            'net_delta_1d': _to_float(result.get('net_delta_oi_31_90')),
-                            'call_delta_1d': _to_float(result.get('call_delta_oi_31_90')),
-                            'put_delta_1d': _to_float(result.get('put_delta_oi_31_90')),
-                            'net_delta_3d': _to_float(result.get('net_delta3d_31_90')),
-                            'net_delta_5d': _to_float(result.get('net_delta5d_31_90')),
-                        },
-                    ]
-                    options_positioning = []
-                    for bucket in bucket_payload:
-                        bucket_net_total = bucket['net_total']
-                        bucket_call_total = bucket['call_total']
-                        bucket_put_total = bucket['put_total']
-                        bucket_net_1d = bucket['net_delta_1d']
-                        bucket_call_1d = bucket['call_delta_1d']
-                        bucket_put_1d = bucket['put_delta_1d']
-                        bucket_net_3d = bucket['net_delta_3d']
-                        bucket_net_5d = bucket['net_delta_5d']
-
-                        if bucket_net_total is None and bucket_call_total is not None and bucket_put_total is not None:
-                            bucket_net_total = bucket_call_total + bucket_put_total
-                        if bucket_net_1d is None and bucket_call_1d is not None and bucket_put_1d is not None:
-                            bucket_net_1d = bucket_call_1d - bucket_put_1d
-
-                        if all(
-                            value is None
-                            for value in (
-                                bucket_net_total, bucket_call_total, bucket_put_total,
-                                bucket_net_1d, bucket_call_1d, bucket_put_1d,
-                                bucket_net_3d, bucket_net_5d,
-                            )
-                        ):
-                            continue
-
-                        if bucket_net_total is not None:
-                            extra_metrics[f"oi_bucket_{bucket['suffix']}"] = bucket_net_total
-                        if bucket_call_total is not None:
-                            extra_metrics[f"call_oi_{bucket['suffix']}"] = bucket_call_total
-                        if bucket_put_total is not None:
-                            extra_metrics[f"put_oi_{bucket['suffix']}"] = bucket_put_total
-                        if bucket_net_1d is not None:
-                            extra_metrics[f"net_delta_oi_{bucket['suffix']}"] = bucket_net_1d
-                            extra_metrics[f"delta_oi_{bucket['suffix']}"] = bucket_net_1d
-                        if bucket_call_1d is not None:
-                            extra_metrics[f"call_delta_oi_{bucket['suffix']}"] = bucket_call_1d
-                        if bucket_put_1d is not None:
-                            extra_metrics[f"put_delta_oi_{bucket['suffix']}"] = bucket_put_1d
-                        if bucket_net_3d is not None:
-                            extra_metrics[f"net_delta3d_{bucket['suffix']}"] = bucket_net_3d
-                            extra_metrics[f"delta3d_{bucket['suffix']}"] = bucket_net_3d
-                        if bucket_net_5d is not None:
-                            extra_metrics[f"net_delta5d_{bucket['suffix']}"] = bucket_net_5d
-                            extra_metrics[f"delta5d_{bucket['suffix']}"] = bucket_net_5d
-
-                        trend = '中性'
-                        trend_ref = bucket_net_1d
-                        if trend_ref is None and bucket_call_1d is not None and bucket_put_1d is not None:
-                            trend_ref = bucket_call_1d - bucket_put_1d
-                        if trend_ref is None:
-                            trend_ref = bucket_net_3d
-                        if trend_ref is not None:
-                            trend = '偏多' if trend_ref >= 0 else '偏空'
-
-                        options_positioning.append({
-                            'bucket': bucket['label'],
-                            'callOI': bucket_call_1d,
-                            'putOI': bucket_put_1d,
-                            'netOI': bucket_net_1d,
-                            'delta3d': bucket_net_3d,
-                            'delta5d': bucket_net_5d,
-                            'trend': trend,
-                        })
-                    if options_positioning:
-                        extra_metrics['optionsPositioning'] = options_positioning
-
-                    if mc_data:
-                        mc_rel_notional = _to_float(
-                            mc_data.get('rel_notional')
-                            if mc_data.get('rel_notional') is not None
-                            else mc_data.get('rel_notional_to_90d')
-                        )
-                        mc_rel_volume = _to_float(
-                            mc_data.get('rel_vol')
-                            if mc_data.get('rel_vol') is not None
-                            else mc_data.get('rel_vol_to_90d')
-                        )
-                        mc_iv30_change = _to_float(
-                            mc_data.get('iv30_chg_pct')
-                            if mc_data.get('iv30_chg_pct') is not None
-                            else mc_data.get('iv_change')
-                        )
-                        if mc_data.get('heat_score') is not None:
-                            extra_metrics['heat_score'] = _to_float(mc_data.get('heat_score'))
-                        if mc_data.get('risk_score') is not None:
-                            extra_metrics['risk_score'] = _to_float(mc_data.get('risk_score'))
-                        if mc_rel_notional is not None:
-                            extra_metrics['rel_notional'] = mc_rel_notional
-                            extra_metrics['rel_notional_to_90d'] = mc_rel_notional
-                        if mc_rel_volume is not None:
-                            extra_metrics['rel_vol'] = mc_rel_volume
-                            extra_metrics['rel_vol_to_90d'] = mc_rel_volume
-                        if mc_data.get('trade_count') is not None:
-                            extra_metrics['trade_count'] = mc_data.get('trade_count')
-                        if mc_iv30_change is not None:
-                            extra_metrics['iv_change'] = mc_iv30_change
-                            extra_metrics['iv30_chg_pct'] = mc_iv30_change
-
-                    merged_metrics = dict(pool_metrics)
-                    for metric_key, metric_value in extra_metrics.items():
-                        if metric_value is None:
-                            continue
-                        merged_metrics[metric_key] = metric_value
-
-                    stock = db.query(Stock).filter(Stock.symbol == result['ticker'].upper()).first()
-                    if not stock:
-                        stock = Stock(symbol=result['ticker'].upper())
-
-                    sector_value = sector_symbol
-                    if finviz_data and finviz_data.get('sector'):
-                        sector_value = finviz_data.get('sector')
-                    industry_value = finviz_data.get('industry') if finviz_data else None
-                    if not industry_value:
-                        industry_value = etf.name or etf.symbol
-
-                    stock.name = finviz_data.get('company_name') if finviz_data else (stock.name or result['ticker'])
-                    stock.sector = sector_value
-                    stock.industry = industry_value
-                    stock.price = float(price_df['close'].iloc[-1])
-                    stock.score_total = score_value
-                    stock.scores = pool_scores
-                    stock.metrics = merged_metrics
-                    db.add(stock)
-                    db.flush()
-
-                    today = date.today()
-                    existing_snapshot = db.query(ScoreSnapshot).filter(
-                        ScoreSnapshot.symbol == stock.symbol,
-                        ScoreSnapshot.symbol_type == 'stock',
-                        ScoreSnapshot.date == today
-                    ).first()
-                    snapshot_payload = {
-                        'scores': pool_scores,
-                        'metrics': pool_metrics
-                    }
-                    thresholds_pass = (pool_scores.get('momentum', 0) >= 50 and pool_scores.get('trend', 0) >= 50)
-                    stock.thresholds_pass = thresholds_pass
-                    if mc_data:
-                        try:
-                            mc_heat_score = _to_float(mc_data.get('heat_score'))
-                            if mc_heat_score is not None:
-                                stock.heat_score = mc_heat_score
-                            mc_risk_score = _to_float(mc_data.get('risk_score'))
-                            if mc_risk_score is not None:
-                                stock.risk_score = mc_risk_score
-                            mc_heat_type = mc_data.get('heat_type')
-                            if isinstance(mc_heat_type, str) and mc_heat_type.strip():
-                                stock.heat_type = normalize_heat_type(mc_heat_type)
-                        except Exception:
-                            pass
-                    if existing_snapshot:
-                        existing_snapshot.total_score = score_value
-                        existing_snapshot.score_breakdown = snapshot_payload
-                        existing_snapshot.thresholds_pass = thresholds_pass
-                    else:
-                        db.add(ScoreSnapshot(
-                            symbol=stock.symbol,
-                            symbol_type='stock',
-                            date=today,
-                            total_score=score_value,
-                            score_breakdown=snapshot_payload,
-                            thresholds_pass=thresholds_pass
-                        ))
-
-                    stock.changes = _compute_deltas(stock.symbol)
-
-            result['score'] = score_value
-
-            total_oi_raw = result.get("total_oi")
-            total_oi_text = (
-                str(int(total_oi_raw))
-                if isinstance(total_oi_raw, (int, float)) and total_oi_raw is not None
-                else "N/A"
-            )
-            oi_0_7_raw = result.get("oi_bucket_0_7")
-            oi_8_30_raw = result.get("oi_bucket_8_30")
-            oi_31_90_raw = result.get("oi_bucket_31_90")
-            oi_0_7_text = str(int(oi_0_7_raw)) if isinstance(oi_0_7_raw, (int, float)) else "N/A"
-            oi_8_30_text = str(int(oi_8_30_raw)) if isinstance(oi_8_30_raw, (int, float)) else "N/A"
-            oi_31_90_text = str(int(oi_31_90_raw)) if isinstance(oi_31_90_raw, (int, float)) else "N/A"
-            logger.info(
-                "\n".join(
-                    [
-                        f"HOLDINGS- [{log_idx}/{max(log_total, 1)}] {ticker_text}",
-                        f" - OHLCV(1Y): {ibkr_price_log}",
-                        (
-                            " - IV7/30/60/90: "
-                            f"{_fmt_float(result.get('iv7'), 2)}% / "
-                            f"{_fmt_float(result.get('iv30'), 2)}% / "
-                            f"{_fmt_float(result.get('iv60'), 2)}% / "
-                            f"{_fmt_float(result.get('iv90'), 2)}%"
-                        ),
-                        (
-                            f"-  Δ OI: {total_oi_text} "
-                            f"(0-7D: {oi_0_7_text}, 8-30D: {oi_8_30_text}, 31-90D: {oi_31_90_text})"
-                        ),
-                        "---",
-                    ]
-                )
-            )
-
-            updated_stocks.append(result)
-            progress_completed += 1
-            if progress_token:
-                ticker_text = str(result.get('ticker') or '').upper()
-                _patch_holdings_refresh_progress(
-                    progress_token,
-                    {
-                        "completed": progress_completed,
-                        "failed": progress_failed,
-                        "current_item": ticker_text,
-                        "message": f"已完成 {progress_completed}/{total_targets}",
+                        "message": f"市场数据抓取完成 {market_fetch_completed}/{total_targets}，准备合并期权与评分...",
                     },
                 )
         else:
@@ -3611,11 +3709,485 @@ async def refresh_holdings_by_coverage(
                     },
                 )
 
+    futu_results: Dict[str, Any] = {}
+    futu_failed_symbols: set[str] = set()
+    futu_batch_error: Optional[str] = None
     if futu_iv_task is not None:
-        await asyncio.gather(futu_iv_task, return_exceptions=True)
+        if progress_token:
+            _patch_holdings_refresh_progress(
+                progress_token,
+                {
+                    "message": "等待 Futu 期权批量结果...",
+                },
+            )
+        futu_results, futu_failed_symbols, futu_batch_error = await asyncio.shield(futu_iv_task)
+    elif refresh_futu and futu_symbols and futu_unavailable_reason:
+        futu_failed_symbols = set(futu_symbols)
+        futu_batch_error = futu_unavailable_reason
+
+    futu_ready_symbol_set: set[str] = set()
+    if refresh_source == "all":
+        futu_ready_symbol_set = set(coverage_symbols)
+    elif refresh_source == "futu":
+        futu_ready_symbol_set = {
+            ticker
+            for ticker in coverage_symbols
+            if bool(futu_gate_by_symbol.get(ticker, {}).get("is_recent"))
+        }
+        futu_ready_symbol_set.update(
+            ticker
+            for ticker, payload in futu_results.items()
+            if _has_futu_payload(payload)
+        )
+    score_calculation_enabled = refresh_source == "all" or (
+        refresh_source == "futu" and len(futu_ready_symbol_set) > 0
+    )
+
+    for result in prefetched_results:
+        holding_data = result.pop('holding_data', {})
+        price_df = result.pop('price_df', None)
+        ticker_text = str(result.get('ticker') or '').upper()
+        log_idx = int(result.pop('_log_idx', 0) or 0)
+        log_total = int(result.pop('_log_total', total_targets) or total_targets)
+        ibkr_price_log = str(result.pop('_log_ibkr', 'N/A'))
+
+        futu_payload = futu_results.get(ticker_text)
+        if _has_futu_payload(futu_payload):
+            result['iv7'] = getattr(futu_payload, 'iv7', None)
+            result['iv30'] = getattr(futu_payload, 'iv30', None)
+            result['iv60'] = getattr(futu_payload, 'iv60', None)
+            result['iv90'] = getattr(futu_payload, 'iv90', None)
+            result['total_oi'] = getattr(futu_payload, 'total_oi', None)
+            result['risk_total_oi'] = getattr(futu_payload, 'risk_total_oi', None)
+            result['oi_bucket_0_7'] = getattr(futu_payload, 'oi_bucket_0_7', None)
+            result['oi_bucket_8_30'] = getattr(futu_payload, 'oi_bucket_8_30', None)
+            result['oi_bucket_31_90'] = getattr(futu_payload, 'oi_bucket_31_90', None)
+            result['risk_oi_bucket_0_7'] = getattr(futu_payload, 'risk_oi_bucket_0_7', None)
+            result['risk_oi_bucket_8_30'] = getattr(futu_payload, 'risk_oi_bucket_8_30', None)
+            result['risk_oi_bucket_31_90'] = getattr(futu_payload, 'risk_oi_bucket_31_90', None)
+            result['call_oi_bucket_0_7'] = getattr(futu_payload, 'call_oi_bucket_0_7', None)
+            result['call_oi_bucket_8_30'] = getattr(futu_payload, 'call_oi_bucket_8_30', None)
+            result['call_oi_bucket_31_90'] = getattr(futu_payload, 'call_oi_bucket_31_90', None)
+            result['put_oi_bucket_0_7'] = getattr(futu_payload, 'put_oi_bucket_0_7', None)
+            result['put_oi_bucket_8_30'] = getattr(futu_payload, 'put_oi_bucket_8_30', None)
+            result['put_oi_bucket_31_90'] = getattr(futu_payload, 'put_oi_bucket_31_90', None)
+            result['delta_oi_1d'] = getattr(futu_payload, 'delta_oi_1d', None)
+            result['net_delta_oi_0_7'] = getattr(futu_payload, 'net_delta_oi_0_7', None)
+            result['net_delta_oi_8_30'] = getattr(futu_payload, 'net_delta_oi_8_30', None)
+            result['net_delta_oi_31_90'] = getattr(futu_payload, 'net_delta_oi_31_90', None)
+            result['call_delta_oi_0_7'] = getattr(futu_payload, 'call_delta_oi_0_7', None)
+            result['call_delta_oi_8_30'] = getattr(futu_payload, 'call_delta_oi_8_30', None)
+            result['call_delta_oi_31_90'] = getattr(futu_payload, 'call_delta_oi_31_90', None)
+            result['put_delta_oi_0_7'] = getattr(futu_payload, 'put_delta_oi_0_7', None)
+            result['put_delta_oi_8_30'] = getattr(futu_payload, 'put_delta_oi_8_30', None)
+            result['put_delta_oi_31_90'] = getattr(futu_payload, 'put_delta_oi_31_90', None)
+            result['net_delta3d_0_7'] = getattr(futu_payload, 'net_delta3d_0_7', None)
+            result['net_delta3d_8_30'] = getattr(futu_payload, 'net_delta3d_8_30', None)
+            result['net_delta3d_31_90'] = getattr(futu_payload, 'net_delta3d_31_90', None)
+            result['net_delta5d_0_7'] = getattr(futu_payload, 'net_delta5d_0_7', None)
+            result['net_delta5d_8_30'] = getattr(futu_payload, 'net_delta5d_8_30', None)
+            result['net_delta5d_31_90'] = getattr(futu_payload, 'net_delta5d_31_90', None)
+            result['data_sources'] = list(dict.fromkeys([*(result.get('data_sources') or []), 'futu']))
+            futu_failed_flag = False
+        else:
+            futu_failed_flag = ticker_text in futu_failed_symbols
+        if futu_failed_flag:
+            futu_failed_count += 1
+
+        if progress_token:
+            _patch_holdings_refresh_progress(
+                progress_token,
+                {
+                    "current_item": ticker_text,
+                    "message": f"正在计算 {ticker_text} 的评分...",
+                },
+            )
+
+        holding_data['iv30'] = result.get('iv30')
+        holding_data['data_sources'] = result.get('data_sources') or []
+
+        completeness_status = completeness_calculator.calculate_holding_data_completeness(
+            result['ticker'],
+            holding_data
+        )
+        result['data_status'] = completeness_status.status
+        result['completeness'] = completeness_status.completeness_score
+
+        score_value = None
+        data_sources_list = result.get('data_sources') or []
+
+        if 'futu' in data_sources_list:
+            today = beijing_today()
+            ticker_upper = str(result['ticker']).upper()
+            existing_iv = db.query(IVData).filter(
+                IVData.symbol == ticker_upper,
+                IVData.date == today,
+            ).first()
+            if existing_iv:
+                existing_iv.iv7 = result.get('iv7')
+                existing_iv.iv30 = result.get('iv30')
+                existing_iv.iv60 = result.get('iv60')
+                existing_iv.iv90 = result.get('iv90')
+                existing_iv.total_oi = result.get('total_oi')
+                existing_iv.delta_oi_1d = result.get('delta_oi_1d')
+                existing_iv.oi_bucket_0_7 = result.get('oi_bucket_0_7')
+                existing_iv.oi_bucket_8_30 = result.get('oi_bucket_8_30')
+                existing_iv.oi_bucket_31_90 = result.get('oi_bucket_31_90')
+                existing_iv.call_oi_bucket_0_7 = result.get('call_oi_bucket_0_7')
+                existing_iv.call_oi_bucket_8_30 = result.get('call_oi_bucket_8_30')
+                existing_iv.call_oi_bucket_31_90 = result.get('call_oi_bucket_31_90')
+                existing_iv.put_oi_bucket_0_7 = result.get('put_oi_bucket_0_7')
+                existing_iv.put_oi_bucket_8_30 = result.get('put_oi_bucket_8_30')
+                existing_iv.put_oi_bucket_31_90 = result.get('put_oi_bucket_31_90')
+                existing_iv.net_delta_oi_0_7 = result.get('net_delta_oi_0_7')
+                existing_iv.net_delta_oi_8_30 = result.get('net_delta_oi_8_30')
+                existing_iv.net_delta_oi_31_90 = result.get('net_delta_oi_31_90')
+                existing_iv.call_delta_oi_0_7 = result.get('call_delta_oi_0_7')
+                existing_iv.call_delta_oi_8_30 = result.get('call_delta_oi_8_30')
+                existing_iv.call_delta_oi_31_90 = result.get('call_delta_oi_31_90')
+                existing_iv.put_delta_oi_0_7 = result.get('put_delta_oi_0_7')
+                existing_iv.put_delta_oi_8_30 = result.get('put_delta_oi_8_30')
+                existing_iv.put_delta_oi_31_90 = result.get('put_delta_oi_31_90')
+                existing_iv.source = 'futu'
+                existing_iv.created_at = datetime.utcnow()
+            else:
+                db.add(IVData(
+                    symbol=ticker_upper,
+                    date=today,
+                    iv7=result.get('iv7'),
+                    iv30=result.get('iv30'),
+                    iv60=result.get('iv60'),
+                    iv90=result.get('iv90'),
+                    total_oi=result.get('total_oi'),
+                    delta_oi_1d=result.get('delta_oi_1d'),
+                    oi_bucket_0_7=result.get('oi_bucket_0_7'),
+                    oi_bucket_8_30=result.get('oi_bucket_8_30'),
+                    oi_bucket_31_90=result.get('oi_bucket_31_90'),
+                    call_oi_bucket_0_7=result.get('call_oi_bucket_0_7'),
+                    call_oi_bucket_8_30=result.get('call_oi_bucket_8_30'),
+                    call_oi_bucket_31_90=result.get('call_oi_bucket_31_90'),
+                    put_oi_bucket_0_7=result.get('put_oi_bucket_0_7'),
+                    put_oi_bucket_8_30=result.get('put_oi_bucket_8_30'),
+                    put_oi_bucket_31_90=result.get('put_oi_bucket_31_90'),
+                    net_delta_oi_0_7=result.get('net_delta_oi_0_7'),
+                    net_delta_oi_8_30=result.get('net_delta_oi_8_30'),
+                    net_delta_oi_31_90=result.get('net_delta_oi_31_90'),
+                    call_delta_oi_0_7=result.get('call_delta_oi_0_7'),
+                    call_delta_oi_8_30=result.get('call_delta_oi_8_30'),
+                    call_delta_oi_31_90=result.get('call_delta_oi_31_90'),
+                    put_delta_oi_0_7=result.get('put_delta_oi_0_7'),
+                    put_delta_oi_8_30=result.get('put_delta_oi_8_30'),
+                    put_delta_oi_31_90=result.get('put_delta_oi_31_90'),
+                    source='futu',
+                ))
+
+        if price_df is None:
+            price_df = _load_price_history(result['ticker'])
+
+        if price_df is not None and not price_df.empty and 'ibkr' in data_sources_list:
+            _save_price_history(result['ticker'], price_df)
+
+        if (
+            score_calculation_enabled
+            and price_df is not None
+            and not price_df.empty
+            and (refresh_source == "all" or ticker_text in futu_ready_symbol_set)
+        ):
+
+            finviz_data = _get_imported(result['ticker'], 'finviz')
+            mc_data = _get_imported(result['ticker'], 'marketchameleon')
+            iv_data = _get_latest_iv(result['ticker'])
+
+            pool_payload = await orchestrator.calculate_momentum_pool_score(
+                symbol=result['ticker'],
+                sector_etf=sector_symbol,
+                finviz_data=finviz_data,
+                mc_data=mc_data,
+                iv_data=iv_data,
+                duration='1 Y',
+                price_df=price_df,
+                sector_df=sector_df,
+            )
+
+            if pool_payload and pool_payload.get('total_score') is not None:
+                score_value = pool_payload.get('total_score')
+                pool_scores = pool_payload.get('scores') or {}
+                pool_metrics = pool_payload.get('metrics') or {}
+                extra_metrics: Dict[str, Any] = {}
+
+                def _to_float(value: Any) -> Optional[float]:
+                    try:
+                        return float(value) if value is not None else None
+                    except (TypeError, ValueError):
+                        return None
+
+                if result.get('iv7') is not None:
+                    extra_metrics['iv7'] = _to_float(result.get('iv7'))
+                if result.get('iv30') is not None:
+                    extra_metrics['iv30'] = _to_float(result.get('iv30'))
+                if result.get('iv60') is not None:
+                    extra_metrics['iv60'] = _to_float(result.get('iv60'))
+                if result.get('iv90') is not None:
+                    extra_metrics['iv90'] = _to_float(result.get('iv90'))
+                if result.get('total_oi') is not None:
+                    extra_metrics['openInterest'] = result.get('total_oi')
+
+                bucket_payload = [
+                    {
+                        'suffix': '0_7',
+                        'label': '0-7',
+                        'net_total': _to_float(result.get('oi_bucket_0_7')),
+                        'call_total': _to_float(result.get('call_oi_bucket_0_7')),
+                        'put_total': _to_float(result.get('put_oi_bucket_0_7')),
+                        'net_delta_1d': _to_float(result.get('net_delta_oi_0_7')),
+                        'call_delta_1d': _to_float(result.get('call_delta_oi_0_7')),
+                        'put_delta_1d': _to_float(result.get('put_delta_oi_0_7')),
+                        'net_delta_3d': _to_float(result.get('net_delta3d_0_7')),
+                        'net_delta_5d': _to_float(result.get('net_delta5d_0_7')),
+                    },
+                    {
+                        'suffix': '8_30',
+                        'label': '8-30',
+                        'net_total': _to_float(result.get('oi_bucket_8_30')),
+                        'call_total': _to_float(result.get('call_oi_bucket_8_30')),
+                        'put_total': _to_float(result.get('put_oi_bucket_8_30')),
+                        'net_delta_1d': _to_float(result.get('net_delta_oi_8_30')),
+                        'call_delta_1d': _to_float(result.get('call_delta_oi_8_30')),
+                        'put_delta_1d': _to_float(result.get('put_delta_oi_8_30')),
+                        'net_delta_3d': _to_float(result.get('net_delta3d_8_30')),
+                        'net_delta_5d': _to_float(result.get('net_delta5d_8_30')),
+                    },
+                    {
+                        'suffix': '31_90',
+                        'label': '31-90',
+                        'net_total': _to_float(result.get('oi_bucket_31_90')),
+                        'call_total': _to_float(result.get('call_oi_bucket_31_90')),
+                        'put_total': _to_float(result.get('put_oi_bucket_31_90')),
+                        'net_delta_1d': _to_float(result.get('net_delta_oi_31_90')),
+                        'call_delta_1d': _to_float(result.get('call_delta_oi_31_90')),
+                        'put_delta_1d': _to_float(result.get('put_delta_oi_31_90')),
+                        'net_delta_3d': _to_float(result.get('net_delta3d_31_90')),
+                        'net_delta_5d': _to_float(result.get('net_delta5d_31_90')),
+                    },
+                ]
+                options_positioning = []
+                for bucket in bucket_payload:
+                    bucket_net_total = bucket['net_total']
+                    bucket_call_total = bucket['call_total']
+                    bucket_put_total = bucket['put_total']
+                    bucket_net_1d = bucket['net_delta_1d']
+                    bucket_call_1d = bucket['call_delta_1d']
+                    bucket_put_1d = bucket['put_delta_1d']
+                    bucket_net_3d = bucket['net_delta_3d']
+                    bucket_net_5d = bucket['net_delta_5d']
+
+                    if bucket_net_total is None and bucket_call_total is not None and bucket_put_total is not None:
+                        bucket_net_total = bucket_call_total + bucket_put_total
+                    if bucket_net_1d is None and bucket_call_1d is not None and bucket_put_1d is not None:
+                        bucket_net_1d = bucket_call_1d - bucket_put_1d
+
+                    if all(
+                        value is None
+                        for value in (
+                            bucket_net_total, bucket_call_total, bucket_put_total,
+                            bucket_net_1d, bucket_call_1d, bucket_put_1d,
+                            bucket_net_3d, bucket_net_5d,
+                        )
+                    ):
+                        continue
+
+                    if bucket_net_total is not None:
+                        extra_metrics[f"oi_bucket_{bucket['suffix']}"] = bucket_net_total
+                    if bucket_call_total is not None:
+                        extra_metrics[f"call_oi_{bucket['suffix']}"] = bucket_call_total
+                    if bucket_put_total is not None:
+                        extra_metrics[f"put_oi_{bucket['suffix']}"] = bucket_put_total
+                    if bucket_net_1d is not None:
+                        extra_metrics[f"net_delta_oi_{bucket['suffix']}"] = bucket_net_1d
+                        extra_metrics[f"delta_oi_{bucket['suffix']}"] = bucket_net_1d
+                    if bucket_call_1d is not None:
+                        extra_metrics[f"call_delta_oi_{bucket['suffix']}"] = bucket_call_1d
+                    if bucket_put_1d is not None:
+                        extra_metrics[f"put_delta_oi_{bucket['suffix']}"] = bucket_put_1d
+                    if bucket_net_3d is not None:
+                        extra_metrics[f"net_delta3d_{bucket['suffix']}"] = bucket_net_3d
+                        extra_metrics[f"delta3d_{bucket['suffix']}"] = bucket_net_3d
+                    if bucket_net_5d is not None:
+                        extra_metrics[f"net_delta5d_{bucket['suffix']}"] = bucket_net_5d
+                        extra_metrics[f"delta5d_{bucket['suffix']}"] = bucket_net_5d
+
+                    trend = '中性'
+                    trend_ref = bucket_net_1d
+                    if trend_ref is None and bucket_call_1d is not None and bucket_put_1d is not None:
+                        trend_ref = bucket_call_1d - bucket_put_1d
+                    if trend_ref is None:
+                        trend_ref = bucket_net_3d
+                    if trend_ref is not None:
+                        trend = '偏多' if trend_ref >= 0 else '偏空'
+
+                    options_positioning.append({
+                        'bucket': bucket['label'],
+                        'callOI': bucket_call_1d,
+                        'putOI': bucket_put_1d,
+                        'netOI': bucket_net_1d,
+                        'delta3d': bucket_net_3d,
+                        'delta5d': bucket_net_5d,
+                        'trend': trend,
+                    })
+                if options_positioning:
+                    extra_metrics['optionsPositioning'] = options_positioning
+
+                if mc_data:
+                    mc_rel_notional = _to_float(
+                        mc_data.get('rel_notional')
+                        if mc_data.get('rel_notional') is not None
+                        else mc_data.get('rel_notional_to_90d')
+                    )
+                    mc_rel_volume = _to_float(
+                        mc_data.get('rel_vol')
+                        if mc_data.get('rel_vol') is not None
+                        else mc_data.get('rel_vol_to_90d')
+                    )
+                    mc_iv30_change = _to_float(
+                        mc_data.get('iv30_chg_pct')
+                        if mc_data.get('iv30_chg_pct') is not None
+                        else mc_data.get('iv_change')
+                    )
+                    if mc_data.get('heat_score') is not None:
+                        extra_metrics['heat_score'] = _to_float(mc_data.get('heat_score'))
+                    if mc_data.get('risk_score') is not None:
+                        extra_metrics['risk_score'] = _to_float(mc_data.get('risk_score'))
+                    if mc_rel_notional is not None:
+                        extra_metrics['rel_notional'] = mc_rel_notional
+                        extra_metrics['rel_notional_to_90d'] = mc_rel_notional
+                    if mc_rel_volume is not None:
+                        extra_metrics['rel_vol'] = mc_rel_volume
+                        extra_metrics['rel_vol_to_90d'] = mc_rel_volume
+                    if mc_data.get('trade_count') is not None:
+                        extra_metrics['trade_count'] = mc_data.get('trade_count')
+                    if mc_iv30_change is not None:
+                        extra_metrics['iv_change'] = mc_iv30_change
+                        extra_metrics['iv30_chg_pct'] = mc_iv30_change
+
+                merged_metrics = dict(pool_metrics)
+                for metric_key, metric_value in extra_metrics.items():
+                    if metric_value is None:
+                        continue
+                    merged_metrics[metric_key] = metric_value
+
+                stock = db.query(Stock).filter(Stock.symbol == result['ticker'].upper()).first()
+                if not stock:
+                    stock = Stock(symbol=result['ticker'].upper())
+
+                sector_value = sector_symbol
+                if finviz_data and finviz_data.get('sector'):
+                    sector_value = finviz_data.get('sector')
+                industry_value = finviz_data.get('industry') if finviz_data else None
+                if not industry_value:
+                    industry_value = etf.name or etf.symbol
+
+                stock.name = finviz_data.get('company_name') if finviz_data else (stock.name or result['ticker'])
+                stock.sector = sector_value
+                stock.industry = industry_value
+                stock.price = float(price_df['close'].iloc[-1])
+                stock.score_total = score_value
+                stock.scores = pool_scores
+                stock.metrics = merged_metrics
+                db.add(stock)
+                db.flush()
+
+                snapshot_date = resolve_latest_trade_date(price_df, fallback=beijing_today()) or beijing_today()
+                existing_snapshot = db.query(ScoreSnapshot).filter(
+                    ScoreSnapshot.symbol == stock.symbol,
+                    ScoreSnapshot.symbol_type == 'stock',
+                    ScoreSnapshot.date == snapshot_date
+                ).first()
+                snapshot_payload = {
+                    'scores': pool_scores,
+                    'metrics': pool_metrics
+                }
+                thresholds_pass = (pool_scores.get('momentum', 0) >= 50 and pool_scores.get('trend', 0) >= 50)
+                stock.thresholds_pass = thresholds_pass
+                if mc_data:
+                    try:
+                        mc_heat_score = _to_float(mc_data.get('heat_score'))
+                        if mc_heat_score is not None:
+                            stock.heat_score = mc_heat_score
+                        mc_risk_score = _to_float(mc_data.get('risk_score'))
+                        if mc_risk_score is not None:
+                            stock.risk_score = mc_risk_score
+                        mc_heat_type = mc_data.get('heat_type')
+                        if isinstance(mc_heat_type, str) and mc_heat_type.strip():
+                            stock.heat_type = normalize_heat_type(mc_heat_type)
+                    except Exception:
+                        pass
+                if existing_snapshot:
+                    existing_snapshot.total_score = score_value
+                    existing_snapshot.score_breakdown = snapshot_payload
+                    existing_snapshot.thresholds_pass = thresholds_pass
+                else:
+                    db.add(ScoreSnapshot(
+                        symbol=stock.symbol,
+                        symbol_type='stock',
+                        date=snapshot_date,
+                        total_score=score_value,
+                        score_breakdown=snapshot_payload,
+                        thresholds_pass=thresholds_pass
+                    ))
+
+                stock.changes = _compute_deltas(stock.symbol)
+
+        result['score'] = score_value
+
+        total_oi_raw = result.get("total_oi")
+        total_oi_text = (
+            str(int(total_oi_raw))
+            if isinstance(total_oi_raw, (int, float)) and total_oi_raw is not None
+            else "N/A"
+        )
+        oi_0_7_raw = result.get("oi_bucket_0_7")
+        oi_8_30_raw = result.get("oi_bucket_8_30")
+        oi_31_90_raw = result.get("oi_bucket_31_90")
+        oi_0_7_text = str(int(oi_0_7_raw)) if isinstance(oi_0_7_raw, (int, float)) else "N/A"
+        oi_8_30_text = str(int(oi_8_30_raw)) if isinstance(oi_8_30_raw, (int, float)) else "N/A"
+        oi_31_90_text = str(int(oi_31_90_raw)) if isinstance(oi_31_90_raw, (int, float)) else "N/A"
+        logger.info(
+            "\n".join(
+                [
+                    f"HOLDINGS- [{log_idx}/{max(log_total, 1)}] {ticker_text}",
+                    f" - OHLCV(1Y): {ibkr_price_log}",
+                    (
+                        " - IV7/30/60/90: "
+                        f"{_fmt_float(result.get('iv7'), 2)}% / "
+                        f"{_fmt_float(result.get('iv30'), 2)}% / "
+                        f"{_fmt_float(result.get('iv60'), 2)}% / "
+                        f"{_fmt_float(result.get('iv90'), 2)}%"
+                    ),
+                    (
+                        f"-  Δ OI: {total_oi_text} "
+                        f"(0-7D: {oi_0_7_text}, 8-30D: {oi_8_30_text}, 31-90D: {oi_31_90_text})"
+                    ),
+                    "---",
+                ]
+            )
+        )
+
+        updated_stocks.append(result)
+        progress_completed += 1
+        if progress_token:
+            _patch_holdings_refresh_progress(
+                progress_token,
+                {
+                    "completed": progress_completed,
+                    "failed": progress_failed,
+                    "current_item": ticker_text,
+                    "message": f"已完成 {progress_completed}/{total_targets}",
+                },
+            )
 
     db.commit()
-    _recalculate_etf_score_from_db(etf, db)
+    if score_calculation_enabled:
+        _recalculate_etf_score_from_db(etf, db)
 
     # 评估覆盖范围的整体完整度
     holdings_with_data = [
@@ -3650,11 +4222,19 @@ async def refresh_holdings_by_coverage(
     else:
         final_message = (
             f"覆盖 {len(filtered_holdings)} 只持仓：刷新 {refreshed_count} 只，"
-            f"跳过 {skipped_recent_count} 只（{HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟内已有市场+期权数据），"
+            f"跳过 {skipped_recent_count} 只（{HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟内已有{_refresh_source_data_label(refresh_source)}），"
             f"平均完备度 {round(coverage_completeness.average_completeness, 1)}%"
         )
-    if futu_failed_count > 0:
+    if futu_unavailable_reason:
+        final_message += f"（Futu 不可用: {futu_unavailable_reason}）"
+    elif futu_batch_error:
+        final_message += f"（Futu 期权批量抓取异常: {futu_batch_error}）"
+    elif futu_failed_count > 0:
         final_message += f"（Futu 期权数据部分缺失 {futu_failed_count} 只）"
+    if refresh_source == "ibkr":
+        final_message += "；未触发评分计算"
+    elif refresh_source == "futu" and not score_calculation_enabled:
+        final_message += "；未获取到可用于评分的期权数据，未触发评分计算"
 
     if progress_token:
         _patch_holdings_refresh_progress(
@@ -3672,6 +4252,7 @@ async def refresh_holdings_by_coverage(
     return {
         "status": "success",
         "symbol": symbol.upper(),
+        "refresh_source": refresh_source,
         "coverage": coverage_label,
         "stocks_count": len(filtered_holdings),
         "refreshed_stocks_count": refreshed_count,

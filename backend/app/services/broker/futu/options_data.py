@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import structlog
 
+from app.core.time_utils import beijing_today
+
 from .connection import FutuConnection
 from .utils import OPTION_TYPE, RET_OK
 
@@ -136,7 +138,7 @@ class FutuOptionsDataFetcher:
             option_types = self.default_option_types()
 
         code = self.format_code(symbol, self.connection.market)
-        today = datetime.now().date()
+        today = beijing_today()
         end_date = today + timedelta(days=max_days)
         expirations: Dict[str, List[OptionContract]] = defaultdict(list)
         seen_contracts: set[Tuple[str, str]] = set()

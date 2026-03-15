@@ -2,6 +2,11 @@ import React, { useEffect, useMemo, useState, useCallback } from 'react';
 import { RefreshProgressModal } from '../modal';
 import type { RefreshResult } from '../../types';
 import { getHoldingsRefreshProgress } from '../../services/api';
+import {
+  formatDateTimeInBeijing,
+  getBeijingCutoffBoundaryMs,
+  parseUtcTimestampMs,
+} from '../../utils/beijingTime';
 
 interface DataStatus {
   source: 'Finviz' | 'MarketChameleon' | '市场数据' | '期权数据' | 'IBKR' | 'Futu';
@@ -40,7 +45,9 @@ interface ETFDetailCardProps {
     dataStatus: DataStatus[];
   };
   coverageRanges?: string[];
+  preferredCoverage?: string;
   onRefreshHoldings: (coverageId: string, expectedSymbolsCount?: number, progressToken?: string) => Promise<unknown>;
+  onPreferredCoverageChange?: (coverageId: string) => void;
   onImportHoldings?: (coverageId?: string) => void;
   onViewStockDetail?: (ticker: string) => void;
   refreshResult?: RefreshResult;
@@ -68,9 +75,6 @@ const COVERAGE_OPTIONS: CoverageOption[] = [
   { id: 'weight85', label: 'Weight85%', type: 'weight', value: 85 },
   { id: 'all', label: 'ALL', type: 'all' },
 ];
-
-const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000;
-const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
 type CoverageSourceKey = 'finviz' | 'marketchameleon' | 'ibkr' | 'futu';
 
@@ -187,41 +191,8 @@ const isHoldingAbove20Dma = (holding: HoldingSummary): boolean => {
   return false;
 };
 
-const normalizeIsoTimestamp = (value?: string | null): string | null => {
-  if (!value) return null;
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-  // Backend may return naive UTC timestamps; normalize to explicit UTC for stable parsing.
-  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(trimmed)) {
-    return `${trimmed}Z`;
-  }
-  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(trimmed)) {
-    return `${trimmed.replace(' ', 'T')}Z`;
-  }
-  return trimmed;
-};
-
-const BEIJING_DATETIME_FORMATTER = new Intl.DateTimeFormat('zh-CN', {
-  timeZone: 'Asia/Shanghai',
-  month: '2-digit',
-  day: '2-digit',
-  hour: '2-digit',
-  minute: '2-digit',
-  hour12: false,
-});
-
 const formatUpdatedAt = (value?: string | null): string => {
-  if (!value) return '--';
-  const normalized = normalizeIsoTimestamp(value);
-  if (!normalized) return '--';
-  const date = new Date(normalized);
-  if (Number.isNaN(date.getTime())) return '--';
-  const parts = BEIJING_DATETIME_FORMATTER.formatToParts(date);
-  const month = parts.find((part) => part.type === 'month')?.value ?? '--';
-  const day = parts.find((part) => part.type === 'day')?.value ?? '--';
-  const hour = parts.find((part) => part.type === 'hour')?.value ?? '--';
-  const minute = parts.find((part) => part.type === 'minute')?.value ?? '--';
-  return `${month}-${day} ${hour}:${minute}`;
+  return formatDateTimeInBeijing(value);
 };
 
 const getCoverageHoldings = (holdings: HoldingSummary[], option: CoverageOption): HoldingSummary[] => {
@@ -247,24 +218,8 @@ const getCoverageHoldings = (holdings: HoldingSummary[], option: CoverageOption)
   return picked;
 };
 
-const getBeijingResetBoundaryMs = (nowMs: number): number => {
-  const beijingNow = new Date(nowMs + BEIJING_OFFSET_MS);
-  const year = beijingNow.getUTCFullYear();
-  const month = beijingNow.getUTCMonth();
-  const day = beijingNow.getUTCDate();
-  const hour = beijingNow.getUTCHours();
-  let boundaryUtcMs = Date.UTC(year, month, day, 0, 0, 0, 0); // 08:00 BJT
-  if (hour < 8) {
-    boundaryUtcMs -= ONE_DAY_MS;
-  }
-  return boundaryUtcMs;
-};
-
 const parseUpdatedAtMs = (value?: string | null): number => {
-  if (!value) return Number.NaN;
-  const normalized = normalizeIsoTimestamp(value);
-  if (!normalized) return Number.NaN;
-  return new Date(normalized).getTime();
+  return parseUtcTimestampMs(value);
 };
 
 const hasFreshHoldingData = (holding: HoldingSummary, boundaryMs: number): boolean => {
@@ -388,7 +343,9 @@ const copyTextToClipboard = async (text: string): Promise<void> => {
 export function ETFDetailCard({
   etf,
   coverageRanges = [],
+  preferredCoverage,
   onRefreshHoldings,
+  onPreferredCoverageChange,
   onImportHoldings,
   onViewStockDetail,
   refreshResult,
@@ -477,11 +434,24 @@ export function ETFDetailCard({
   }, [activeCoverage, availableCoverageOptions]);
 
   useEffect(() => {
+    const normalizedPreferredCoverage = preferredCoverage?.trim().toLowerCase();
+    if (!normalizedPreferredCoverage) {
+      return;
+    }
+    if (!availableCoverageOptions.some((option) => option.id === normalizedPreferredCoverage)) {
+      return;
+    }
+    if (normalizedPreferredCoverage !== activeCoverage) {
+      setActiveCoverage(normalizedPreferredCoverage as CoverageOption['id']);
+    }
+  }, [activeCoverage, availableCoverageOptions, preferredCoverage]);
+
+  useEffect(() => {
     setCoverageCopyState('idle');
   }, [activeCoverage]);
 
   const showCoverageSection = availableCoverageOptions.length >= 1;
-  const beijingResetBoundaryMs = useMemo(() => getBeijingResetBoundaryMs(clockNowMs), [clockNowMs]);
+  const beijingResetBoundaryMs = useMemo(() => getBeijingCutoffBoundaryMs(clockNowMs), [clockNowMs]);
 
   const coverageStatsByOption = useMemo(() => {
     const stats = new Map<CoverageOption['id'], {
@@ -895,7 +865,10 @@ export function ETFDetailCard({
                 return (
                   <button
                     key={option.id}
-                    onClick={() => setActiveCoverage(option.id)}
+                    onClick={() => {
+                      setActiveCoverage(option.id);
+                      onPreferredCoverageChange?.(option.id);
+                    }}
                     className={getCoverageTabStyle(option, isActive)}
                   >
                     <span

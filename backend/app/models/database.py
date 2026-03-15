@@ -179,6 +179,27 @@ class Task(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class RefreshJob(Base):
+    __tablename__ = "refresh_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    job_type = Column(String(20), nullable=False, index=True)
+    status = Column(String(20), nullable=False, index=True, default="pending")
+    source = Column(String(20), nullable=False, default="cli")
+    payload = Column(JSON, nullable=False)
+    result = Column(JSON, nullable=True)
+    error = Column(Text, nullable=True)
+    progress_total = Column(Integer, nullable=False, default=0)
+    progress_completed = Column(Integer, nullable=False, default=0)
+    progress_failed = Column(Integer, nullable=False, default=0)
+    current_item = Column(String(64), nullable=True)
+    message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+
+
 # ============ 新增表结构 (Task 1) ============
 
 class PriceHistory(Base):

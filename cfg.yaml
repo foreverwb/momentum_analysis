@@ -14,3 +14,11 @@ futu:
 refresh:
   etf_cooldown_minutes: 15
   holdings_cooldown_minutes: 60
+  serial_gap_seconds: 2
+
+# CLI 文件查找配置
+cli:
+  downloads_dir: '~/Downloads'
+  finviz_file_prefix: 'Finviz_'
+  mc_file_prefix: 'MarketChameleon_'
+  holdings_file_prefix: ''

@@ -21,6 +21,7 @@ from sqlalchemy import and_, func
 from sqlalchemy.orm import Session
 
 from app.models import ETF, ETFHolding, IVData, MarketRegimeSnapshot, PriceHistory, get_db
+from app.core.time_utils import beijing_today, get_beijing_cutoff_boundary, utc_now_iso
 
 try:
     import numpy as np
@@ -297,15 +298,11 @@ def _normalize_datetime(value: Any) -> Optional[datetime]:
 
 
 def _get_beijing_sync_boundary() -> Dict[str, Any]:
-    now_utc = datetime.utcnow()
-    now_beijing = now_utc + timedelta(hours=8)
-    boundary_beijing = now_beijing.replace(hour=8, minute=0, second=0, microsecond=0)
-    if now_beijing < boundary_beijing:
-        boundary_beijing -= timedelta(days=1)
+    boundary = get_beijing_cutoff_boundary()
     return {
-        "boundary_utc": boundary_beijing - timedelta(hours=8),
-        "boundary_date": boundary_beijing.date(),
-        "sync_date": boundary_beijing.date().isoformat(),
+        "boundary_utc": boundary["boundary_utc"],
+        "boundary_date": boundary["boundary_date"],
+        "sync_date": boundary["sync_date"],
     }
 
 
@@ -656,7 +653,7 @@ async def get_market_regime(
         return None
 
     try:
-        today = date_type.today()
+        today = beijing_today()
 
         if not refresh:
             existing_snapshot = db.query(MarketRegimeSnapshot).filter(
@@ -1022,7 +1019,7 @@ async def sync_market_data(
             results['failed'].extend(iv_failed)
 
             iv_success_candidates: List[str] = []
-            snapshot_date = date_type.today()
+            snapshot_date = beijing_today()
             for symbol in iv_synced:
                 payload = iv_payload.get(symbol)
                 if not isinstance(payload, dict):
@@ -1215,7 +1212,7 @@ async def get_vix():
         
         return {
             'vix': vix,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': utc_now_iso()
         }
         
     except Exception as e:

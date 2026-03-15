@@ -7,6 +7,8 @@ Momentum Radar 命令行工具
 - update: 更新 ETF Holdings 数据（与 uploads 相同，更语义化的命令）
 - finviz etfs: 导入 Finviz JSON/CSV ETF 数据
 - mc etfs: 导入 MarketChameleon ETF 数据（支持整文件或按覆盖范围导入）
+- Actualiser etfs: 后台串行刷新多个 ETF
+- Actualiser holdings: 后台串行刷新多个 ETF holdings
 - init: 初始化数据库和默认数据
 
 使用示例:
@@ -31,6 +33,10 @@ Momentum Radar 命令行工具
     python -m app.cli finviz etfs -f finviz_export.csv
     python -m app.cli finviz etfs -s "XLK,XLC,XLV" -w 85 -f finviz_export.csv
 
+    # 后台提交刷新任务（命令立即返回）
+    python -m app.cli Actualiser etfs -s "XLK,XLF,SOXX"
+    python -m app.cli Actualiser holdings -s "XLK,SOXX" -w t-20
+
     # 初始化数据库
     python -m app.cli init
 """
@@ -41,7 +47,10 @@ import sys
 import os
 import json
 import re
+import socket
 import time
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 from datetime import datetime, date, timezone
 from pathlib import Path
 
@@ -53,10 +62,37 @@ PROVIDER_COMMANDS = {"finviz", "mc"}
 PROVIDER_ETF_SUBCOMMAND = "etfs"
 _SHARE_CLASS_ALIAS_PATTERN = re.compile(r"^([A-Z][A-Z0-9]{0,5})[.-]([A-Z])$")
 SQLITE_LOCK_RETRY_ATTEMPTS = 3
+DEFAULT_API_BASE_URL = os.environ.get("MOMENTUM_API_BASE_URL", "http://127.0.0.1:8000")
+REFRESH_JOB_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+REFRESH_POST_SUBMIT_POLL_SECONDS = 2.0
+REFRESH_POST_SUBMIT_POLL_INTERVAL_SECONDS = 0.25
+ACTUALISER_COMMAND = "Actualiser"
+LEGACY_REFRESH_COMMANDS = {"refresh", "actualiser"}
+ALL_REFRESH_COMMANDS = {ACTUALISER_COMMAND, *LEGACY_REFRESH_COMMANDS}
 
 # 添加 backend 根目录到 Python 路径，兼容直接执行 app/cli.py。
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_ROOT))
+
+from app.core.time_utils import beijing_today, utc_now_naive
+
+
+TOP_LEVEL_COMMANDS = {
+    "uploads",
+    "update",
+    "init",
+    "list-etfs",
+    "list-holdings",
+    "finviz",
+    "mc",
+    *ALL_REFRESH_COMMANDS,
+}
+FILE_PREFIX_ATTR_BY_COMMAND = {
+    "uploads": "holdings_file_prefix",
+    "update": "holdings_file_prefix",
+    "finviz": "finviz_file_prefix",
+    "mc": "mc_file_prefix",
+}
 
 
 def _running_in_venv() -> bool:
@@ -105,8 +141,98 @@ def _ensure_db_dependencies() -> None:
 _maybe_reexec_in_venv()
 
 
-def normalize_cli_argv(argv=None) -> list:
+def _infer_cli_invoked_command(prog: str | None = None) -> str | None:
+    program = Path(prog or sys.argv[0]).name
+    candidates = [program, Path(program).stem]
+    stem = Path(program).stem
+    if stem.endswith("-script"):
+        candidates.append(stem[:-7])
+    for candidate in candidates:
+        if candidate in TOP_LEVEL_COMMANDS:
+            return candidate
+    return None
+
+
+def _is_plain_filename(raw_value: str) -> bool:
+    if not raw_value:
+        return False
+    if raw_value.startswith("."):
+        return False
+    separators = [os.sep]
+    if os.altsep:
+        separators.append(os.altsep)
+    if any(separator in raw_value for separator in separators):
+        return False
+    return True
+
+
+def _resolve_cli_downloads_dir(config) -> Path:
+    configured = (config.cli.downloads_dir or "").strip()
+    downloads_dir = Path(configured).expanduser() if configured else Path.home() / "Downloads"
+    if downloads_dir.is_absolute():
+        return downloads_dir.resolve()
+
+    if config.loaded_from_file and config.config_path:
+        base_dir = Path(config.config_path).expanduser().resolve().parent
+    else:
+        base_dir = BACKEND_ROOT.parent
+    return (base_dir / downloads_dir).resolve()
+
+
+def _resolve_cli_file_prefix(command: str, config) -> str:
+    command_prefix_attr = FILE_PREFIX_ATTR_BY_COMMAND.get(command)
+    if command_prefix_attr:
+        command_prefix = getattr(config.cli, command_prefix_attr, "").strip()
+        if command_prefix:
+            return command_prefix
+    return (config.cli.file_prefix or "").strip()
+
+
+def resolve_cli_file_arg(file_value: str, command: str) -> str:
+    raw_value = str(file_value).strip()
+    if not raw_value:
+        return raw_value
+
+    candidate = Path(raw_value).expanduser()
+    if candidate.is_absolute():
+        return str(candidate)
+
+    direct_candidate = (Path.cwd() / candidate).resolve()
+    if candidate.exists():
+        return str(candidate.resolve())
+    if direct_candidate.exists():
+        return str(direct_candidate)
+    if not _is_plain_filename(raw_value):
+        return str(direct_candidate)
+
+    try:
+        from app.core.broker_config import load_broker_config
+    except Exception:
+        return raw_value
+
+    config = load_broker_config()
+    downloads_dir = _resolve_cli_downloads_dir(config)
+    file_prefix = _resolve_cli_file_prefix(command, config)
+
+    prefixed_candidate = None
+    if file_prefix and not raw_value.startswith(file_prefix):
+        prefixed_candidate = downloads_dir / f"{file_prefix}{raw_value}"
+        if prefixed_candidate.exists():
+            return str(prefixed_candidate.resolve())
+
+    downloads_candidate = downloads_dir / raw_value
+    if downloads_candidate.exists():
+        return str(downloads_candidate.resolve())
+
+    return raw_value
+
+
+def normalize_cli_argv(argv=None, prog: str | None = None) -> list:
     raw_args = list(sys.argv[1:] if argv is None else argv)
+    invoked_command = _infer_cli_invoked_command(prog)
+    if invoked_command and (not raw_args or raw_args[0] not in TOP_LEVEL_COMMANDS):
+        raw_args = [invoked_command, *raw_args]
+
     if not raw_args:
         return raw_args
 
@@ -123,13 +249,34 @@ def normalize_cli_argv(argv=None) -> list:
     return raw_args
 
 
-def parse_cli_args(argv=None):
+def _finalize_cli_args(parser: argparse.ArgumentParser, args):
+    if getattr(args, "command", None) in LEGACY_REFRESH_COMMANDS:
+        args.command = ACTUALISER_COMMAND
+
+    if args.command in {"uploads", "update"}:
+        positional_file = getattr(args, "file_arg", None)
+        optional_file = getattr(args, "file", None)
+        if positional_file and optional_file:
+            parser.error("uploads/update 不能同时使用位置参数 file 和 -f/--file")
+        resolved_file = optional_file or positional_file
+        if not resolved_file:
+            parser.error("uploads/update 需要提供文件路径，可使用位置参数 file 或 -f/--file")
+        args.file = resolved_file
+
+    if args.command in FILE_PREFIX_ATTR_BY_COMMAND and getattr(args, "file", None):
+        args.file = resolve_cli_file_arg(args.file, args.command)
+
+    return args
+
+
+def parse_cli_args(argv=None, prog: str | None = None):
     parser = build_parser()
-    return parser.parse_args(normalize_cli_argv(argv))
+    args = parser.parse_args(normalize_cli_argv(argv, prog=prog))
+    return _finalize_cli_args(parser, args)
 
 
 def _today_iso_date() -> str:
-    return date.today().isoformat()
+    return beijing_today().isoformat()
 
 
 def parse_xlsx_holdings(file_path: str) -> list:
@@ -332,17 +479,30 @@ def _canonical_symbol_key(symbol: str) -> str:
 
 
 def parse_etf_symbols(raw_etfs: str) -> list:
+    return _parse_symbol_csv(raw_etfs, empty_message='ETF 列表为空，请使用 -s "XLK,XLC,XLV" 形式输入')
+
+
+def _parse_symbol_csv(raw_value: str, *, empty_message: str) -> list:
     symbols = []
     seen = set()
-    for token in str(raw_etfs or "").split(','):
+    for token in str(raw_value or "").split(','):
         symbol = token.strip().upper()
         if not symbol or symbol in seen:
             continue
         seen.add(symbol)
         symbols.append(symbol)
     if not symbols:
-        raise ValueError("ETF 列表为空，请使用 -s \"XLK,XLC,XLV\" 形式输入")
+        raise ValueError(empty_message)
     return symbols
+
+
+def parse_optional_exclude_symbols(raw_symbols: str | None) -> list[str]:
+    if not str(raw_symbols or "").strip():
+        return []
+    return _parse_symbol_csv(
+        raw_symbols,
+        empty_message='exclude_symbols 为空，请使用 --exclude-symbols "UI,BRK.B" 形式输入',
+    )
 
 
 def parse_mc_coverage(raw_coverage: str) -> tuple:
@@ -379,6 +539,358 @@ def parse_mc_coverage(raw_coverage: str) -> tuple:
         return "weight", value, f"weight{value}"
 
     raise ValueError(f"无效覆盖范围: {raw_coverage}。仅支持 -w t-10 或 -w 85")
+
+
+def parse_refresh_holdings_coverage(raw_coverage: str) -> tuple:
+    text = str(raw_coverage or "").strip().lower().replace(" ", "")
+    if text == "all":
+        return "all", 0, "all"
+    return parse_mc_coverage(text)
+
+
+def _normalize_api_base_url(raw_url: str) -> str:
+    base_url = str(raw_url or DEFAULT_API_BASE_URL).strip()
+    if not base_url:
+        raise ValueError("API 地址不能为空")
+    return base_url.rstrip("/")
+
+
+def _http_json_request(method: str, url: str, payload=None, timeout: int = 10):
+    headers = {"Accept": "application/json"}
+    body = None
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    req = urllib_request.Request(url=url, data=body, method=method.upper(), headers=headers)
+    request_timeout = max(1, int(timeout))
+    try:
+        with urllib_request.urlopen(req, timeout=request_timeout) as response:
+            raw = response.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except urllib_error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="ignore")
+        detail = raw.strip()
+        if detail:
+            try:
+                payload = json.loads(detail)
+                if isinstance(payload, dict):
+                    detail = payload.get("detail") or payload.get("message") or detail
+            except Exception:
+                pass
+        raise RuntimeError(f"API 请求失败 ({exc.code}): {detail or exc.reason}") from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise RuntimeError(
+            f"API 请求超时（{request_timeout} 秒）: {url}。"
+            "如后端当前繁忙，可增大 --timeout；提交 Actualiser etfs 时也可显式传 -s 避免先拉 ETF 目录。"
+        ) from exc
+    except urllib_error.URLError as exc:
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            raise RuntimeError(
+                f"API 请求超时（{request_timeout} 秒）: {url}。"
+                "如后端当前繁忙，可增大 --timeout；提交 Actualiser etfs 时也可显式传 -s 避免先拉 ETF 目录。"
+            ) from exc
+        raise RuntimeError(
+            "无法连接后端 API，请先启动 FastAPI 服务，例如 `cd backend && .venv/bin/python -m uvicorn app.main:app --port 8000`"
+        ) from exc
+
+
+def _print_refresh_job_summary(job: dict, *, command_hint: str) -> None:
+    job_id = job.get("id")
+    queue_position = job.get("queue_position")
+    message = job.get("message") or "任务已入队"
+
+    print(message)
+    print(f"Job ID: {job_id}")
+    print(f"状态: {job.get('status')}")
+    if queue_position is not None:
+        print(f"队列位置: {queue_position}")
+    print(f"查询状态: {command_hint}")
+
+
+def _print_refresh_job_failure_details(job: dict) -> None:
+    result = job.get("result")
+    if not isinstance(result, dict):
+        return
+    items = result.get("items")
+    if not isinstance(items, list) or not items:
+        return
+
+    failed_items = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "").strip().lower()
+        if status in {"success", "snapshot"}:
+            continue
+        failed_items.append(item)
+
+    if not failed_items:
+        return
+
+    print("失败明细:")
+    for item in failed_items:
+        symbol = str(item.get("symbol") or item.get("ticker") or "-").upper()
+        coverage = str(item.get("coverage") or "").strip()
+        label = f"{symbol} ({coverage})" if coverage else symbol
+        message = item.get("message") or item.get("error") or item.get("status") or "未知错误"
+        print(f"- {label}: {message}")
+
+
+def _refresh_job_has_failures(job: dict) -> bool:
+    if not isinstance(job, dict):
+        return False
+    if job.get("error"):
+        return True
+    try:
+        if int(job.get("progress_failed") or 0) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    result = job.get("result")
+    if isinstance(result, dict):
+        summary_status = str(result.get("summary_status") or "").strip().lower()
+        if summary_status in {"failed", "partial_success"}:
+            return True
+    return False
+
+
+def _poll_refresh_job_until_terminal(
+    job_id: int,
+    *,
+    api_base: str,
+    timeout: int,
+    max_wait_seconds: float = REFRESH_POST_SUBMIT_POLL_SECONDS,
+    poll_interval_seconds: float = REFRESH_POST_SUBMIT_POLL_INTERVAL_SECONDS,
+) -> dict | None:
+    if not job_id:
+        return None
+
+    deadline = time.monotonic() + max(0.0, float(max_wait_seconds))
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(max(0.0, float(poll_interval_seconds)), remaining))
+        try:
+            job = _http_json_request(
+                "GET",
+                f"{api_base}/api/refresh-jobs/{job_id}",
+                timeout=timeout,
+            )
+        except RuntimeError:
+            return None
+
+        status = str(job.get("status") or "").strip().lower()
+        if _refresh_job_has_failures(job):
+            return job
+        if status in REFRESH_JOB_TERMINAL_STATUSES:
+            return job
+
+
+def _fetch_etf_catalog(api_base: str, *, timeout: int) -> list[dict]:
+    response = _http_json_request(
+        "GET",
+        f"{api_base}/api/etfs",
+        timeout=timeout,
+    )
+    items = response if isinstance(response, list) else response.get("items") if isinstance(response, dict) else None
+    if not isinstance(items, list):
+        raise RuntimeError("无法从后端获取 ETF 列表")
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _extract_etf_symbols_from_catalog(items: list[dict]) -> list[str]:
+    symbols = parse_etf_symbols(
+        ",".join(
+            str(item.get("symbol") or "").strip()
+            for item in items
+            if str(item.get("symbol") or "").strip()
+        )
+    )
+    if not symbols:
+        raise RuntimeError("后端未返回可刷新的 ETF 列表")
+    return symbols
+
+
+def _split_symbols_by_holdings(symbols: list[str], items: list[dict]) -> tuple[list[str], list[str]]:
+    holdings_count_by_symbol = {}
+    for item in items:
+        symbol = _normalize_symbol(item.get("symbol"))
+        if not symbol:
+            continue
+        try:
+            holdings_count = int(item.get("holdingsCount") or 0)
+        except (TypeError, ValueError):
+            holdings_count = 0
+        holdings_count_by_symbol[symbol] = max(0, holdings_count)
+
+    refreshable = []
+    skipped = []
+    for symbol in symbols:
+        holdings_count = holdings_count_by_symbol.get(symbol)
+        if holdings_count is None or holdings_count > 0:
+            refreshable.append(symbol)
+        else:
+            skipped.append(symbol)
+
+    return refreshable, skipped
+
+
+def _fetch_all_etf_symbols(api_base: str, *, timeout: int) -> list[str]:
+    items = _fetch_etf_catalog(api_base, timeout=timeout)
+
+    return _extract_etf_symbols_from_catalog(items)
+
+
+def cmd_refresh_etfs(args):
+    api_base = _normalize_api_base_url(args.api_base)
+    require_holdings = args.source in {"ibkr", "futu"}
+
+    if args.symbols:
+        symbols = parse_etf_symbols(args.symbols)
+        if require_holdings:
+            etf_catalog = _fetch_etf_catalog(api_base, timeout=args.timeout)
+            symbols, skipped_symbols = _split_symbols_by_holdings(symbols, etf_catalog)
+            if skipped_symbols:
+                print(f"已跳过无 holdings 数据的 ETF: {','.join(skipped_symbols)}")
+    else:
+        etf_catalog = _fetch_etf_catalog(api_base, timeout=args.timeout)
+        all_symbols = _extract_etf_symbols_from_catalog(etf_catalog)
+        if require_holdings:
+            symbols, skipped_symbols = _split_symbols_by_holdings(all_symbols, etf_catalog)
+            print(f"未提供 ETF 列表，已自动加载有 holdings 数据的 ETF: {len(symbols)} 个")
+            if skipped_symbols:
+                print(f"已跳过无 holdings 数据的 ETF: {','.join(skipped_symbols)}")
+        else:
+            symbols = all_symbols
+            print(f"未提供 ETF 列表，已自动加载全部 ETF: {len(symbols)} 个")
+
+    if not symbols:
+        print("没有具备 holdings 数据的 ETF，跳过提交任务")
+        return
+
+    response = _http_json_request(
+        "POST",
+        f"{api_base}/api/refresh-jobs/etfs",
+        payload={
+            "symbols": symbols,
+            "source": "cli",
+            "refresh_source": args.source,
+        },
+        timeout=args.timeout,
+    )
+    job = response.get("job") or {}
+    _print_refresh_job_summary(
+        job,
+        command_hint=f"python -m app.cli {ACTUALISER_COMMAND} status {job.get('id')} --api-base {api_base}",
+    )
+
+
+def cmd_refresh_holdings(args):
+    symbols = parse_etf_symbols(args.symbols)
+    exclude_symbols = parse_optional_exclude_symbols(getattr(args, "exclude_symbols", None))
+    coverage_type, coverage_value, coverage_label = parse_refresh_holdings_coverage(args.coverage)
+    api_base = _normalize_api_base_url(args.api_base)
+    response = _http_json_request(
+        "POST",
+        f"{api_base}/api/refresh-jobs/holdings",
+        payload={
+            "items": [
+                {
+                    "symbol": symbol,
+                    "coverage_type": coverage_type,
+                    "coverage_value": coverage_value,
+                    "related_etf_symbols": [],
+                }
+                for symbol in symbols
+            ],
+            "source": "cli",
+            "refresh_source": args.source,
+            "exclude_symbols": exclude_symbols,
+        },
+        timeout=args.timeout,
+    )
+    job = response.get("job") or {}
+    command_hint = f"python -m app.cli {ACTUALISER_COMMAND} status {job.get('id')} --api-base {api_base}"
+    print(f"已提交 holdings 刷新任务: {','.join(symbols)} ({coverage_label})")
+    _print_refresh_job_summary(
+        job,
+        command_hint=command_hint,
+    )
+    terminal_job = _poll_refresh_job_until_terminal(
+        int(job.get("id") or 0),
+        api_base=api_base,
+        timeout=args.timeout,
+    )
+    if terminal_job and _refresh_job_has_failures(terminal_job):
+        job_status = str(terminal_job.get("status") or "").strip().lower()
+        if job_status in REFRESH_JOB_TERMINAL_STATUSES:
+            print("后台任务快速返回错误:")
+        else:
+            print("后台任务已发现错误，任务仍在后台继续:")
+        if terminal_job.get("message"):
+            print(f"消息: {terminal_job.get('message')}")
+        if terminal_job.get("error"):
+            print(f"错误: {terminal_job.get('error')}")
+        _print_refresh_job_failure_details(terminal_job)
+        print(f"查询状态: {command_hint}")
+
+
+def cmd_refresh_status(args):
+    api_base = _normalize_api_base_url(args.api_base)
+    job = _http_json_request(
+        "GET",
+        f"{api_base}/api/refresh-jobs/{args.job_id}",
+        timeout=args.timeout,
+    )
+    print(f"Job ID: {job.get('id')}")
+    print(f"类型: {job.get('job_type')}")
+    print(f"状态: {job.get('status')}")
+    print(f"进度: {job.get('progress_completed')}/{job.get('progress_total')} (失败 {job.get('progress_failed')})")
+    if job.get("current_item"):
+        print(f"当前标的: {job.get('current_item')}")
+    if job.get("queue_position") is not None:
+        print(f"队列位置: {job.get('queue_position')}")
+    if job.get("message"):
+        print(f"消息: {job.get('message')}")
+    if job.get("error"):
+        print(f"错误: {job.get('error')}")
+    _print_refresh_job_failure_details(job)
+    if args.show_result and job.get("result") is not None:
+        print("结果:")
+        print(json.dumps(job.get("result"), ensure_ascii=False, indent=2))
+
+
+def cmd_refresh_list(args):
+    api_base = _normalize_api_base_url(args.api_base)
+    query_params = [f"limit={int(args.limit)}"]
+    if args.status:
+        query_params.append(f"status={args.status}")
+    response = _http_json_request(
+        "GET",
+        f"{api_base}/api/refresh-jobs?{'&'.join(query_params)}",
+        timeout=args.timeout,
+    )
+    items = response.get("items") or []
+    if not items:
+        print("暂无刷新任务")
+        return
+
+    print(f"{'ID':<6} {'TYPE':<10} {'STATUS':<12} {'PROGRESS':<14} {'QUEUE':<8} MESSAGE")
+    for item in items:
+        progress = f"{item.get('progress_completed', 0)}/{item.get('progress_total', 0)}"
+        queue_position = item.get("queue_position")
+        queue_text = "-" if queue_position is None else str(queue_position)
+        message = str(item.get("message") or "")
+        print(
+            f"{str(item.get('id')):<6} "
+            f"{str(item.get('job_type')):<10} "
+            f"{str(item.get('status')):<12} "
+            f"{progress:<14} "
+            f"{queue_text:<8} "
+            f"{message}"
+        )
 
 
 def load_mc_json_rows(file_path: str) -> list:
@@ -669,7 +1181,7 @@ def cmd_import_finviz(args):
 
     init_db()
 
-    data_date_str = args.date if args.date else datetime.now().strftime("%Y-%m-%d")
+    data_date_str = args.date if args.date else _today_iso_date()
     file_path = args.file
 
     try:
@@ -847,10 +1359,21 @@ def cmd_import_finviz(args):
 
                 etf_record = db.query(ETF).filter(ETF.symbol == plan["etf_symbol"]).first()
                 if etf_record:
-                    existing_ranges = getattr(etf_record, 'coverage_ranges', None) or []
-                    if coverage_label not in existing_ranges:
-                        existing_ranges.append(coverage_label)
-                        etf_record.coverage_ranges = existing_ranges
+                    raw_ranges = getattr(etf_record, 'coverage_ranges', None) or []
+                    if isinstance(raw_ranges, str):
+                        try:
+                            parsed_ranges = json.loads(raw_ranges)
+                            raw_ranges = parsed_ranges if isinstance(parsed_ranges, list) else []
+                        except Exception:
+                            raw_ranges = []
+                    existing_ranges = [
+                        str(item).strip().lower()
+                        for item in raw_ranges
+                        if isinstance(item, str) and str(item).strip()
+                    ]
+                    next_ranges = [coverage_label, *[item for item in existing_ranges if item != coverage_label]]
+                    if next_ranges != existing_ranges:
+                        etf_record.coverage_ranges = next_ranges
                         etf_record.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
                 results.append({
@@ -919,7 +1442,7 @@ def cmd_import_mc(args):
 
     init_db()
 
-    data_date_str = args.date if args.date else datetime.now().strftime("%Y-%m-%d")
+    data_date_str = args.date if args.date else _today_iso_date()
     file_path = args.file
 
     try:
@@ -1084,10 +1607,21 @@ def cmd_import_mc(args):
 
                 etf_record = db.query(ETF).filter(ETF.symbol == plan["etf_symbol"]).first()
                 if etf_record:
-                    existing_ranges = getattr(etf_record, 'coverage_ranges', None) or []
-                    if coverage_label not in existing_ranges:
-                        existing_ranges.append(coverage_label)
-                        etf_record.coverage_ranges = existing_ranges
+                    raw_ranges = getattr(etf_record, 'coverage_ranges', None) or []
+                    if isinstance(raw_ranges, str):
+                        try:
+                            parsed_ranges = json.loads(raw_ranges)
+                            raw_ranges = parsed_ranges if isinstance(parsed_ranges, list) else []
+                        except Exception:
+                            raw_ranges = []
+                    existing_ranges = [
+                        str(item).strip().lower()
+                        for item in raw_ranges
+                        if isinstance(item, str) and str(item).strip()
+                    ]
+                    next_ranges = [coverage_label, *[item for item in existing_ranges if item != coverage_label]]
+                    if next_ranges != existing_ranges:
+                        etf_record.coverage_ranges = next_ranges
                         etf_record.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
                 results.append({
@@ -1162,7 +1696,7 @@ def cmd_uploads(args):
     # 验证参数
     etf_type = args.type
     etf_symbol = args.etf_symbol.upper()
-    data_date_str = args.date if args.date else datetime.now().strftime("%Y-%m-%d")
+    data_date_str = args.date if args.date else _today_iso_date()
     file_path = args.file
     parent_sector = args.sector.upper() if args.sector else None
     
@@ -1287,7 +1821,7 @@ def cmd_uploads(args):
         
         # 更新 ETF 的持仓数量
         etf.holdings_count = len(valid_holdings)
-        etf.updated_at = datetime.now()
+        etf.updated_at = utc_now_naive()
         
         # 删除该 ETF 在指定日期的旧上传日志（支持重复上传）
         db.query(HoldingsUploadLog).filter(
@@ -1483,6 +2017,16 @@ def build_parser():
   python -m app.cli mc etfs -d 2026-03-06 -s "XLK,XLC,XLV" -w 85 -f marketchameleon.json
   python -m app.cli mc etfs -s "XLK,XLC,XLV" -w t-10 -f marketchameleon.json
 
+  # 激活 backend 虚拟环境并执行 ./bin/install-cli-shortcuts 后，可直接使用短命令
+  Actualiser etfs -s "XLK,XLF,SOXX"
+  finviz -f export.csv
+  mc -f marketchameleon.json
+
+  # 后台提交刷新任务（命令不会等待刷新完成）
+  python -m app.cli Actualiser etfs -s "XLK,XLF,SOXX"
+  python -m app.cli Actualiser holdings -s "XLK,SOXX" -w t-20
+  python -m app.cli Actualiser status 12
+
   # 旧写法仍兼容，会自动按 etfs 处理
   python -m app.cli finviz -f finviz_export.csv
   python -m app.cli mc -f marketchameleon_etfs.json
@@ -1506,7 +2050,16 @@ def build_parser():
     uploads_parser.add_argument('-a', '--etf-symbol', required=True, dest='etf_symbol',
                                help='ETF 符号 (如 XLK, SOXX)')
     uploads_parser.add_argument('-s', '--sector', help='父板块符号 (仅 industry 类型需要)')
-    uploads_parser.add_argument('file', help='Holdings 文件路径 (xlsx/xls/csv)')
+    uploads_parser.add_argument(
+        '-f', '--file',
+        required=False,
+        help='Holdings 文件路径或文件名；仅填文件名时会按 cfg.yaml 的 cli.downloads_dir / holdings_file_prefix 自动补全'
+    )
+    uploads_parser.add_argument(
+        'file_arg',
+        nargs='?',
+        help='兼容旧写法的 Holdings 文件路径 (xlsx/xls/csv)'
+    )
     uploads_parser.set_defaults(func=cmd_uploads)
     
     # update 命令 (uploads 的别名，更语义化)
@@ -1523,7 +2076,16 @@ def build_parser():
     update_parser.add_argument('-a', '--etf-symbol', required=True, dest='etf_symbol',
                               help='ETF 符号 (如 XLK, SOXX)')
     update_parser.add_argument('-s', '--sector', help='父板块符号 (仅 industry 类型需要)')
-    update_parser.add_argument('file', help='Holdings 文件路径 (xlsx/xls/csv)')
+    update_parser.add_argument(
+        '-f', '--file',
+        required=False,
+        help='Holdings 文件路径或文件名；仅填文件名时会按 cfg.yaml 的 cli.downloads_dir / holdings_file_prefix 自动补全'
+    )
+    update_parser.add_argument(
+        'file_arg',
+        nargs='?',
+        help='兼容旧写法的 Holdings 文件路径 (xlsx/xls/csv)'
+    )
     update_parser.set_defaults(func=cmd_uploads)
     
     # init 命令
@@ -1559,7 +2121,7 @@ def build_parser():
     )
     import_finviz_parser.add_argument(
         '-f', '--file', required=True,
-        help='Finviz JSON/CSV 文件路径'
+        help='Finviz JSON/CSV 文件路径或文件名；仅填文件名时会按 cfg.yaml 的 cli.downloads_dir / finviz_file_prefix 自动补全'
     )
     import_finviz_parser.add_argument(
         '-s', '--etfs', required=False,
@@ -1589,7 +2151,7 @@ def build_parser():
     )
     import_mc_parser.add_argument(
         '-f', '--file', required=True,
-        help='MarketChameleon JSON 文件路径'
+        help='MarketChameleon JSON 文件路径或文件名；仅填文件名时会按 cfg.yaml 的 cli.downloads_dir / mc_file_prefix 自动补全'
     )
     import_mc_parser.add_argument(
         '-s', '--etfs', required=False,
@@ -1601,6 +2163,107 @@ def build_parser():
     )
     import_mc_parser.set_defaults(resource=PROVIDER_ETF_SUBCOMMAND)
     import_mc_parser.set_defaults(func=cmd_import_mc)
+
+    refresh_parser = subparsers.add_parser(
+        ACTUALISER_COMMAND,
+        aliases=sorted(LEGACY_REFRESH_COMMANDS),
+        help='提交后台刷新任务并由服务端串行执行'
+    )
+    refresh_subparsers = refresh_parser.add_subparsers(dest='resource')
+    refresh_subparsers.required = True
+
+    refresh_etfs_parser = refresh_subparsers.add_parser(
+        'etfs',
+        help='后台刷新多个 ETF，命令提交后立即返回'
+    )
+    refresh_etfs_parser.add_argument(
+        '-s', '--symbols', required=False,
+        help='ETF 列表，逗号分隔（如 "XLK,XLF,SOXX"）；省略时默认刷新全部 ETF'
+    )
+    refresh_etfs_parser.add_argument(
+        '--source', choices=['all', 'ibkr', 'futu'], default='all',
+        help='刷新数据源，默认 all'
+    )
+    refresh_etfs_parser.add_argument(
+        '--api-base', default=DEFAULT_API_BASE_URL,
+        help=f'后端 API 地址，默认 {DEFAULT_API_BASE_URL}'
+    )
+    refresh_etfs_parser.add_argument(
+        '--timeout', type=int, default=10,
+        help='提交任务请求超时（秒）'
+    )
+    refresh_etfs_parser.set_defaults(func=cmd_refresh_etfs)
+
+    refresh_holdings_parser = refresh_subparsers.add_parser(
+        'holdings',
+        help='后台串行刷新多个 ETF holdings，命令提交后立即返回'
+    )
+    refresh_holdings_parser.add_argument(
+        '-s', '--symbols', required=True,
+        help='ETF 列表，逗号分隔（如 "XLK,SOXX"）'
+    )
+    refresh_holdings_parser.add_argument(
+        '-w', '--coverage', default='t-20',
+        help='覆盖范围，支持 t-20 / 85 / all，默认 t-20'
+    )
+    refresh_holdings_parser.add_argument(
+        '--source', choices=['all', 'ibkr', 'futu'], default='all',
+        help='刷新数据源，默认 all'
+    )
+    refresh_holdings_parser.add_argument(
+        '--exclude-symbols',
+        help='可选，逗号分隔；这些 ticker 缺少最新导入数据时不阻塞 holdings 刷新，例如 "UI,BRK.B"',
+    )
+    refresh_holdings_parser.add_argument(
+        '--api-base', default=DEFAULT_API_BASE_URL,
+        help=f'后端 API 地址，默认 {DEFAULT_API_BASE_URL}'
+    )
+    refresh_holdings_parser.add_argument(
+        '--timeout', type=int, default=10,
+        help='提交任务请求超时（秒）'
+    )
+    refresh_holdings_parser.set_defaults(func=cmd_refresh_holdings)
+
+    refresh_status_parser = refresh_subparsers.add_parser(
+        'status',
+        help='查看后台刷新任务状态'
+    )
+    refresh_status_parser.add_argument('job_id', type=int, help='job id')
+    refresh_status_parser.add_argument(
+        '--api-base', default=DEFAULT_API_BASE_URL,
+        help=f'后端 API 地址，默认 {DEFAULT_API_BASE_URL}'
+    )
+    refresh_status_parser.add_argument(
+        '--timeout', type=int, default=10,
+        help='请求超时（秒）'
+    )
+    refresh_status_parser.add_argument(
+        '--show-result', action='store_true',
+        help='输出完整 result JSON'
+    )
+    refresh_status_parser.set_defaults(func=cmd_refresh_status)
+
+    refresh_list_parser = refresh_subparsers.add_parser(
+        'list',
+        help='列出最近的后台刷新任务'
+    )
+    refresh_list_parser.add_argument(
+        '--status', choices=['pending', 'running', 'completed', 'failed'],
+        help='按状态过滤'
+    )
+    refresh_list_parser.add_argument(
+        '--limit', type=int, default=10,
+        help='返回 job 数量，默认 10'
+    )
+    refresh_list_parser.add_argument(
+        '--api-base', default=DEFAULT_API_BASE_URL,
+        help=f'后端 API 地址，默认 {DEFAULT_API_BASE_URL}'
+    )
+    refresh_list_parser.add_argument(
+        '--timeout', type=int, default=10,
+        help='请求超时（秒）'
+    )
+    refresh_list_parser.set_defaults(func=cmd_refresh_list)
 
     return parser
 
@@ -1615,8 +2278,12 @@ def main():
 
     if args.command in {"uploads", "update", "init", "list-etfs", "list-holdings", "finviz", "mc"}:
         _ensure_db_dependencies()
-    
-    args.func(args)
+
+    try:
+        args.func(args)
+    except RuntimeError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == '__main__':

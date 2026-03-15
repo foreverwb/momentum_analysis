@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from app.services.broker.futu.iv_calculator import FutuIVCalculator
+from app.services.broker.futu.iv_calculator import FutuIVCalculator, IVTermResult
 from app.services.broker.futu.options_data import (
     FutuOptionsDataFetcher,
     OptionChainFetchMeta,
@@ -279,3 +279,64 @@ def test_pick_atm_iv_uses_call_side_from_combined_chain_records():
     }
 
     assert calculator._pick_atm_iv(contracts, snapshot_map) == 40.0
+
+
+def test_compute_bucket_delta_payload_uses_delta_notional_change_formula():
+    connection = _DummyConnection(client=object())
+    calculator = FutuIVCalculator(
+        connection=connection,
+        options_fetcher=FutuOptionsDataFetcher(connection=connection),
+        oi_cache_file="/tmp/futu_oi_cache_test.db",
+    )
+    today = datetime(2026, 1, 15).date()
+    result = IVTermResult(total_oi=15, risk_total_oi=90000)
+    result._snapshot_payload = {
+        "total_oi": 15,
+        "risk_total_oi": 90000,
+        "buckets": {
+            "0_7": {"net": None, "call": None, "put": None, "risk_net": None},
+            "8_30": {"net": 15, "call": 15, "put": None, "risk_net": 90000},
+            "31_90": {"net": None, "call": None, "put": None, "risk_net": None},
+        },
+        "contracts": {
+            "US.TEST260215C00100000": {
+                "oi": 15,
+                "bucket": "8_30",
+                "side": "call",
+                "risk_weight": 6000.0,
+            },
+        },
+    }
+    cache = {
+        "TEST": {
+            "2026-01-14": {
+                "total_oi": 10,
+                "risk_total_oi": 50000,
+                "buckets": {
+                    "0_7": {"net": None, "call": None, "put": None, "risk_net": None},
+                    "8_30": {"net": 10, "call": 10, "put": None, "risk_net": 50000},
+                    "31_90": {"net": None, "call": None, "put": None, "risk_net": None},
+                },
+                "contracts": {
+                    "US.TEST260215C00100000": {
+                        "oi": 10,
+                        "bucket": "8_30",
+                        "side": "call",
+                        "risk_weight": 5000.0,
+                    },
+                },
+            },
+        },
+    }
+
+    payload = calculator._compute_bucket_delta_payload(
+        symbol="TEST",
+        today=today,
+        result=result,
+        cache=cache,
+    )
+
+    assert payload["total_oi_1d"] == 30000
+    assert payload["by_bucket"]["8_30"]["net_1d"] == 30000
+    assert payload["by_bucket"]["8_30"]["call_1d"] == 30000
+    assert payload["by_bucket"]["8_30"]["put_1d"] is None

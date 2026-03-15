@@ -13,6 +13,7 @@ from typing import List, Optional, Dict, Any
 
 from app.models import get_db, Stock, ImportedData, ETFHolding, ETF, PriceHistory, IVData, ScoreSnapshot
 from app.api.series_utils import build_metric_series, build_sma20_comparison_series
+from app.core.time_utils import utc_isoformat
 from app.services.parsers import normalize_heat_type
 router = APIRouter()
 
@@ -948,8 +949,8 @@ async def get_stock_detail(
             "riskScore": stock.risk_score or 0.0,
             "thresholdsPass": stock.thresholds_pass if stock.thresholds_pass is not None else True,
         },
-        "updatedAt": stock.updated_at.isoformat() if stock.updated_at else None,
-        "createdAt": stock.created_at.isoformat() if stock.created_at else None,
+        "updatedAt": utc_isoformat(stock.updated_at),
+        "createdAt": utc_isoformat(stock.created_at),
     }
     
     return response
@@ -960,7 +961,7 @@ async def get_stock_trend_comparison(
     symbol: str,
     period: int = Query(20, description="对比周期（交易日）: 5/20/63"),
     metric: str = Query("relative", description="指标: relative/sma20/return20d/score"),
-    label_tz: str = Query("market", description="日期标签时区: market/beijing"),
+    label_tz: str = Query("beijing", description="日期标签时区，默认北京时间"),
     db: Session = Depends(get_db)
 ):
     """
@@ -970,7 +971,7 @@ async def get_stock_trend_comparison(
         raise HTTPException(status_code=400, detail="period must be one of 5, 20, 63")
     if metric not in ("relative", "sma20", "return20d", "score"):
         raise HTTPException(status_code=400, detail="metric must be one of relative, sma20, return20d, score")
-    normalized_label_tz = (label_tz or "market").strip().lower()
+    normalized_label_tz = (label_tz or "beijing").strip().lower()
     if normalized_label_tz not in ("market", "beijing"):
         raise HTTPException(status_code=400, detail="label_tz must be one of market, beijing")
 
@@ -1277,6 +1278,77 @@ async def get_stock_options_overlay(
                 return "偏空"
         return "中性"
 
+    bucket_suffixes = (("0-7", "0_7"), ("8-30", "8_30"), ("31-90", "31_90"))
+
+    def _build_iv_history_positioning() -> Dict[str, Dict[str, Any]]:
+        if latest_iv_record is None or getattr(latest_iv_record, "date", None) is None:
+            return {}
+
+        previous_rows = db.query(IVData).filter(
+            IVData.symbol == stock.symbol,
+            IVData.date < latest_iv_record.date,
+        ).order_by(IVData.date.desc(), IVData.id.desc()).limit(5).all()
+
+        prev1 = previous_rows[0] if len(previous_rows) >= 1 else None
+        prev3 = previous_rows[2] if len(previous_rows) >= 3 else None
+        prev5 = previous_rows[4] if len(previous_rows) >= 5 else None
+
+        def _delta(current: Optional[float], previous: Optional[float]) -> Optional[float]:
+            if current is None or previous is None:
+                return None
+            return current - previous
+
+        def _record_float(record: Optional[IVData], attr: str) -> Optional[float]:
+            if record is None:
+                return None
+            return _as_float(getattr(record, attr, None))
+
+        computed: Dict[str, Dict[str, Any]] = {}
+        for bucket, suffix in bucket_suffixes:
+            # Stock.metrics may lag the freshest IVData row by one refresh cycle.
+            # Use the latest IV snapshot as the current-source-of-truth for bucket totals.
+            current_call_total = _as_float(
+                getattr(latest_iv_record, f"call_oi_bucket_{suffix}", None),
+                metrics.get(f"call_oi_{suffix}"),
+                metrics.get(f"call_oi_bucket_{suffix}"),
+            )
+            current_put_total = _as_float(
+                getattr(latest_iv_record, f"put_oi_bucket_{suffix}", None),
+                metrics.get(f"put_oi_{suffix}"),
+                metrics.get(f"put_oi_bucket_{suffix}"),
+            )
+            current_net_total = _as_float(
+                getattr(latest_iv_record, f"oi_bucket_{suffix}", None),
+                metrics.get(f"oi_bucket_{suffix}"),
+                metrics.get(f"net_oi_{suffix}"),
+            )
+            if current_net_total is None and current_call_total is not None and current_put_total is not None:
+                current_net_total = current_call_total + current_put_total
+
+            call_oi = _delta(current_call_total, _record_float(prev1, f"call_oi_bucket_{suffix}"))
+            put_oi = _delta(current_put_total, _record_float(prev1, f"put_oi_bucket_{suffix}"))
+            net_oi = _delta(current_net_total, _record_float(prev1, f"oi_bucket_{suffix}"))
+            delta3d = _delta(current_net_total, _record_float(prev3, f"oi_bucket_{suffix}"))
+            delta5d = _delta(current_net_total, _record_float(prev5, f"oi_bucket_{suffix}"))
+
+            if all(value is None for value in (call_oi, put_oi, net_oi, delta3d, delta5d)):
+                continue
+
+            trend_reference = net_oi if net_oi is not None else delta3d if delta3d is not None else delta5d
+            computed[bucket] = {
+                "bucket": bucket,
+                "callOI": call_oi,
+                "putOI": put_oi,
+                "netOI": net_oi,
+                "delta3d": delta3d,
+                "delta5d": delta5d,
+                "trend": _infer_trend(trend_reference, call_oi, put_oi),
+            }
+
+        return computed
+
+    iv_history_positioning = _build_iv_history_positioning()
+
     positioning: List[Dict[str, Any]] = []
     raw_positioning = metrics.get("optionsPositioning", []) if isinstance(metrics.get("optionsPositioning"), list) else []
     for row in raw_positioning:
@@ -1323,19 +1395,27 @@ async def get_stock_options_overlay(
         )
 
     supplemental_positioning: Dict[str, Dict[str, Any]] = {}
-    bucket_suffixes = (("0-7", "0_7"), ("8-30", "8_30"), ("31-90", "31_90"))
     for bucket, suffix in bucket_suffixes:
+        history_row = iv_history_positioning.get(bucket) or {}
         call_oi = _as_float(
+            history_row.get("callOI"),
+            getattr(latest_iv_record, f"call_delta_oi_{suffix}", None),
             metrics.get(f"call_delta_oi_{suffix}"),
             metrics.get(f"call_oi_{suffix}"),
+            metrics.get(f"call_oi_bucket_{suffix}"),
             mc_data.get(f"call_delta_oi_{suffix}"),
         )
         put_oi = _as_float(
+            history_row.get("putOI"),
+            getattr(latest_iv_record, f"put_delta_oi_{suffix}", None),
             metrics.get(f"put_delta_oi_{suffix}"),
             metrics.get(f"put_oi_{suffix}"),
+            metrics.get(f"put_oi_bucket_{suffix}"),
             mc_data.get(f"put_delta_oi_{suffix}"),
         )
         net_oi = _as_float(
+            history_row.get("netOI"),
+            getattr(latest_iv_record, f"net_delta_oi_{suffix}", None),
             metrics.get(f"net_delta_oi_{suffix}"),
             metrics.get(f"delta_oi_{suffix}"),
             metrics.get(f"net_oi_{suffix}"),
@@ -1347,6 +1427,7 @@ async def get_stock_options_overlay(
         if net_oi is None and call_oi is not None and put_oi is not None:
             net_oi = call_oi - put_oi
         delta3d = _as_float(
+            history_row.get("delta3d"),
             metrics.get(f"delta3d_{suffix}"),
             metrics.get(f"delta_3d_{suffix}"),
             metrics.get(f"net_delta3d_{suffix}"),
@@ -1354,6 +1435,7 @@ async def get_stock_options_overlay(
             mc_data.get(f"delta_3d_{suffix}"),
         )
         delta5d = _as_float(
+            history_row.get("delta5d"),
             metrics.get(f"delta5d_{suffix}"),
             metrics.get(f"delta_5d_{suffix}"),
             metrics.get(f"net_delta5d_{suffix}"),
@@ -1371,7 +1453,7 @@ async def get_stock_options_overlay(
             "netOI": net_oi,
             "delta3d": delta3d,
             "delta5d": delta5d,
-            "trend": _infer_trend(net_oi, call_oi, put_oi),
+            "trend": _infer_trend(net_oi, call_oi, put_oi, str(history_row.get("trend") or "").strip()),
         }
 
     if positioning and supplemental_positioning:

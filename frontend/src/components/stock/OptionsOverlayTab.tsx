@@ -7,6 +7,7 @@
 import React, { useEffect, useState } from 'react';
 import type { StockDetail, OptionsScoreData } from '../../types';
 import { getOptionsOverlayData, type OptionsOverlayData, type OptionsPositioningData } from '../../services/api';
+import { formatDateTimeInBeijing } from '../../utils/beijingTime';
 
 interface OptionsOverlayTabProps {
   stock: StockDetail;
@@ -237,19 +238,32 @@ export function OptionsOverlayTab({ stock }: OptionsOverlayTabProps) {
       if (!bucket) return null;
       const normalizedBucket = normalizeBucketLabel(bucket);
 
+      const hasExplicitCallSplit = [
+        'callOI', 'call_oi', 'call_delta_1d', 'callDelta1d', 'call_delta_oi', 'callDeltaOI',
+        'call_delta', 'callDelta', 'call_change', 'callChange', 'call',
+      ].some((key) => row[key] !== undefined);
+      const hasExplicitPutSplit = [
+        'putOI', 'put_oi', 'put_delta_1d', 'putDelta1d', 'put_delta_oi', 'putDeltaOI',
+        'put_delta', 'putDelta', 'put_change', 'putChange', 'put',
+      ].some((key) => row[key] !== undefined);
       const callOI = toNumber(
-        row.callOI ?? row.call_oi ?? row.call_delta ?? row.callDelta ?? row.call_change ?? row.callChange ?? row.call
+        row.callOI ?? row.call_oi ?? row.call_delta_1d ?? row.callDelta1d ?? row.call_delta_oi ??
+        row.callDeltaOI ?? row.call_delta ?? row.callDelta ?? row.call_change ?? row.callChange ?? row.call
       );
       const putOI = toNumber(
-        row.putOI ?? row.put_oi ?? row.put_delta ?? row.putDelta ?? row.put_change ?? row.putChange ?? row.put
+        row.putOI ?? row.put_oi ?? row.put_delta_1d ?? row.putDelta1d ?? row.put_delta_oi ??
+        row.putDeltaOI ?? row.put_delta ?? row.putDelta ?? row.put_change ?? row.putChange ?? row.put
       );
       const netOI = toNumber(
-        row.netOI ?? row.net_oi ?? row.net_delta ?? row.netDelta ?? row.net_change ?? row.netChange ?? row.net
+        row.netOI ?? row.net_oi ?? row.net_delta_1d ?? row.netDelta1d ?? row.net_delta_oi ??
+        row.netDeltaOI ?? row.net_delta ?? row.netDelta ?? row.net_change ?? row.netChange ?? row.net
       );
       const delta3d = toNumber(row.delta3d ?? row.delta_3d ?? row.delta3D ?? row.delta_oi_3d);
       const delta5d = toNumber(row.delta5d ?? row.delta_5d ?? row.delta5D ?? row.delta_oi_5d);
       // Compatibility fix: old payload used 0/0 as placeholder when call/put split was unavailable.
       const placeholderSplit =
+        !hasExplicitCallSplit &&
+        !hasExplicitPutSplit &&
         callOI === 0 &&
         putOI === 0 &&
         [netOI, delta3d, delta5d].some((value) => typeof value === 'number' && value !== 0);
@@ -630,7 +644,7 @@ export function OptionsOverlayTab({ stock }: OptionsOverlayTabProps) {
 
         {optionsOverlay?.updatedAt && (
           <p className="mt-4 text-xs text-[var(--text-muted)]">
-            数据更新时间: {new Date(optionsOverlay.updatedAt).toLocaleString('zh-CN')}
+            数据更新时间: {formatDateTimeInBeijing(optionsOverlay.updatedAt)}
           </p>
         )}
       </div>

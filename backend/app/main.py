@@ -6,7 +6,7 @@ from uuid import uuid4
 import structlog
 from structlog.contextvars import bind_contextvars, clear_contextvars
 
-from app.api import stocks, etfs, tasks
+from app.api import stocks, etfs, tasks, refresh_jobs
 from app.api import market, import_data, broker
 from app.core.logging_config import configure_logging
 from app.models.database import engine, Base, init_db, init_default_sector_etfs
@@ -30,6 +30,13 @@ async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     # 启动时
     logger.info("Momentum Radar API 启动中...")
+    try:
+        from app.services.refresh_jobs import get_refresh_job_manager
+
+        refresh_job_manager = get_refresh_job_manager()
+        await refresh_job_manager.ensure_started()
+    except Exception as e:
+        logger.exception("启动 refresh job worker 失败", err=str(e))
     yield
     # 关闭时
     logger.info("Momentum Radar API 关闭中...")
@@ -40,6 +47,13 @@ async def lifespan(app: FastAPI):
         await orchestrator.disconnect_all()
     except Exception as e:
         logger.exception("关闭 Broker 连接时出错", err=str(e))
+    try:
+        from app.services.refresh_jobs import get_refresh_job_manager
+
+        refresh_job_manager = get_refresh_job_manager()
+        await refresh_job_manager.shutdown()
+    except Exception as e:
+        logger.exception("关闭 refresh job worker 时出错", err=str(e))
 
 
 app = FastAPI(
@@ -96,6 +110,7 @@ app.add_middleware(
 app.include_router(stocks.router, prefix="/api/stocks", tags=["Stocks"])
 app.include_router(etfs.router, prefix="/api/etfs", tags=["ETFs"])
 app.include_router(tasks.router, prefix="/api/tasks", tags=["Tasks"])
+app.include_router(refresh_jobs.router)
 
 # Task 11: 新增路由
 app.include_router(market.router, tags=["Market"])

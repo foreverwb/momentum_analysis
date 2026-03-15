@@ -1,10 +1,19 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { RelativeTrendChart, type RelativeTrendSeries } from '../chart';
 import { ETFDetailCard } from './ETFDetailCard';
-import { HoldingsImportModal, ETFImportModal, RefreshProgressModal } from '../modal';
+import { AddTaskETFsModal, HoldingsImportModal, ETFImportModal, RefreshProgressModal } from '../modal';
 import { LoadingState, ErrorMessage } from '../common';
 import type { Task, ETF, Holding, RefreshResult } from '../../types';
+import { taskQueryKeys } from '../../hooks/useData';
 import * as api from '../../services/api';
+import {
+  formatBeijingBoundaryLabel,
+  formatDateInBeijing,
+  formatDateTimeInBeijing,
+  getBeijingCutoffBoundaryMs,
+  parseUtcTimestampMs,
+} from '../../utils/beijingTime';
 
 interface TaskDetailProps {
   task: Task;
@@ -49,14 +58,17 @@ const TREND_METRIC_OPTIONS = [
 ];
 const TREND_METRICS: Array<'relative' | 'sma20' | 'return20d' | 'score'> = ['relative', 'sma20', 'return20d', 'score'];
 const TASK_TREND_CACHE_TTL_MS = 60 * 1000;
-const taskTrendCache = new Map<string, {
+const TASK_TREND_STORAGE_KEY = 'task-detail-trend-cache-v1';
+type TaskTrendCacheEntry = {
   cachedAt: number;
   dates: string[];
   series: RelativeTrendSeries[];
   priceSeries: RelativeTrendSeries[];
   sma20Series: RelativeTrendSeries[];
-}>();
+};
+const taskTrendCache = new Map<string, TaskTrendCacheEntry>();
 const taskTrendInFlight = new Map<string, Promise<void>>();
+let taskTrendStorageBoundaryMs: number | null = null;
 
 const toTaskTrendCacheKey = (
   taskId: number,
@@ -106,13 +118,112 @@ const hasRequiredSymbolsData = (
   });
 };
 
-const hasRenderableTrendCache = (cacheEntry?: {
-  dates: string[];
-  series: RelativeTrendSeries[];
-} | null): boolean => {
+const hasRenderableTrendCache = (cacheEntry?: Pick<TaskTrendCacheEntry, 'dates' | 'series'> | null): boolean => {
   if (!cacheEntry) return false;
   if (!Array.isArray(cacheEntry.dates) || cacheEntry.dates.length <= 1) return false;
   return cacheEntry.series.some((item) => hasValidSeriesValues(item.values));
+};
+
+const sanitizeStoredTrendValues = (rawValues: unknown): Array<number | null> => {
+  if (!Array.isArray(rawValues)) return [];
+  return rawValues.map((value) => (typeof value === 'number' && Number.isFinite(value) ? value : null));
+};
+
+const sanitizeStoredTrendSeries = (rawSeries: unknown): RelativeTrendSeries[] => {
+  if (!Array.isArray(rawSeries)) return [];
+  return rawSeries.reduce<RelativeTrendSeries[]>((acc, item) => {
+    if (typeof item !== 'object' || item === null) return acc;
+    const record = item as Record<string, unknown>;
+    const symbol = typeof record.symbol === 'string' ? record.symbol.trim().toUpperCase() : '';
+    if (!symbol) return acc;
+    const color = typeof record.color === 'string' && record.color.trim() ? record.color.trim() : undefined;
+    acc.push({
+      symbol,
+      values: sanitizeStoredTrendValues(record.values),
+      ...(color ? { color } : {}),
+    });
+    return acc;
+  }, []);
+};
+
+const normalizeTaskTrendCacheEntry = (rawEntry: unknown): TaskTrendCacheEntry | null => {
+  if (typeof rawEntry !== 'object' || rawEntry === null) return null;
+  const record = rawEntry as Record<string, unknown>;
+  const cachedAt = typeof record.cachedAt === 'number' ? record.cachedAt : Number.NaN;
+  if (!Number.isFinite(cachedAt)) return null;
+  const dates = Array.isArray(record.dates)
+    ? record.dates.filter((item): item is string => typeof item === 'string')
+    : [];
+  return {
+    cachedAt,
+    dates,
+    series: sanitizeStoredTrendSeries(record.series),
+    priceSeries: sanitizeStoredTrendSeries(record.priceSeries),
+    sma20Series: sanitizeStoredTrendSeries(record.sma20Series),
+  };
+};
+
+const pruneTaskTrendCache = (boundaryMs: number): void => {
+  taskTrendCache.forEach((entry, cacheKey) => {
+    if (!Number.isFinite(entry.cachedAt) || entry.cachedAt < boundaryMs) {
+      taskTrendCache.delete(cacheKey);
+    }
+  });
+};
+
+const persistTaskTrendCache = (boundaryMs: number = getBeijingCutoffBoundaryMs(Date.now())): void => {
+  pruneTaskTrendCache(boundaryMs);
+  if (typeof window === 'undefined') {
+    return;
+  }
+  try {
+    const payload: Record<string, TaskTrendCacheEntry> = {};
+    taskTrendCache.forEach((entry, cacheKey) => {
+      if (!Number.isFinite(entry.cachedAt) || entry.cachedAt < boundaryMs) {
+        return;
+      }
+      payload[cacheKey] = entry;
+    });
+    localStorage.setItem(TASK_TREND_STORAGE_KEY, JSON.stringify(payload));
+  } catch {
+    // ignore storage errors
+  }
+};
+
+const loadPersistedTaskTrendCache = (boundaryMs: number = getBeijingCutoffBoundaryMs(Date.now())): void => {
+  pruneTaskTrendCache(boundaryMs);
+  if (typeof window === 'undefined' || taskTrendStorageBoundaryMs === boundaryMs) {
+    return;
+  }
+  taskTrendStorageBoundaryMs = boundaryMs;
+  let shouldPersist = false;
+  try {
+    const raw = localStorage.getItem(TASK_TREND_STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== 'object' || parsed === null) {
+      shouldPersist = true;
+      return;
+    }
+    Object.entries(parsed as Record<string, unknown>).forEach(([cacheKey, rawEntry]) => {
+      if (typeof cacheKey !== 'string' || !cacheKey.trim()) {
+        shouldPersist = true;
+        return;
+      }
+      const normalizedEntry = normalizeTaskTrendCacheEntry(rawEntry);
+      if (!normalizedEntry || normalizedEntry.cachedAt < boundaryMs) {
+        shouldPersist = true;
+        return;
+      }
+      taskTrendCache.set(cacheKey, normalizedEntry);
+    });
+  } catch {
+    shouldPersist = true;
+  } finally {
+    if (shouldPersist) {
+      persistTaskTrendCache(boundaryMs);
+    }
+  }
 };
 
 const isTaskTrendCacheFresh = (
@@ -136,8 +247,6 @@ const SOURCE_STATUS_LABEL: Record<SourceStatus, string> = {
 };
 
 const SOURCE_STATUS_STORAGE_PREFIX = 'task-detail-source-status-v1';
-const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000;
-const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
 const SOURCE_CIRCLE_META: Record<SourceKey, { label: string; borderColor: string }> = {
   finviz: { label: 'Finviz', borderColor: '#93c5fd' },
@@ -182,9 +291,9 @@ const loadStoredSourceUpdatedAt = (taskId: number): Partial<Record<SourceKey, st
     (Object.keys(SOURCE_CIRCLE_META) as SourceKey[]).forEach((key) => {
       const value = (parsed as Record<string, unknown>)[key];
       if (typeof value !== 'string') return;
-      const ts = new Date(value);
-      if (Number.isNaN(ts.getTime())) return;
-      result[key] = ts.toISOString();
+      const ts = parseUtcTimestampMs(value);
+      if (!Number.isFinite(ts)) return;
+      result[key] = new Date(ts).toISOString();
     });
     return result;
   } catch {
@@ -199,27 +308,14 @@ const saveStoredSourceUpdatedAt = (taskId: number, payload: Partial<Record<Sourc
     (Object.keys(SOURCE_CIRCLE_META) as SourceKey[]).forEach((key) => {
       const value = payload[key];
       if (!value) return;
-      const ts = new Date(value);
-      if (Number.isNaN(ts.getTime())) return;
-      sanitized[key] = ts.toISOString();
+      const ts = parseUtcTimestampMs(value);
+      if (!Number.isFinite(ts)) return;
+      sanitized[key] = new Date(ts).toISOString();
     });
     localStorage.setItem(getSourceStatusStorageKey(taskId), JSON.stringify(sanitized));
   } catch {
     // ignore storage errors
   }
-};
-
-const getBeijingResetBoundaryMs = (nowMs: number): number => {
-  const beijingNow = new Date(nowMs + BEIJING_OFFSET_MS);
-  const year = beijingNow.getUTCFullYear();
-  const month = beijingNow.getUTCMonth();
-  const day = beijingNow.getUTCDate();
-  const hour = beijingNow.getUTCHours();
-  let boundaryUtcMs = Date.UTC(year, month, day, 0, 0, 0, 0); // 08:00 BJT
-  if (hour < 8) {
-    boundaryUtcMs -= ONE_DAY_MS;
-  }
-  return boundaryUtcMs;
 };
 
 const mapDataSourcesToKeys = (dataSources?: Record<string, boolean>): SourceKey[] => {
@@ -230,39 +326,15 @@ const mapDataSourcesToKeys = (dataSources?: Record<string, boolean>): SourceKey[
 };
 
 const formatUpdateDate = (value?: string | null): string => {
-  if (!value) return '--';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  const year = date.getFullYear();
-  const month = `${date.getMonth() + 1}`.padStart(2, '0');
-  const day = `${date.getDate()}`.padStart(2, '0');
-  return `${year}-${month}-${day}`;
+  return formatDateInBeijing(value);
 };
 
 const formatUpdateDateTime = (value?: string | null): string => {
-  if (!value) return '--';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return '--';
-  const beijing = new Date(date.getTime() + BEIJING_OFFSET_MS);
-  const month = `${beijing.getUTCMonth() + 1}`.padStart(2, '0');
-  const day = `${beijing.getUTCDate()}`.padStart(2, '0');
-  const hours = `${beijing.getUTCHours()}`.padStart(2, '0');
-  const minutes = `${beijing.getUTCMinutes()}`.padStart(2, '0');
-  return `${month}-${day} ${hours}:${minutes}`;
+  return formatDateTimeInBeijing(value);
 };
 
 const parseTimestampMs = (value?: string | null): number => {
-  if (!value) return Number.NaN;
-  const ts = new Date(value).getTime();
-  return Number.isFinite(ts) ? ts : Number.NaN;
-};
-
-const formatBeijingBoundaryLabel = (boundaryUtcMs: number): string => {
-  const beijing = new Date(boundaryUtcMs + BEIJING_OFFSET_MS);
-  const year = beijing.getUTCFullYear();
-  const month = `${beijing.getUTCMonth() + 1}`.padStart(2, '0');
-  const day = `${beijing.getUTCDate()}`.padStart(2, '0');
-  return `${year}-${month}-${day} 08:00`;
+  return parseUtcTimestampMs(value);
 };
 
 const normalizeEtfs = (raw: unknown): string[] => {
@@ -324,6 +396,43 @@ const IMPORT_SYMBOL_KEYS = [
 ] as const;
 const COVERAGE_PATTERN = /^(top|weight)(\d+)$/i;
 const ALL_COVERAGE_ID = 'all';
+const PREFERRED_COVERAGE_STORAGE_PREFIX = 'task-detail-preferred-coverage-v1';
+
+const normalizeCoverageId = (value: unknown): string | undefined => {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return undefined;
+  if (normalized === ALL_COVERAGE_ID || COVERAGE_PATTERN.test(normalized)) {
+    return normalized;
+  }
+  return undefined;
+};
+
+const getPreferredCoverageStorageKey = (taskId: number): string =>
+  `${PREFERRED_COVERAGE_STORAGE_PREFIX}:${taskId}`;
+
+const loadStoredPreferredCoverage = (taskId: number): string | undefined => {
+  if (typeof window === 'undefined') return undefined;
+  try {
+    return normalizeCoverageId(localStorage.getItem(getPreferredCoverageStorageKey(taskId)));
+  } catch {
+    return undefined;
+  }
+};
+
+const saveStoredPreferredCoverage = (taskId: number, coverage?: string) => {
+  if (typeof window === 'undefined') return;
+  try {
+    const normalized = normalizeCoverageId(coverage);
+    if (!normalized) {
+      localStorage.removeItem(getPreferredCoverageStorageKey(taskId));
+      return;
+    }
+    localStorage.setItem(getPreferredCoverageStorageKey(taskId), normalized);
+  } catch {
+    // ignore storage errors
+  }
+};
 
 const extractImportRows = (payload: unknown): unknown[] | null => {
   if (Array.isArray(payload)) return payload;
@@ -552,20 +661,46 @@ interface ETFDetailData {
     count?: number;
   }>;
   coverageRanges: string[];
+  preferredCoverage?: string;
   sourceUpdatedAt?: Partial<Record<SourceKey, string | null>>;
 }
+
+const pickPreferredCoverageFromDetails = (
+  details: Array<{ preferredCoverage?: string }>
+): string | undefined => {
+  const ranked = new Map<string, { count: number; firstIndex: number }>();
+  details.forEach((detail, index) => {
+    const normalized = normalizeCoverageId(detail.preferredCoverage);
+    if (!normalized) return;
+    const current = ranked.get(normalized);
+    if (current) {
+      current.count += 1;
+      return;
+    }
+    ranked.set(normalized, { count: 1, firstIndex: index });
+  });
+
+  return Array.from(ranked.entries())
+    .sort((left, right) => {
+      const [, leftMeta] = left;
+      const [, rightMeta] = right;
+      if (rightMeta.count !== leftMeta.count) {
+        return rightMeta.count - leftMeta.count;
+      }
+      return leftMeta.firstIndex - rightMeta.firstIndex;
+    })[0]?.[0];
+};
 
 const pickLatestIsoTimestamp = (values: Array<string | null | undefined>): string | undefined => {
   let latestTs = Number.NEGATIVE_INFINITY;
   let latestValue: string | undefined;
   values.forEach((value) => {
     if (typeof value !== 'string' || value.trim() === '') return;
-    const parsed = new Date(value);
-    const ts = parsed.getTime();
+    const ts = parseUtcTimestampMs(value);
     if (!Number.isFinite(ts)) return;
     if (ts > latestTs) {
       latestTs = ts;
-      latestValue = parsed.toISOString();
+      latestValue = new Date(ts).toISOString();
     }
   });
   return latestValue;
@@ -658,13 +793,18 @@ const normalizeRefreshStatus = (status?: string): RefreshResult['status'] => {
 };
 
 export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps) {
+  const queryClient = useQueryClient();
   const [trendPeriod, setTrendPeriod] = useState<'5d' | '20d' | '63d'>('20d');
   const [trendMetric, setTrendMetric] = useState<'relative' | 'sma20' | 'return20d' | 'score'>('relative');
-  const [trendLabelTimezone, setTrendLabelTimezone] = useState<'market' | 'beijing'>('market');
+  const trendLabelTimezone = 'beijing' as const;
+  const [isAddETFModalOpen, setIsAddETFModalOpen] = useState(false);
   const [holdingsModalOpen, setHoldingsModalOpen] = useState(false);
   const [etfModalOpen, setETFModalOpen] = useState(false);
   const [selectedETF, setSelectedETF] = useState<string>('');
   const [selectedCoverage, setSelectedCoverage] = useState<string | undefined>();
+  const [preferredCoverage, setPreferredCoverage] = useState<string | undefined>(
+    () => loadStoredPreferredCoverage(task.id)
+  );
   const [coverageRangesByETF, setCoverageRangesByETF] = useState<Record<string, string[]>>({});
   const [resolvedEtfs, setResolvedEtfs] = useState<string[]>(
     () => resolveMonitoredEtfs(task.etfs, task.type, task.sector)
@@ -678,6 +818,13 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
   const taskBaseIndicesKey = useMemo(() => getSymbolsKey(taskBaseIndices), [taskBaseIndices]);
   const primaryBaseIndex = taskBaseIndices[0] || 'SPY';
 
+  const applyPreferredCoverage = (coverageId?: string) => {
+    const normalized = normalizeCoverageId(coverageId);
+    if (normalized) {
+      setPreferredCoverage(normalized);
+    }
+  };
+
   // API 数据状态
   const [etfDetails, setEtfDetails] = useState<ETFDetailData[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -687,6 +834,7 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
   const [trendPriceSeries, setTrendPriceSeries] = useState<RelativeTrendSeries[]>([]);
   const [trendSma20Series, setTrendSma20Series] = useState<RelativeTrendSeries[]>([]);
   const [isTrendLoading, setIsTrendLoading] = useState(false);
+  const [isTrendCacheHydrated, setIsTrendCacheHydrated] = useState(() => typeof window === 'undefined');
   const [trendError, setTrendError] = useState<string | null>(null);
 
   // WebSocket 刷新全部状态
@@ -706,6 +854,7 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
     () => loadStoredSourceUpdatedAt(task.id)
   );
   const [clockNowMs, setClockNowMs] = useState<number>(() => Date.now());
+  const resetBoundaryMs = useMemo(() => getBeijingCutoffBoundaryMs(clockNowMs), [clockNowMs]);
   const trendCacheScopeKey = useMemo(
     () =>
       toTaskTrendScopeKey({
@@ -716,6 +865,32 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
       }),
     [resolvedEtfsKey, taskBaseIndicesKey, task.sector, lastRefreshAllAt, task.updatedAt]
   );
+  const selectedTrendCacheKey = useMemo(
+    () =>
+      task.id
+        ? toTaskTrendCacheKey(task.id, trendPeriod, trendMetric, trendLabelTimezone, trendCacheScopeKey)
+        : '',
+    [task.id, trendPeriod, trendMetric, trendLabelTimezone, trendCacheScopeKey]
+  );
+  const trendRefreshSequenceRef = useRef(0);
+  const activeTrendCacheKeyRef = useRef(selectedTrendCacheKey);
+  const clearTrendData = useCallback(() => {
+    setTrendDates([]);
+    setTrendSeries([]);
+    setTrendPriceSeries([]);
+    setTrendSma20Series([]);
+  }, []);
+  const applyTrendCacheEntry = useCallback((cacheEntry?: TaskTrendCacheEntry | null): boolean => {
+    if (!cacheEntry) {
+      clearTrendData();
+      return false;
+    }
+    setTrendDates(cacheEntry.dates);
+    setTrendSeries(cacheEntry.series);
+    setTrendPriceSeries(cacheEntry.priceSeries);
+    setTrendSma20Series(cacheEntry.sma20Series);
+    return true;
+  }, [clearTrendData]);
   const createFallbackETFDetail = (symbol: string, totalCount: number): ETFDetailData => ({
     symbol,
     name: getETFName(symbol),
@@ -735,6 +910,7 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
       { source: '期权数据', status: 'missing', updatedAt: null },
     ],
     coverageRanges: [],
+    preferredCoverage: undefined,
     sourceUpdatedAt: {},
   });
 
@@ -785,6 +961,7 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
               holdings: etf.holdings || [],
               dataStatus: generateDataStatus(etf),
               coverageRanges: etf.coverageRanges || [],
+              preferredCoverage: etf.preferredCoverage,
               sourceUpdatedAt: etf.sourceUpdatedAt || {},
             };
           }
@@ -798,6 +975,10 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
       
       const results = await Promise.all(etfDataPromises);
       const sortedResults = applySortedEtfDetails(results, { orderHint: symbols, cacheKey });
+      const backendPreferredCoverage = pickPreferredCoverageFromDetails(sortedResults);
+      if (backendPreferredCoverage) {
+        setPreferredCoverage((prev) => normalizeCoverageId(prev) ?? backendPreferredCoverage);
+      }
       setSelectedETF((prev) => prev || sortedResults[0]?.symbol || '');
     } catch (e) {
       if (!silent) {
@@ -826,12 +1007,24 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
   }, [task.id]);
 
   useEffect(() => {
+    setPreferredCoverage(loadStoredPreferredCoverage(task.id));
+  }, [task.id]);
+
+  useEffect(() => {
     setLastRefreshAllAt(task.updatedAt ?? null);
   }, [task.id, task.updatedAt]);
 
   useEffect(() => {
+    activeTrendCacheKeyRef.current = selectedTrendCacheKey;
+  }, [selectedTrendCacheKey]);
+
+  useEffect(() => {
     saveStoredSourceUpdatedAt(task.id, sourceUpdatedAtMap);
   }, [task.id, sourceUpdatedAtMap]);
+
+  useEffect(() => {
+    saveStoredPreferredCoverage(task.id, preferredCoverage);
+  }, [task.id, preferredCoverage]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -920,14 +1113,16 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
     });
   }, [etfDetails]);
 
-  useEffect(() => {
+  const handleTrendRefresh = useCallback(async () => {
     if (!task.id) {
       return;
     }
-    let cancelled = false;
+
+    const refreshSequence = trendRefreshSequenceRef.current + 1;
+    trendRefreshSequenceRef.current = refreshSequence;
+    const requestSelectionKey = selectedTrendCacheKey;
     const periodValue = trendPeriod === '5d' ? 5 : trendPeriod === '20d' ? 20 : 63;
     const baseSymbols = taskBaseIndices.map((symbol) => symbol.toUpperCase());
-    const baseSymbol = baseSymbols[0];
     const sectorSymbol = task.sector?.toUpperCase();
     const marketSymbols = Array.from(
       new Set(
@@ -945,26 +1140,6 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
     if (sectorSymbol) {
       reservedColors[sectorSymbol] = '#8b5cf6';
     }
-    const setTrendFromCache = (metric: 'relative' | 'sma20' | 'return20d' | 'score'): boolean => {
-      const cacheKey = toTaskTrendCacheKey(task.id, trendPeriod, metric, trendLabelTimezone, trendCacheScopeKey);
-      const cached = taskTrendCache.get(cacheKey);
-      if (!cached) return false;
-      setTrendDates(cached.dates);
-      setTrendSeries(cached.series);
-      setTrendPriceSeries(cached.priceSeries);
-      setTrendSma20Series(cached.sma20Series);
-      return true;
-    };
-    const selectedCacheKey = toTaskTrendCacheKey(task.id, trendPeriod, trendMetric, trendLabelTimezone, trendCacheScopeKey);
-    const selectedCached = taskTrendCache.get(selectedCacheKey);
-    if (selectedCached) {
-      setTrendDates(selectedCached.dates);
-      setTrendSeries(selectedCached.series);
-      setTrendPriceSeries(selectedCached.priceSeries);
-      setTrendSma20Series(selectedCached.sma20Series);
-      setTrendError(null);
-    }
-
     const metricsToFetch = TREND_METRICS.filter((metric) => {
       const cacheKey = toTaskTrendCacheKey(task.id, trendPeriod, metric, trendLabelTimezone, trendCacheScopeKey);
       const cached = taskTrendCache.get(cacheKey);
@@ -976,183 +1151,186 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
     });
 
     setTrendError(null);
+    setIsTrendLoading(true);
 
-    const loadTrendData = async () => {
-      try {
-        let dailySynced = false;
-        if (marketSymbols.length > 0) {
-          try {
-            dailySynced = await api.ensureDailyPriceSync(marketSymbols);
-          } catch (dailySyncError) {
-            console.warn('Daily price sync check failed:', dailySyncError);
-          }
-          if (cancelled) return;
+    try {
+      let dailySynced = false;
+      if (marketSymbols.length > 0) {
+        try {
+          dailySynced = await api.ensureDailyPriceSync(marketSymbols);
+        } catch (dailySyncError) {
+          console.warn('Daily price sync check failed:', dailySyncError);
         }
+      }
 
-        const metricsToLoad = dailySynced ? TREND_METRICS : metricsToFetch;
-        if (metricsToLoad.length === 0) {
-          setTrendError(null);
-          setIsTrendLoading(false);
-          return;
-        }
-
-        setIsTrendLoading(true);
-        let warmupPromise: Promise<unknown> | null = null;
-        const ensureWarmup = (): Promise<unknown> => {
-          if (warmupPromise) {
-            return warmupPromise;
-          }
-          warmupPromise = api.syncPriceDataForSymbols(marketSymbols).catch((syncError) => {
-            console.warn('Market trend data warmup failed:', syncError);
-            return null;
-          });
+      const metricsToLoad = dailySynced ? TREND_METRICS : metricsToFetch;
+      let warmupPromise: Promise<unknown> | null = null;
+      const ensureWarmup = (): Promise<unknown> => {
+        if (warmupPromise) {
           return warmupPromise;
-        };
+        }
+        warmupPromise = api.syncPriceDataForSymbols(marketSymbols).catch((syncError) => {
+          console.warn('Market trend data warmup failed:', syncError);
+          return null;
+        });
+        return warmupPromise;
+      };
 
-        const withSeriesColors = (
-          seriesItems: Array<{ symbol: string; values: Array<number | null> }> | undefined
-        ): RelativeTrendSeries[] => {
-          let paletteIndex = 0;
-          const usedColors = new Set(Object.values(reservedColors));
-          return (seriesItems || []).map((item) => {
-            const key = item.symbol?.toUpperCase?.() ?? '';
-            if (reservedColors[key]) {
-              return {
-                symbol: item.symbol,
-                values: item.values,
-                color: reservedColors[key],
-              };
-            }
-            let attempts = 0;
-            while (
-              usedColors.has(TREND_COLORS[paletteIndex % TREND_COLORS.length]) &&
-              attempts < TREND_COLORS.length
-            ) {
-              paletteIndex += 1;
-              attempts += 1;
-            }
-            const color = TREND_COLORS[paletteIndex % TREND_COLORS.length];
-            usedColors.add(color);
-            paletteIndex += 1;
+      const withSeriesColors = (
+        seriesItems: Array<{ symbol: string; values: Array<number | null> }> | undefined
+      ): RelativeTrendSeries[] => {
+        let paletteIndex = 0;
+        const usedColors = new Set(Object.values(reservedColors));
+        return (seriesItems || []).map((item) => {
+          const key = item.symbol?.toUpperCase?.() ?? '';
+          if (reservedColors[key]) {
             return {
               symbol: item.symbol,
               values: item.values,
-              color,
+              color: reservedColors[key],
             };
+          }
+          let attempts = 0;
+          while (
+            usedColors.has(TREND_COLORS[paletteIndex % TREND_COLORS.length]) &&
+            attempts < TREND_COLORS.length
+          ) {
+            paletteIndex += 1;
+            attempts += 1;
+          }
+          const color = TREND_COLORS[paletteIndex % TREND_COLORS.length];
+          usedColors.add(color);
+          paletteIndex += 1;
+          return {
+            symbol: item.symbol,
+            values: item.values,
+            color,
+          };
+        });
+      };
+
+      const fetchMetricTrend = async (metric: 'relative' | 'sma20' | 'return20d' | 'score') => {
+        const cacheKey = toTaskTrendCacheKey(task.id, trendPeriod, metric, trendLabelTimezone, trendCacheScopeKey);
+        const cacheEntry = taskTrendCache.get(cacheKey);
+        if (cacheEntry && !dailySynced) {
+          const shouldReuseCache =
+            isTaskTrendCacheFresh(cacheEntry) &&
+            (metric !== trendMetric || hasRenderableTrendCache(cacheEntry));
+          if (shouldReuseCache) {
+            return;
+          }
+        }
+
+        const inFlight = taskTrendInFlight.get(cacheKey);
+        if (inFlight) {
+          await inFlight;
+          if (!dailySynced && taskTrendCache.has(cacheKey)) {
+            return;
+          }
+        }
+
+        const requestPromise = (async () => {
+          let resp = await api.getTaskTrendComparison(task.id, periodValue, metric, trendLabelTimezone);
+          if (
+            metric !== 'score' &&
+            marketSymbols.length > 0 &&
+            !hasRequiredSymbolsData(resp.price_series || resp.series, marketSymbols)
+          ) {
+            await ensureWarmup();
+            resp = await api.getTaskTrendComparison(task.id, periodValue, metric, trendLabelTimezone);
+          }
+          const baseSeriesRaw =
+            metric === 'sma20' && Array.isArray(resp.deviation_series)
+              ? resp.deviation_series
+              : resp.series;
+          const seriesWithColors = withSeriesColors(baseSeriesRaw);
+          const priceSeriesWithColors =
+            metric === 'sma20' ? withSeriesColors(resp.price_series) : [];
+          const sma20SeriesWithColors =
+            metric === 'sma20' ? withSeriesColors(resp.sma20_series) : [];
+          taskTrendCache.set(cacheKey, {
+            cachedAt: Date.now(),
+            dates: resp.dates || [],
+            series: seriesWithColors,
+            priceSeries: priceSeriesWithColors,
+            sma20Series: sma20SeriesWithColors,
           });
-        };
+          persistTaskTrendCache();
+        })();
 
-        const fetchMetricTrend = async (metric: 'relative' | 'sma20' | 'return20d' | 'score') => {
-          const cacheKey = toTaskTrendCacheKey(task.id, trendPeriod, metric, trendLabelTimezone, trendCacheScopeKey);
-          const cacheEntry = taskTrendCache.get(cacheKey);
-          if (cacheEntry && !dailySynced) {
-            const shouldReuseCache =
-              isTaskTrendCacheFresh(cacheEntry) &&
-              (metric !== trendMetric || hasRenderableTrendCache(cacheEntry));
-            if (shouldReuseCache) {
-              return;
-            }
+        taskTrendInFlight.set(cacheKey, requestPromise);
+        try {
+          await requestPromise;
+        } finally {
+          if (taskTrendInFlight.get(cacheKey) === requestPromise) {
+            taskTrendInFlight.delete(cacheKey);
           }
-
-          const inFlight = taskTrendInFlight.get(cacheKey);
-          if (inFlight) {
-            await inFlight;
-            if (!dailySynced && taskTrendCache.has(cacheKey)) {
-              return;
-            }
-          }
-
-          const requestPromise = (async () => {
-            let resp = await api.getTaskTrendComparison(task.id, periodValue, metric, trendLabelTimezone);
-            if (
-              metric !== 'score' &&
-              marketSymbols.length > 0 &&
-              !hasRequiredSymbolsData(resp.price_series || resp.series, marketSymbols)
-            ) {
-              await ensureWarmup();
-              resp = await api.getTaskTrendComparison(task.id, periodValue, metric, trendLabelTimezone);
-            }
-            const baseSeriesRaw =
-              metric === 'sma20' && Array.isArray(resp.deviation_series)
-                ? resp.deviation_series
-                : resp.series;
-            const seriesWithColors = withSeriesColors(baseSeriesRaw);
-            const priceSeriesWithColors =
-              metric === 'sma20' ? withSeriesColors(resp.price_series) : [];
-            const sma20SeriesWithColors =
-              metric === 'sma20' ? withSeriesColors(resp.sma20_series) : [];
-            taskTrendCache.set(cacheKey, {
-              cachedAt: Date.now(),
-              dates: resp.dates || [],
-              series: seriesWithColors,
-              priceSeries: priceSeriesWithColors,
-              sma20Series: sma20SeriesWithColors,
-            });
-          })();
-
-          taskTrendInFlight.set(cacheKey, requestPromise);
-          try {
-            await requestPromise;
-          } finally {
-            if (taskTrendInFlight.get(cacheKey) === requestPromise) {
-              taskTrendInFlight.delete(cacheKey);
-            }
-          }
-        };
-
-        const results = await Promise.allSettled(metricsToLoad.map((metric) => fetchMetricTrend(metric)));
-        if (cancelled) return;
-
-        const hasSelectedMetricCache = setTrendFromCache(trendMetric);
-        if (!hasSelectedMetricCache) {
-          setTrendDates([]);
-          setTrendSeries([]);
-          setTrendPriceSeries([]);
-          setTrendSma20Series([]);
         }
+      };
 
-        const failedResults = results.filter(
-          (result): result is PromiseRejectedResult => result.status === 'rejected'
-        );
-        if (!hasSelectedMetricCache && failedResults.length > 0) {
-          const firstReason = failedResults[0].reason;
-          setTrendError(firstReason instanceof Error ? firstReason.message : '走势数据加载失败');
-        } else {
-          setTrendError(null);
-        }
-      } catch (e) {
-        if (cancelled) return;
-        if (!selectedCached) {
-          setTrendDates([]);
-          setTrendSeries([]);
-          setTrendPriceSeries([]);
-          setTrendSma20Series([]);
-        }
-        setTrendError(e instanceof Error ? e.message : '走势数据加载失败');
-      } finally {
-        if (cancelled) return;
+      const results = await Promise.allSettled(metricsToLoad.map((metric) => fetchMetricTrend(metric)));
+      if (trendRefreshSequenceRef.current !== refreshSequence) {
+        return;
+      }
+      if (activeTrendCacheKeyRef.current !== requestSelectionKey) {
+        return;
+      }
+
+      const hasSelectedMetricCache = applyTrendCacheEntry(taskTrendCache.get(requestSelectionKey));
+      const failedResults = results.filter(
+        (result): result is PromiseRejectedResult => result.status === 'rejected'
+      );
+      if (!hasSelectedMetricCache && failedResults.length > 0) {
+        const firstReason = failedResults[0].reason;
+        setTrendError(firstReason instanceof Error ? firstReason.message : '走势数据加载失败');
+      } else {
+        setTrendError(null);
+      }
+    } catch (e) {
+      if (trendRefreshSequenceRef.current !== refreshSequence) {
+        return;
+      }
+      if (activeTrendCacheKeyRef.current !== requestSelectionKey) {
+        return;
+      }
+      if (!taskTrendCache.get(requestSelectionKey)) {
+        clearTrendData();
+      }
+      setTrendError(e instanceof Error ? e.message : '走势数据加载失败');
+    } finally {
+      if (trendRefreshSequenceRef.current === refreshSequence) {
         setIsTrendLoading(false);
       }
-    };
-
-    void loadTrendData();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [task.id, resolvedEtfsKey, taskBaseIndicesKey, task.sector, trendPeriod, trendMetric, trendLabelTimezone, trendCacheScopeKey]);
+    }
+  }, [
+    applyTrendCacheEntry,
+    clearTrendData,
+    resolvedEtfs,
+    selectedTrendCacheKey,
+    task.id,
+    task.sector,
+    taskBaseIndices,
+    trendCacheScopeKey,
+    trendLabelTimezone,
+    trendMetric,
+    trendPeriod,
+  ]);
 
   useEffect(() => {
-    if (!task.id) return;
-    const cacheKey = toTaskTrendCacheKey(task.id, trendPeriod, trendMetric, trendLabelTimezone, trendCacheScopeKey);
-    const cached = taskTrendCache.get(cacheKey);
-    if (!cached) return;
-    setTrendDates(cached.dates);
-    setTrendSeries(cached.series);
-    setTrendPriceSeries(cached.priceSeries);
-    setTrendSma20Series(cached.sma20Series);
+    loadPersistedTaskTrendCache(resetBoundaryMs);
+    setIsTrendCacheHydrated(true);
+  }, [resetBoundaryMs]);
+
+  useEffect(() => {
+    if (!task.id) {
+      clearTrendData();
+      setTrendError(null);
+      return;
+    }
+    const cached = taskTrendCache.get(selectedTrendCacheKey);
+    applyTrendCacheEntry(cached);
     setTrendError(null);
-  }, [task.id, trendPeriod, trendMetric, trendLabelTimezone, trendCacheScopeKey]);
+  }, [applyTrendCacheEntry, clearTrendData, selectedTrendCacheKey, task.id]);
 
   useEffect(() => {
     if (!resolvedEtfs.length) {
@@ -1261,7 +1439,6 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
     return task.updatedAt || task.createdAt;
   }, [lastRefreshAllAt, etfDetails, task.updatedAt, task.createdAt]);
   const latestUpdatedAtLabel = useMemo(() => formatUpdateDate(latestUpdatedAt), [latestUpdatedAt]);
-  const resetBoundaryMs = useMemo(() => getBeijingResetBoundaryMs(clockNowMs), [clockNowMs]);
   const effectiveSourceUpdatedAtMap = useMemo(
     () => ({
       ...sourceUpdatedAtMap,
@@ -1290,7 +1467,7 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
   const sourceIndicators = useMemo(() => {
     return (Object.keys(SOURCE_CIRCLE_META) as SourceKey[]).map((sourceKey) => {
       const updatedAt = effectiveSourceUpdatedAtMap[sourceKey] || null;
-      const updatedAtMs = updatedAt ? new Date(updatedAt).getTime() : Number.NaN;
+      const updatedAtMs = parseTimestampMs(updatedAt);
       const isUpdatedInCurrentWindow = Number.isFinite(updatedAtMs) && updatedAtMs >= resetBoundaryMs;
       const status: SourceStatus = isUpdatedInCurrentWindow ? 'complete' : 'missing';
       const borderColor =
@@ -1314,7 +1491,7 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
     const missing = requiredSources.filter((sourceKey) => {
       const updatedAt = effectiveSourceUpdatedAtMap[sourceKey];
       if (!updatedAt) return true;
-      const ts = new Date(updatedAt).getTime();
+      const ts = parseTimestampMs(updatedAt);
       return !Number.isFinite(ts) || ts < resetBoundaryMs;
     });
     if (!missing.length) return null;
@@ -1339,13 +1516,17 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
     }
     return (value: number) => `${value.toFixed(1)}%`;
   }, [trendMetric]);
+  const selectedTrendCacheEntry = task.id ? taskTrendCache.get(selectedTrendCacheKey) : undefined;
+  const trendEmptyStateText = (selectedTrendCacheEntry || !isTrendCacheHydrated)
+    ? undefined
+    : '点击右上角刷新获取走势数据';
 
   const markSourcesUpdated = (sources: SourceKey[], updatedAt?: string) => {
     if (!sources.length) return;
     const normalizedAt = (() => {
       if (!updatedAt) return new Date().toISOString();
-      const parsed = new Date(updatedAt);
-      return Number.isNaN(parsed.getTime()) ? new Date().toISOString() : parsed.toISOString();
+      const parsedMs = parseTimestampMs(updatedAt);
+      return Number.isFinite(parsedMs) ? new Date(parsedMs).toISOString() : new Date().toISOString();
     })();
     setSourceUpdatedAtMap((prev) => {
       const next = { ...prev };
@@ -1456,6 +1637,7 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
     expectedSymbolsCount?: number,
     progressToken?: string
   ) => {
+    applyPreferredCoverage(coverageId);
     const parsedCoverage = parseCoverageSelection(coverageId);
     const normalizedSymbol = symbol.trim().toUpperCase();
     const targetEtfDetail = etfDetails.find((etfDetail) => etfDetail.symbol === normalizedSymbol);
@@ -1509,6 +1691,7 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
       );
 
       console.log('Holdings refresh response:', response);
+      applyPreferredCoverage(coverageId);
 
       const responseRecord = response as unknown as Record<string, unknown>;
       const updatedAtRaw = responseRecord['updated_at'];
@@ -1756,7 +1939,9 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
 
   const handleOpenHoldingsModal = (symbol: string, coverageId?: string) => {
     setSelectedETF(symbol);
-    setSelectedCoverage(coverageId);
+    const normalizedCoverage = normalizeCoverageId(coverageId);
+    setSelectedCoverage(normalizedCoverage);
+    applyPreferredCoverage(normalizedCoverage);
     setHoldingsModalOpen(true);
   };
 
@@ -1768,6 +1953,18 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
     }
     setSelectedETF(targetSymbol);
     setETFModalOpen(true);
+  };
+
+  const handleAddTaskETFs = async (symbols: string[]) => {
+    if (!task.id) {
+      throw new Error('当前任务不存在');
+    }
+
+    const updatedTask = await api.addTaskETFs(task.id, symbols);
+    queryClient.setQueryData(taskQueryKeys.detail(task.id), updatedTask);
+    queryClient.setQueryData(taskQueryKeys.detail(String(task.id)), updatedTask);
+    void queryClient.invalidateQueries({ queryKey: taskQueryKeys.lists() });
+    setResolvedEtfs(resolveMonitoredEtfs(updatedTask.etfs, updatedTask.type, updatedTask.sector));
   };
 
   if (isLoading) {
@@ -1816,6 +2013,12 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
         </div>
         <div className="flex flex-col items-end gap-3">
           <div className="flex items-center gap-3">
+            <button
+              onClick={() => setIsAddETFModalOpen(true)}
+              className="px-4 py-2 text-sm font-medium rounded-[var(--radius-sm)] bg-[var(--bg-secondary)] border border-[var(--accent-blue)] text-[var(--accent-blue)] hover:bg-[var(--accent-blue)]/10 transition-colors flex items-center gap-2"
+            >
+              Add ETFs
+            </button>
             <button
               onClick={handleRefreshAll}
               disabled={isRefreshingAll}
@@ -1881,29 +2084,8 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
           </div>
         )}
         <div className="flex justify-end mb-2">
-          <div className="inline-flex rounded border border-[var(--border-light)] overflow-hidden">
-            <button
-              type="button"
-              onClick={() => setTrendLabelTimezone('market')}
-              className={`px-2 py-1 text-xs transition-colors ${
-                trendLabelTimezone === 'market'
-                  ? 'bg-[var(--accent-blue)] text-white'
-                  : 'bg-[var(--bg-primary)] text-[var(--text-muted)] hover:text-[var(--text-primary)]'
-              }`}
-            >
-              美东交易日
-            </button>
-            <button
-              type="button"
-              onClick={() => setTrendLabelTimezone('beijing')}
-              className={`px-2 py-1 text-xs border-l border-[var(--border-light)] transition-colors ${
-                trendLabelTimezone === 'beijing'
-                  ? 'bg-[var(--accent-blue)] text-white'
-                  : 'bg-[var(--bg-primary)] text-[var(--text-muted)] hover:text-[var(--text-primary)]'
-              }`}
-            >
-              北京时间
-            </button>
+          <div className="px-2 py-1 text-xs rounded border border-[var(--border-light)] bg-[var(--bg-primary)] text-[var(--text-muted)]">
+            北京时间
           </div>
         </div>
         <RelativeTrendChart
@@ -1920,10 +2102,13 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
           valueFormatter={trendValueFormatter}
           baseSymbol={primaryBaseIndex}
           symbolRoleMap={trendSymbolRoleMap}
+          isLoading={isTrendLoading || !isTrendCacheHydrated}
+          loadingText={isTrendLoading ? '正在刷新走势数据...' : '正在加载走势数据...'}
+          onRefresh={handleTrendRefresh}
+          refreshDisabled={!task.id || !resolvedEtfs.length}
+          refreshLabel="刷新走势数据"
+          emptyStateText={trendEmptyStateText}
         />
-        {isTrendLoading && (
-          <div className="text-xs text-[var(--text-muted)] mt-2">走势数据加载中...</div>
-        )}
       </div>
 
       {/* ETF Cards Section */}
@@ -1943,7 +2128,9 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
                 key={etf.symbol}
                 etf={etf}
                 coverageRanges={mergedRanges}
+                preferredCoverage={preferredCoverage ?? etf.preferredCoverage}
                 refreshResult={latestRefreshResults[etf.symbol]}
+                onPreferredCoverageChange={applyPreferredCoverage}
                 onRefreshHoldings={(coverageId: string, expectedSymbolsCount?: number, progressToken?: string) =>
                   handleRefreshHoldings(etf.symbol, coverageId, expectedSymbolsCount, progressToken)
                 }
@@ -1956,6 +2143,14 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
       </div>
 
       {/* Modals */}
+      <AddTaskETFsModal
+        isOpen={isAddETFModalOpen}
+        onClose={() => setIsAddETFModalOpen(false)}
+        taskType={task.type}
+        taskSector={task.sector}
+        existingEtfs={task.etfs}
+        onSubmit={handleAddTaskETFs}
+      />
       <HoldingsImportModal
         isOpen={holdingsModalOpen}
         onClose={() => {
@@ -1963,7 +2158,7 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
           setSelectedCoverage(undefined);
         }}
         etfSymbol={selectedETF}
-        selectedCoverage={selectedCoverage}
+        selectedCoverage={selectedCoverage ?? preferredCoverage}
         onImport={async (data) => {
           console.log('Import holdings:', selectedETF, data);
           if (selectedETF && data.jsonData) {
@@ -2003,6 +2198,7 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
                 );
               }
               const importedSymbols = new Set(matchResult.symbols);
+              applyPreferredCoverage(data.coverage);
 
               const importedAt = new Date().toISOString();
               
@@ -2072,6 +2268,7 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
                         ...etfDetail,
                         holdings: nextHoldings,
                         coverageRanges: Array.from(existingRanges),
+                        preferredCoverage: normalizeCoverageId(data.coverage),
                       };
                     }),
                     task.type,

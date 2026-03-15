@@ -25,6 +25,7 @@ from app.models import (
     get_db, ETF, ETFHolding, HoldingsUploadLog, ImportedData,
     is_valid_ticker, is_valid_sector_symbol, VALID_SECTOR_SYMBOLS
 )
+from app.core.time_utils import beijing_today, utc_isoformat
 
 logger = logging.getLogger(__name__)
 
@@ -33,11 +34,51 @@ _COVERAGE_PATTERN = re.compile(r"^(top|weight)(\d+)$", re.IGNORECASE)
 _SHARE_CLASS_ALIAS_PATTERN = re.compile(r"^([A-Z][A-Z0-9]{0,5})[.-]([A-Z])$")
 
 
+def _normalize_coverage_label(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return None
+    if normalized == "all" or _COVERAGE_PATTERN.match(normalized):
+        return normalized
+    return None
+
+
+def _promote_etf_coverage_range(db: Session, etf_symbol: Optional[str], coverage: Optional[str]) -> None:
+    normalized_symbol = str(etf_symbol or "").strip().upper()
+    normalized_coverage = _normalize_coverage_label(coverage)
+    if not normalized_symbol or not normalized_coverage:
+        return
+
+    etf = db.query(ETF).filter(ETF.symbol == normalized_symbol).first()
+    if not etf:
+        return
+
+    raw_ranges = getattr(etf, "coverage_ranges", None) or []
+    if isinstance(raw_ranges, str):
+        try:
+            parsed_ranges = json.loads(raw_ranges)
+            raw_ranges = parsed_ranges if isinstance(parsed_ranges, list) else []
+        except Exception:
+            raw_ranges = []
+
+    existing_ranges = [
+        str(item).strip().lower()
+        for item in raw_ranges
+        if isinstance(item, str) and str(item).strip()
+    ]
+    next_ranges = [normalized_coverage, *[item for item in existing_ranges if item != normalized_coverage]]
+    if next_ranges != existing_ranges:
+        etf.coverage_ranges = next_ranges
+        etf.updated_at = datetime.utcnow()
+
+
 def _upsert_imported_data(db: Session, source: str, items: List[Dict[str, Any]]) -> int:
     """将导入数据写入 imported_data 表，按 symbol+date+source 去重。"""
     if not items:
         return 0
-    today = date.today()
+    today = beijing_today()
     count = 0
     for item in items:
         symbol = item.get("symbol") if isinstance(item, dict) else None
@@ -688,7 +729,7 @@ async def get_holdings_upload_logs(
             "skippedCount": log.skipped_count,
             "status": log.status,
             "errorMessage": log.error_message,
-            "createdAt": log.created_at.isoformat() if log.created_at else None
+            "createdAt": utc_isoformat(log.created_at)
         }
         for log in logs
     ]
@@ -864,7 +905,10 @@ async def import_mc_data(
         processed_items = result.get('processed_data') or []
         try:
             inserted = _upsert_imported_data(db, 'marketchameleon', processed_items)
+            _promote_etf_coverage_range(db, normalized_etf_symbol, normalized_coverage)
             if inserted:
+                db.commit()
+            elif normalized_etf_symbol and normalized_coverage:
                 db.commit()
         except Exception as exc:
             db.rollback()
@@ -1051,7 +1095,10 @@ async def import_mc_csv(
         processed_items = result.get('processed_data') or []
         try:
             inserted = _upsert_imported_data(db, 'marketchameleon', processed_items)
+            _promote_etf_coverage_range(db, normalized_etf_symbol, normalized_coverage)
             if inserted:
+                db.commit()
+            elif normalized_etf_symbol and normalized_coverage:
                 db.commit()
         except Exception as exc:
             db.rollback()

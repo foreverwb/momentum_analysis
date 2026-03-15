@@ -15,9 +15,10 @@ import json
 import pandas as pd
 
 from app.models import get_db, Task, ETF, ETFHolding, Stock, PriceHistory, ImportedData, IVData, ScoreSnapshot
-from app.schemas import TaskCreate
+from app.schemas import TaskCreate, TaskEtfsAdd
 from app.api.etfs import refresh_etf_data, ETF_REFRESH_COOLDOWN_MINUTES
-from app.api.series_utils import build_metric_series, build_sma20_comparison_series
+from app.api.series_utils import build_metric_series, build_sma20_comparison_series, resolve_latest_trade_date
+from app.core.time_utils import beijing_today, format_beijing_date, utc_isoformat, utc_now_iso
 
 router = APIRouter()
 
@@ -33,8 +34,8 @@ def format_task_response(task: Task) -> dict:
         "baseIndices": base_indices,
         "sector": task.sector,
         "etfs": task.etfs or [],
-        "createdAt": task.created_at.strftime("%Y-%m-%d") if task.created_at else None,
-        "updatedAt": task.updated_at.isoformat() if task.updated_at else None,
+        "createdAt": format_beijing_date(task.created_at),
+        "updatedAt": utc_isoformat(task.updated_at),
     }
 
 
@@ -73,6 +74,88 @@ def _normalize_base_indices(raw: Any) -> List[str]:
         if symbol and symbol not in deduped:
             deduped.append(symbol)
     return deduped or ["SPY"]
+
+
+def _normalize_optional_symbol(raw: Any) -> Optional[str]:
+    if raw is None:
+        return None
+    normalized = str(raw).strip().upper()
+    return normalized or None
+
+
+def _dedupe_symbols(symbols: List[str]) -> List[str]:
+    deduped: List[str] = []
+    for symbol in symbols:
+        normalized = str(symbol).strip().upper()
+        if normalized and normalized not in deduped:
+            deduped.append(normalized)
+    return deduped
+
+
+def _validate_task_etfs(
+    *,
+    task_type: str,
+    sector: Optional[str],
+    etfs: Any,
+    db: Session,
+) -> Tuple[Optional[str], List[str]]:
+    normalized_type = str(task_type or "").strip().lower()
+    normalized_sector = _normalize_optional_symbol(sector)
+    normalized_etfs = _dedupe_symbols(_normalize_symbols(etfs))
+
+    if normalized_type not in {"rotation", "drilldown", "momentum"}:
+        raise HTTPException(status_code=400, detail=f"Unsupported task type: {task_type}")
+
+    if normalized_type in {"drilldown", "momentum"} and not normalized_sector:
+        raise HTTPException(status_code=400, detail="该任务类型必须指定板块 ETF")
+
+    if not normalized_etfs:
+        return (None if normalized_type == "rotation" else normalized_sector, normalized_etfs)
+
+    etf_rows = db.query(ETF).filter(func.upper(ETF.symbol).in_(normalized_etfs)).all()
+    etf_by_symbol = {
+        str(etf.symbol or "").strip().upper(): etf
+        for etf in etf_rows
+        if str(etf.symbol or "").strip()
+    }
+
+    missing_symbols = [symbol for symbol in normalized_etfs if symbol not in etf_by_symbol]
+    if missing_symbols:
+        raise HTTPException(status_code=400, detail=f"ETF 不存在: {', '.join(missing_symbols)}")
+
+    if normalized_type == "rotation":
+        invalid_symbols = [
+            symbol for symbol in normalized_etfs
+            if str(etf_by_symbol[symbol].type or "").strip().lower() != "sector"
+        ]
+        if invalid_symbols:
+            raise HTTPException(
+                status_code=400,
+                detail=f"板块轮动任务只能添加板块 ETF: {', '.join(invalid_symbols)}",
+            )
+        return None, normalized_etfs
+
+    invalid_symbols = [
+        symbol for symbol in normalized_etfs
+        if str(etf_by_symbol[symbol].type or "").strip().lower() != "industry"
+    ]
+    if invalid_symbols:
+        raise HTTPException(
+            status_code=400,
+            detail=f"当前任务类型只能添加行业 ETF: {', '.join(invalid_symbols)}",
+        )
+
+    wrong_sector_symbols = [
+        symbol for symbol in normalized_etfs
+        if _normalize_optional_symbol(etf_by_symbol[symbol].parent_sector) != normalized_sector
+    ]
+    if wrong_sector_symbols:
+        raise HTTPException(
+            status_code=400,
+            detail=f"只能添加属于板块 {normalized_sector} 的行业 ETF: {', '.join(wrong_sector_symbols)}",
+        )
+
+    return normalized_sector, normalized_etfs
 
 
 def _coerce_datetime(value: Any) -> Optional[datetime]:
@@ -236,7 +319,7 @@ async def get_task_trend_comparison(
     task_id: int,
     period: int = Query(20, description="对比周期（交易日）: 5/20/63"),
     metric: str = Query("relative", description="指标: relative/sma20/return20d/score"),
-    label_tz: str = Query("market", description="日期标签时区: market/beijing"),
+    label_tz: str = Query("beijing", description="日期标签时区，默认北京时间"),
     db: Session = Depends(get_db)
 ):
     """
@@ -250,7 +333,7 @@ async def get_task_trend_comparison(
         raise HTTPException(status_code=400, detail="period must be one of 5, 20, 63")
     if metric not in ("relative", "sma20", "return20d", "score"):
         raise HTTPException(status_code=400, detail="metric must be one of relative, sma20, return20d, score")
-    normalized_label_tz = (label_tz or "market").strip().lower()
+    normalized_label_tz = (label_tz or "beijing").strip().lower()
     if normalized_label_tz not in ("market", "beijing"):
         raise HTTPException(status_code=400, detail="label_tz must be one of market, beijing")
 
@@ -316,12 +399,18 @@ async def create_task(task: TaskCreate, db: Session = Depends(get_db)):
     创建新的监控任务
     """
     base_indices = _normalize_base_indices(task.baseIndex)
+    normalized_sector, normalized_etfs = _validate_task_etfs(
+        task_type=task.type.value,
+        sector=task.sector,
+        etfs=task.etfs,
+        db=db,
+    )
     new_task = Task(
         title=task.title,
         type=task.type.value,
         base_index=",".join(base_indices),
-        sector=task.sector,
-        etfs=task.etfs,
+        sector=normalized_sector,
+        etfs=normalized_etfs,
         created_at=datetime.utcnow()
     )
     
@@ -347,15 +436,56 @@ async def update_task(
         raise HTTPException(status_code=404, detail="Task not found")
     
     base_indices = _normalize_base_indices(task_update.baseIndex)
+    normalized_sector, normalized_etfs = _validate_task_etfs(
+        task_type=task_update.type.value,
+        sector=task_update.sector,
+        etfs=task_update.etfs,
+        db=db,
+    )
     task.title = task_update.title
     task.type = task_update.type.value
     task.base_index = ",".join(base_indices)
-    task.sector = task_update.sector
-    task.etfs = task_update.etfs
+    task.sector = normalized_sector
+    task.etfs = normalized_etfs
     
     db.commit()
     db.refresh(task)
     
+    return format_task_response(task)
+
+
+@router.post("/{task_id}/etfs", response_model=dict)
+async def add_task_etfs(
+    task_id: int,
+    payload: TaskEtfsAdd,
+    db: Session = Depends(get_db)
+):
+    """
+    向现有监控任务中追加 ETF
+    """
+    task = db.query(Task).filter(Task.id == task_id).first()
+
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    _, requested_etfs = _validate_task_etfs(
+        task_type=task.type,
+        sector=task.sector,
+        etfs=payload.etfs,
+        db=db,
+    )
+    if not requested_etfs:
+        raise HTTPException(status_code=400, detail="请至少选择一个 ETF")
+
+    # 仅校验本次新增的 ETF，保留任务里已有的历史配置。
+    # 这样即使旧任务包含与当前板块映射不一致的遗留 ETF，也不会阻塞新增合法标的。
+    existing_etfs = _dedupe_symbols(_normalize_symbols(task.etfs))
+    task.etfs = _dedupe_symbols(existing_etfs + requested_etfs)
+    task.updated_at = datetime.utcnow()
+
+    db.commit()
+    db.refresh(task)
+
     return format_task_response(task)
 
 
@@ -652,11 +782,11 @@ async def refresh_momentum_stocks(
         db.add(stock)
         db.flush()
 
-        today = date_type.today()
+        snapshot_date = resolve_latest_trade_date(price_df, fallback=beijing_today()) or beijing_today()
         existing_snapshot = db.query(ScoreSnapshot).filter(
             ScoreSnapshot.symbol == ticker,
             ScoreSnapshot.symbol_type == "stock",
-            ScoreSnapshot.date == today
+            ScoreSnapshot.date == snapshot_date
         ).first()
 
         score_breakdown = {
@@ -676,7 +806,7 @@ async def refresh_momentum_stocks(
             db.add(ScoreSnapshot(
                 symbol=ticker,
                 symbol_type="stock",
-                date=today,
+                date=snapshot_date,
                 total_score=stock.score_total,
                 score_breakdown=score_breakdown,
                 thresholds_pass=thresholds_pass
@@ -751,7 +881,7 @@ async def websocket_refresh_stream(websocket: WebSocket, task_id: int, db: Sessi
                 "message": "任务中没有 ETF",
                 "total_count": 0,
                 "completed_count": 0,
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": utc_now_iso()
             })
             return
 
@@ -773,7 +903,7 @@ async def websocket_refresh_stream(websocket: WebSocket, task_id: int, db: Sessi
                     "total_count": len(etf_symbols),
                     "current_etf": symbol,
                     "error": None,
-                    "timestamp": datetime.utcnow().isoformat()
+                    "timestamp": utc_now_iso()
                 })
                 await asyncio.sleep(0.1)
 
@@ -792,7 +922,7 @@ async def websocket_refresh_stream(websocket: WebSocket, task_id: int, db: Sessi
                         "total_count": len(etf_symbols),
                         "current_etf": symbol if idx < len(etf_symbols) else None,
                         "error": None,
-                        "timestamp": datetime.utcnow().isoformat()
+                        "timestamp": utc_now_iso()
                     })
                 else:
                     # 推送部分失败消息
@@ -806,7 +936,7 @@ async def websocket_refresh_stream(websocket: WebSocket, task_id: int, db: Sessi
                         "total_count": len(etf_symbols),
                         "current_etf": symbol,
                         "error": result.get('message'),
-                        "timestamp": datetime.utcnow().isoformat()
+                        "timestamp": utc_now_iso()
                     })
 
             except Exception as e:
@@ -821,7 +951,7 @@ async def websocket_refresh_stream(websocket: WebSocket, task_id: int, db: Sessi
                     "total_count": len(etf_symbols),
                     "current_etf": symbol,
                     "error": str(e),
-                    "timestamp": datetime.utcnow().isoformat()
+                    "timestamp": utc_now_iso()
                 })
 
             await asyncio.sleep(0.2)
@@ -832,7 +962,7 @@ async def websocket_refresh_stream(websocket: WebSocket, task_id: int, db: Sessi
             "message": f"任务完成: {len(etf_symbols)} 个 ETF 已刷新",
             "total_count": len(etf_symbols),
             "completed_count": len(etf_symbols),
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": utc_now_iso()
         })
 
     except WebSocketDisconnect:
@@ -841,6 +971,6 @@ async def websocket_refresh_stream(websocket: WebSocket, task_id: int, db: Sessi
         await websocket.send_json({
             "event": "error",
             "message": str(e),
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": utc_now_iso()
         })
         await websocket.close()

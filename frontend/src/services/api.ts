@@ -15,6 +15,7 @@ import type {
   Task, 
   CreateTaskInput
 } from '../types';
+import { getBeijingCutoffBoundaryMs, getBeijingSyncWindowKey, parseUtcTimestampMs } from '../utils/beijingTime';
 
 // ----------------------------------------------------------------------------
 // Configuration
@@ -987,30 +988,6 @@ const marketPriceDailySyncedAt = new Map<string, number>();
 let marketPriceDailyCacheLoaded = false;
 const MARKET_PRICE_SYNC_MAX_AGE_MS = 5 * 60 * 1000;
 const MARKET_PRICE_DAILY_SYNC_STORAGE_KEY = 'market-price-daily-sync-v1';
-const MARKET_PRICE_BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000;
-const MARKET_PRICE_ONE_DAY_MS = 24 * 60 * 60 * 1000;
-
-const getBeijingSyncBoundaryMs = (nowMs: number): number => {
-  const beijingNow = new Date(nowMs + MARKET_PRICE_BEIJING_OFFSET_MS);
-  const year = beijingNow.getUTCFullYear();
-  const month = beijingNow.getUTCMonth();
-  const day = beijingNow.getUTCDate();
-  const hour = beijingNow.getUTCHours();
-  let boundaryUtcMs = Date.UTC(year, month, day, 0, 0, 0, 0); // 08:00 BJT
-  if (hour < 8) {
-    boundaryUtcMs -= MARKET_PRICE_ONE_DAY_MS;
-  }
-  return boundaryUtcMs;
-};
-
-const getBeijingSyncWindowKey = (nowMs: number): string => {
-  const boundaryMs = getBeijingSyncBoundaryMs(nowMs);
-  const beijingBoundary = new Date(boundaryMs + MARKET_PRICE_BEIJING_OFFSET_MS);
-  const year = beijingBoundary.getUTCFullYear();
-  const month = `${beijingBoundary.getUTCMonth() + 1}`.padStart(2, '0');
-  const day = `${beijingBoundary.getUTCDate()}`.padStart(2, '0');
-  return `${year}-${month}-${day}`;
-};
 
 const loadMarketPriceDailySyncCache = (): void => {
   if (marketPriceDailyCacheLoaded || typeof window === 'undefined') {
@@ -1025,7 +1002,7 @@ const loadMarketPriceDailySyncCache = (): void => {
     Object.entries(parsed as Record<string, unknown>).forEach(([symbol, value]) => {
       if (typeof symbol !== 'string' || !symbol.trim()) return;
       if (typeof value !== 'string') return;
-      const ts = new Date(value).getTime();
+      const ts = parseUtcTimestampMs(value);
       if (!Number.isFinite(ts)) return;
       marketPriceDailySyncedAt.set(symbol.trim().toUpperCase(), ts);
     });
@@ -1094,7 +1071,7 @@ export async function syncPriceDataForSymbols(
   }
 
   const nowMs = Date.now();
-  const boundaryMs = getBeijingSyncBoundaryMs(nowMs);
+  const boundaryMs = getBeijingCutoffBoundaryMs(nowMs);
   if (!options?.force) {
     const alreadyFresh = cleanedSymbols.filter((symbol) =>
       isMarketPriceFreshInCurrentBeijingWindow(symbol, boundaryMs)
@@ -1255,10 +1232,15 @@ export async function ensureDailyPriceSync(symbols: string[]): Promise<boolean> 
         `[DailySync] ${freshness.stale.length} stale symbols, syncing:`,
         freshness.stale
       );
-      await syncPriceDataForSymbols(freshness.stale, { force: true });
-      // 同步完成，标记为 confirmed
+      const syncResult = await syncPriceDataForSymbols(freshness.stale, { force: true });
+      const failedSet = new Set(syncResult.failed.map((symbol) => symbol.trim().toUpperCase()));
       for (const s of freshness.stale) {
-        dailySyncConfirmed.add(s.toUpperCase());
+        if (!failedSet.has(s.toUpperCase())) {
+          dailySyncConfirmed.add(s.toUpperCase());
+        }
+      }
+      if (syncResult.failed.length > 0) {
+        console.warn('[DailySync] some symbols still stale after sync:', syncResult.failed);
       }
       return true;
     } catch (err) {
@@ -1448,6 +1430,7 @@ function normalizeETF(raw: unknown): ETF {
     holdingsCount: toNumber(source.holdingsCount) ?? 0,
     holdings,
     coverageRanges: toStringArray(source.coverageRanges),
+    preferredCoverage: toStringValue(source.preferredCoverage) ?? undefined,
     sourceUpdatedAt: Object.keys(sourceUpdatedAt).length > 0 ? sourceUpdatedAt : undefined,
     lastUpdated: toStringValue(source.lastUpdated) ?? toStringValue(source.updatedAt) ?? toStringValue(source.updated_at),
   };
@@ -1672,6 +1655,20 @@ export async function updateTask(id: string | number, input: CreateTaskInput): P
 }
 
 /**
+ * Add ETFs to an existing task
+ */
+export async function addTaskETFs(id: string | number, etfs: string[]): Promise<Task> {
+  const taskId = normalizeTaskId(id);
+  const response = await fetchApi<unknown>(`/tasks/${taskId}/etfs`, {
+    method: 'POST',
+    body: JSON.stringify({
+      etfs: normalizeTaskEtfs(etfs),
+    }),
+  });
+  return normalizeTask(response);
+}
+
+/**
  * Delete a task
  */
 export async function deleteTask(id: string | number): Promise<{ success: boolean; message: string }> {
@@ -1731,7 +1728,7 @@ export async function getTaskTrendComparison(
   taskId: string | number,
   period: 5 | 20 | 63 = 20,
   metric: 'relative' | 'sma20' | 'return20d' | 'score' = 'relative',
-  labelTimezone: 'market' | 'beijing' = 'market'
+  labelTimezone: 'market' | 'beijing' = 'beijing'
 ): Promise<{
   task_id: number;
   period: number;
@@ -1765,7 +1762,7 @@ export async function getStockTrendComparison(
   symbol: string,
   period: 5 | 20 | 63 = 20,
   metric: 'relative' | 'sma20' | 'return20d' | 'score' = 'relative',
-  labelTimezone: 'market' | 'beijing' = 'market'
+  labelTimezone: 'market' | 'beijing' = 'beijing'
 ): Promise<{
   symbol: string;
   period: number;
@@ -2201,9 +2198,15 @@ function normalizeOptionsOverlayData(raw: unknown, fallbackSymbol: string): Opti
     if (!isRecord(value)) return null;
     const bucket = toStringValue(value.bucket ?? value.term ?? value.range ?? value.label);
     if (!bucket) return null;
-    const callOI = toMaybeNumber(value.callOI ?? value.call_oi);
-    const putOI = toMaybeNumber(value.putOI ?? value.put_oi);
-    const netOI = toMaybeNumber(value.netOI ?? value.net_oi) ?? (
+    const callOI = toMaybeNumber(
+      value.callOI ?? value.call_oi ?? value.call_delta_1d ?? value.callDelta1d ?? value.call_delta_oi
+    );
+    const putOI = toMaybeNumber(
+      value.putOI ?? value.put_oi ?? value.put_delta_1d ?? value.putDelta1d ?? value.put_delta_oi
+    );
+    const netOI = toMaybeNumber(
+      value.netOI ?? value.net_oi ?? value.net_delta_1d ?? value.netDelta1d ?? value.net_delta_oi
+    ) ?? (
       callOI != null && putOI != null ? callOI - putOI : null
     );
     const delta3d = toMaybeNumber(value.delta3d ?? value.delta_3d);

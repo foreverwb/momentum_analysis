@@ -18,6 +18,7 @@ from datetime import datetime, date
 from enum import Enum
 import asyncio
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -935,6 +936,8 @@ class DataOrchestrator:
         mc_data: Optional[Dict[str, Any]] = None,
         iv_data: Optional[Dict[str, Any]] = None,
         duration: str = '1 Y',
+        price_df: Optional[pd.DataFrame] = None,
+        sector_df: Optional[pd.DataFrame] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         动能股池评分官方入口。
@@ -957,20 +960,22 @@ class DataOrchestrator:
         try:
             from .calculators.momentum_pool import calculate_momentum_pool_result
 
-            price_df = await asyncio.to_thread(
-                self._price_provider.get_ohlcv,
-                symbol=symbol,
-                duration=duration,
-                bar_size='1 day',
-            )
-            if price_df is None:
+            resolved_price_df = price_df
+            if resolved_price_df is None:
+                resolved_price_df = await asyncio.to_thread(
+                    self._price_provider.get_ohlcv,
+                    symbol=symbol,
+                    duration=duration,
+                    bar_size='1 day',
+                )
+            if resolved_price_df is None:
                 result = dict(empty_result)
                 result['error'] = 'symbol price data unavailable'
                 return result
 
-            sector_df = None
-            if sector_etf:
-                sector_df = await asyncio.to_thread(
+            resolved_sector_df = sector_df
+            if resolved_sector_df is None and sector_etf:
+                resolved_sector_df = await asyncio.to_thread(
                     self._price_provider.get_ohlcv,
                     symbol=sector_etf,
                     duration=duration,
@@ -979,8 +984,8 @@ class DataOrchestrator:
 
             pool_result = await asyncio.to_thread(
                 calculate_momentum_pool_result,
-                price_df=price_df,
-                sector_df=sector_df,
+                price_df=resolved_price_df,
+                sector_df=resolved_sector_df,
                 finviz_data=finviz_data,
                 mc_data=mc_data,
                 iv_data=iv_data,
@@ -1236,12 +1241,23 @@ class DataOrchestrator:
             try:
                 etf = db.query(ETF).filter(ETF.symbol == etf_symbol.upper()).first()
                 if etf:
-                    existing_ranges = getattr(etf, 'coverage_ranges', None) or []
-                    if coverage not in existing_ranges:
-                        existing_ranges.append(coverage)
-                        etf.coverage_ranges = existing_ranges
+                    raw_ranges = getattr(etf, 'coverage_ranges', None) or []
+                    if isinstance(raw_ranges, str):
+                        try:
+                            parsed_ranges = json.loads(raw_ranges)
+                            raw_ranges = parsed_ranges if isinstance(parsed_ranges, list) else []
+                        except Exception:
+                            raw_ranges = []
+                    existing_ranges = [
+                        str(item).strip().lower()
+                        for item in raw_ranges
+                        if isinstance(item, str) and str(item).strip()
+                    ]
+                    next_ranges = [coverage, *[item for item in existing_ranges if item != coverage]]
+                    if next_ranges != existing_ranges:
+                        etf.coverage_ranges = next_ranges
                         db.commit()
-                        logger.info(f"已更新 {etf_symbol} 的 coverage_ranges: {existing_ranges}")
+                        logger.info(f"已更新 {etf_symbol} 的 coverage_ranges: {next_ranges}")
             except Exception as e:
                 logger.warning(f"更新 coverage_ranges 失败 (可能数据库列不存在): {e}")
                 db.rollback()
