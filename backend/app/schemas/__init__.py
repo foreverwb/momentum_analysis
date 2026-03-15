@@ -120,6 +120,10 @@ class TaskCreate(TaskBase):
     pass
 
 
+class TaskEtfsAdd(BaseModel):
+    etfs: List[str]
+
+
 class TaskResponse(TaskBase):
     id: int
     createdAt: str

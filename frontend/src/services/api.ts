@@ -1672,6 +1672,20 @@ export async function updateTask(id: string | number, input: CreateTaskInput): P
 }
 
 /**
+ * Add ETFs to an existing task
+ */
+export async function addTaskETFs(id: string | number, etfs: string[]): Promise<Task> {
+  const taskId = normalizeTaskId(id);
+  const response = await fetchApi<unknown>(`/tasks/${taskId}/etfs`, {
+    method: 'POST',
+    body: JSON.stringify({
+      etfs: normalizeTaskEtfs(etfs),
+    }),
+  });
+  return normalizeTask(response);
+}
+
+/**
  * Delete a task
  */
 export async function deleteTask(id: string | number): Promise<{ success: boolean; message: string }> {

@@ -15,7 +15,7 @@ import json
 import pandas as pd
 
 from app.models import get_db, Task, ETF, ETFHolding, Stock, PriceHistory, ImportedData, IVData, ScoreSnapshot
-from app.schemas import TaskCreate
+from app.schemas import TaskCreate, TaskEtfsAdd
 from app.api.etfs import refresh_etf_data, ETF_REFRESH_COOLDOWN_MINUTES
 from app.api.series_utils import build_metric_series, build_sma20_comparison_series
 
@@ -73,6 +73,88 @@ def _normalize_base_indices(raw: Any) -> List[str]:
         if symbol and symbol not in deduped:
             deduped.append(symbol)
     return deduped or ["SPY"]
+
+
+def _normalize_optional_symbol(raw: Any) -> Optional[str]:
+    if raw is None:
+        return None
+    normalized = str(raw).strip().upper()
+    return normalized or None
+
+
+def _dedupe_symbols(symbols: List[str]) -> List[str]:
+    deduped: List[str] = []
+    for symbol in symbols:
+        normalized = str(symbol).strip().upper()
+        if normalized and normalized not in deduped:
+            deduped.append(normalized)
+    return deduped
+
+
+def _validate_task_etfs(
+    *,
+    task_type: str,
+    sector: Optional[str],
+    etfs: Any,
+    db: Session,
+) -> Tuple[Optional[str], List[str]]:
+    normalized_type = str(task_type or "").strip().lower()
+    normalized_sector = _normalize_optional_symbol(sector)
+    normalized_etfs = _dedupe_symbols(_normalize_symbols(etfs))
+
+    if normalized_type not in {"rotation", "drilldown", "momentum"}:
+        raise HTTPException(status_code=400, detail=f"Unsupported task type: {task_type}")
+
+    if normalized_type in {"drilldown", "momentum"} and not normalized_sector:
+        raise HTTPException(status_code=400, detail="该任务类型必须指定板块 ETF")
+
+    if not normalized_etfs:
+        return (None if normalized_type == "rotation" else normalized_sector, normalized_etfs)
+
+    etf_rows = db.query(ETF).filter(func.upper(ETF.symbol).in_(normalized_etfs)).all()
+    etf_by_symbol = {
+        str(etf.symbol or "").strip().upper(): etf
+        for etf in etf_rows
+        if str(etf.symbol or "").strip()
+    }
+
+    missing_symbols = [symbol for symbol in normalized_etfs if symbol not in etf_by_symbol]
+    if missing_symbols:
+        raise HTTPException(status_code=400, detail=f"ETF 不存在: {', '.join(missing_symbols)}")
+
+    if normalized_type == "rotation":
+        invalid_symbols = [
+            symbol for symbol in normalized_etfs
+            if str(etf_by_symbol[symbol].type or "").strip().lower() != "sector"
+        ]
+        if invalid_symbols:
+            raise HTTPException(
+                status_code=400,
+                detail=f"板块轮动任务只能添加板块 ETF: {', '.join(invalid_symbols)}",
+            )
+        return None, normalized_etfs
+
+    invalid_symbols = [
+        symbol for symbol in normalized_etfs
+        if str(etf_by_symbol[symbol].type or "").strip().lower() != "industry"
+    ]
+    if invalid_symbols:
+        raise HTTPException(
+            status_code=400,
+            detail=f"当前任务类型只能添加行业 ETF: {', '.join(invalid_symbols)}",
+        )
+
+    wrong_sector_symbols = [
+        symbol for symbol in normalized_etfs
+        if _normalize_optional_symbol(etf_by_symbol[symbol].parent_sector) != normalized_sector
+    ]
+    if wrong_sector_symbols:
+        raise HTTPException(
+            status_code=400,
+            detail=f"只能添加属于板块 {normalized_sector} 的行业 ETF: {', '.join(wrong_sector_symbols)}",
+        )
+
+    return normalized_sector, normalized_etfs
 
 
 def _coerce_datetime(value: Any) -> Optional[datetime]:
@@ -316,12 +398,18 @@ async def create_task(task: TaskCreate, db: Session = Depends(get_db)):
     创建新的监控任务
     """
     base_indices = _normalize_base_indices(task.baseIndex)
+    normalized_sector, normalized_etfs = _validate_task_etfs(
+        task_type=task.type.value,
+        sector=task.sector,
+        etfs=task.etfs,
+        db=db,
+    )
     new_task = Task(
         title=task.title,
         type=task.type.value,
         base_index=",".join(base_indices),
-        sector=task.sector,
-        etfs=task.etfs,
+        sector=normalized_sector,
+        etfs=normalized_etfs,
         created_at=datetime.utcnow()
     )
     
@@ -347,15 +435,61 @@ async def update_task(
         raise HTTPException(status_code=404, detail="Task not found")
     
     base_indices = _normalize_base_indices(task_update.baseIndex)
+    normalized_sector, normalized_etfs = _validate_task_etfs(
+        task_type=task_update.type.value,
+        sector=task_update.sector,
+        etfs=task_update.etfs,
+        db=db,
+    )
     task.title = task_update.title
     task.type = task_update.type.value
     task.base_index = ",".join(base_indices)
-    task.sector = task_update.sector
-    task.etfs = task_update.etfs
+    task.sector = normalized_sector
+    task.etfs = normalized_etfs
     
     db.commit()
     db.refresh(task)
     
+    return format_task_response(task)
+
+
+@router.post("/{task_id}/etfs", response_model=dict)
+async def add_task_etfs(
+    task_id: int,
+    payload: TaskEtfsAdd,
+    db: Session = Depends(get_db)
+):
+    """
+    向现有监控任务中追加 ETF
+    """
+    task = db.query(Task).filter(Task.id == task_id).first()
+
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    _, requested_etfs = _validate_task_etfs(
+        task_type=task.type,
+        sector=task.sector,
+        etfs=payload.etfs,
+        db=db,
+    )
+    if not requested_etfs:
+        raise HTTPException(status_code=400, detail="请至少选择一个 ETF")
+
+    merged_etfs = _dedupe_symbols(_normalize_symbols(task.etfs) + requested_etfs)
+    _, validated_etfs = _validate_task_etfs(
+        task_type=task.type,
+        sector=task.sector,
+        etfs=merged_etfs,
+        db=db,
+    )
+
+    task.etfs = validated_etfs
+    task.updated_at = datetime.utcnow()
+
+    db.commit()
+    db.refresh(task)
+
     return format_task_response(task)
 
 

@@ -1,9 +1,11 @@
 import React, { useState, useEffect, useMemo } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { RelativeTrendChart, type RelativeTrendSeries } from '../chart';
 import { ETFDetailCard } from './ETFDetailCard';
-import { HoldingsImportModal, ETFImportModal, RefreshProgressModal } from '../modal';
+import { AddTaskETFsModal, HoldingsImportModal, ETFImportModal, RefreshProgressModal } from '../modal';
 import { LoadingState, ErrorMessage } from '../common';
 import type { Task, ETF, Holding, RefreshResult } from '../../types';
+import { taskQueryKeys } from '../../hooks/useData';
 import * as api from '../../services/api';
 
 interface TaskDetailProps {
@@ -658,9 +660,11 @@ const normalizeRefreshStatus = (status?: string): RefreshResult['status'] => {
 };
 
 export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps) {
+  const queryClient = useQueryClient();
   const [trendPeriod, setTrendPeriod] = useState<'5d' | '20d' | '63d'>('20d');
   const [trendMetric, setTrendMetric] = useState<'relative' | 'sma20' | 'return20d' | 'score'>('relative');
   const [trendLabelTimezone, setTrendLabelTimezone] = useState<'market' | 'beijing'>('market');
+  const [isAddETFModalOpen, setIsAddETFModalOpen] = useState(false);
   const [holdingsModalOpen, setHoldingsModalOpen] = useState(false);
   const [etfModalOpen, setETFModalOpen] = useState(false);
   const [selectedETF, setSelectedETF] = useState<string>('');
@@ -1770,6 +1774,18 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
     setETFModalOpen(true);
   };
 
+  const handleAddTaskETFs = async (symbols: string[]) => {
+    if (!task.id) {
+      throw new Error('当前任务不存在');
+    }
+
+    const updatedTask = await api.addTaskETFs(task.id, symbols);
+    queryClient.setQueryData(taskQueryKeys.detail(task.id), updatedTask);
+    queryClient.setQueryData(taskQueryKeys.detail(String(task.id)), updatedTask);
+    void queryClient.invalidateQueries({ queryKey: taskQueryKeys.lists() });
+    setResolvedEtfs(resolveMonitoredEtfs(updatedTask.etfs, updatedTask.type, updatedTask.sector));
+  };
+
   if (isLoading) {
     return <LoadingState message="正在加载监控任务数据..." />;
   }
@@ -1816,6 +1832,12 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
         </div>
         <div className="flex flex-col items-end gap-3">
           <div className="flex items-center gap-3">
+            <button
+              onClick={() => setIsAddETFModalOpen(true)}
+              className="px-4 py-2 text-sm font-medium rounded-[var(--radius-sm)] bg-[var(--bg-secondary)] border border-[var(--accent-blue)] text-[var(--accent-blue)] hover:bg-[var(--accent-blue)]/10 transition-colors flex items-center gap-2"
+            >
+              Add ETFs
+            </button>
             <button
               onClick={handleRefreshAll}
               disabled={isRefreshingAll}
@@ -1956,6 +1978,14 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
       </div>
 
       {/* Modals */}
+      <AddTaskETFsModal
+        isOpen={isAddETFModalOpen}
+        onClose={() => setIsAddETFModalOpen(false)}
+        taskType={task.type}
+        taskSector={task.sector}
+        existingEtfs={task.etfs}
+        onSubmit={handleAddTaskETFs}
+      />
       <HoldingsImportModal
         isOpen={holdingsModalOpen}
         onClose={() => {
