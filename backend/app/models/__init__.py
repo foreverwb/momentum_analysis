@@ -1,6 +1,6 @@
 from .database import (
     Base, engine, SessionLocal, get_db, 
-    Stock, ETF, ETFHolding, Task,
+    Stock, ETF, ETFHolding, Task, RefreshJob,
     PriceHistory, IVData, ImportedData, ScoreSnapshot, MarketRegimeSnapshot, BrokerStatus,
     HoldingsUploadLog,
     init_db, init_default_sector_etfs, 

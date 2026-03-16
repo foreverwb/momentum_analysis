@@ -168,6 +168,23 @@ ETF 评分 `breakdown` 现在同时输出：
 | `list-etfs` | 列出所有 ETF | `python -m app.cli list-etfs` |
 | `list-holdings` | 列出指定 ETF 持仓 | `python -m app.cli list-holdings XLK` |
 
+### 后台刷新命令
+
+以下命令依赖已启动的后端 API。命令执行后只负责提交 job，刷新会在 FastAPI 进程内后台串行执行，不需要在当前命令行窗口等待。
+
+| 命令 | 说明 | 示例 |
+| --- | --- | --- |
+| `refresh etfs` | 后台串行刷新多个 ETF | `python -m app.cli refresh etfs -s "XLK,XLF,SOXX"` |
+| `refresh holdings` | 后台串行刷新多个 ETF holdings；支持 `t-20` / `85` / `all` | `python -m app.cli refresh holdings -s "XLK,SOXX" -w t-20` |
+| `refresh status` | 查询单个后台 refresh job 状态 | `python -m app.cli refresh status 12` |
+| `refresh list` | 查看最近的后台 refresh jobs | `python -m app.cli refresh list --status running` |
+
+说明：
+
+- 多个 ETF / holdings job 在服务端按入队顺序串行执行，避免对 IBKR / Futu 形成并发冲击。
+- `refresh holdings` 内部仍保留已有的 IBKR 并发限制与 Futu 批量抓取逻辑。
+- 串行 job 之间会按 `cfg.yaml -> refresh.serial_gap_seconds` 留出间隔，默认 `2` 秒。
+
 ### 便捷入口
 
 | 命令 | 说明 | 示例 |

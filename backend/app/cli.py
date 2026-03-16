@@ -7,6 +7,8 @@ Momentum Radar 命令行工具
 - update: 更新 ETF Holdings 数据（与 uploads 相同，更语义化的命令）
 - finviz etfs: 导入 Finviz JSON/CSV ETF 数据
 - mc etfs: 导入 MarketChameleon ETF 数据（支持整文件或按覆盖范围导入）
+- refresh etfs: 后台串行刷新多个 ETF
+- refresh holdings: 后台串行刷新多个 ETF holdings
 - init: 初始化数据库和默认数据
 
 使用示例:
@@ -31,6 +33,10 @@ Momentum Radar 命令行工具
     python -m app.cli finviz etfs -f finviz_export.csv
     python -m app.cli finviz etfs -s "XLK,XLC,XLV" -w 85 -f finviz_export.csv
 
+    # 后台提交 refresh 任务（命令立即返回）
+    python -m app.cli refresh etfs -s "XLK,XLF,SOXX"
+    python -m app.cli refresh holdings -s "XLK,SOXX" -w t-20
+
     # 初始化数据库
     python -m app.cli init
 """
@@ -42,6 +48,8 @@ import os
 import json
 import re
 import time
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 from datetime import datetime, date, timezone
 from pathlib import Path
 
@@ -53,6 +61,10 @@ PROVIDER_COMMANDS = {"finviz", "mc"}
 PROVIDER_ETF_SUBCOMMAND = "etfs"
 _SHARE_CLASS_ALIAS_PATTERN = re.compile(r"^([A-Z][A-Z0-9]{0,5})[.-]([A-Z])$")
 SQLITE_LOCK_RETRY_ATTEMPTS = 3
+DEFAULT_API_BASE_URL = os.environ.get("MOMENTUM_API_BASE_URL", "http://127.0.0.1:8000")
+REFRESH_JOB_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+REFRESH_POST_SUBMIT_POLL_SECONDS = 2.0
+REFRESH_POST_SUBMIT_POLL_INTERVAL_SECONDS = 0.25
 
 # 添加 backend 根目录到 Python 路径，兼容直接执行 app/cli.py。
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -379,6 +391,264 @@ def parse_mc_coverage(raw_coverage: str) -> tuple:
         return "weight", value, f"weight{value}"
 
     raise ValueError(f"无效覆盖范围: {raw_coverage}。仅支持 -w t-10 或 -w 85")
+
+
+def parse_refresh_holdings_coverage(raw_coverage: str) -> tuple:
+    text = str(raw_coverage or "").strip().lower().replace(" ", "")
+    if text == "all":
+        return "all", 0, "all"
+    return parse_mc_coverage(text)
+
+
+def _normalize_api_base_url(raw_url: str) -> str:
+    base_url = str(raw_url or DEFAULT_API_BASE_URL).strip()
+    if not base_url:
+        raise ValueError("API 地址不能为空")
+    return base_url.rstrip("/")
+
+
+def _http_json_request(method: str, url: str, payload=None, timeout: int = 10) -> dict:
+    headers = {"Accept": "application/json"}
+    body = None
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    req = urllib_request.Request(url=url, data=body, method=method.upper(), headers=headers)
+    try:
+        with urllib_request.urlopen(req, timeout=max(1, int(timeout))) as response:
+            raw = response.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except urllib_error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="ignore")
+        detail = raw.strip()
+        if detail:
+            try:
+                payload = json.loads(detail)
+                if isinstance(payload, dict):
+                    detail = payload.get("detail") or payload.get("message") or detail
+            except Exception:
+                pass
+        raise RuntimeError(f"API 请求失败 ({exc.code}): {detail or exc.reason}") from exc
+    except urllib_error.URLError as exc:
+        raise RuntimeError(
+            "无法连接后端 API，请先启动 FastAPI 服务，例如 `cd backend && .venv/bin/python -m uvicorn app.main:app --port 8000`"
+        ) from exc
+
+
+def _print_refresh_job_summary(job: dict, *, command_hint: str) -> None:
+    job_id = job.get("id")
+    queue_position = job.get("queue_position")
+    message = job.get("message") or "任务已入队"
+
+    print(message)
+    print(f"Job ID: {job_id}")
+    print(f"状态: {job.get('status')}")
+    if queue_position is not None:
+        print(f"队列位置: {queue_position}")
+    print(f"查询状态: {command_hint}")
+
+
+def _print_refresh_job_failure_details(job: dict) -> None:
+    result = job.get("result")
+    if not isinstance(result, dict):
+        return
+    items = result.get("items")
+    if not isinstance(items, list) or not items:
+        return
+
+    failed_items = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "").strip().lower()
+        if status in {"success", "snapshot"}:
+            continue
+        failed_items.append(item)
+
+    if not failed_items:
+        return
+
+    print("失败明细:")
+    for item in failed_items:
+        symbol = str(item.get("symbol") or item.get("ticker") or "-").upper()
+        coverage = str(item.get("coverage") or "").strip()
+        label = f"{symbol} ({coverage})" if coverage else symbol
+        message = item.get("message") or item.get("error") or item.get("status") or "未知错误"
+        print(f"- {label}: {message}")
+
+
+def _refresh_job_has_failures(job: dict) -> bool:
+    if not isinstance(job, dict):
+        return False
+    if job.get("error"):
+        return True
+    try:
+        if int(job.get("progress_failed") or 0) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    result = job.get("result")
+    if isinstance(result, dict):
+        summary_status = str(result.get("summary_status") or "").strip().lower()
+        if summary_status in {"failed", "partial_success"}:
+            return True
+    return False
+
+
+def _poll_refresh_job_until_terminal(
+    job_id: int,
+    *,
+    api_base: str,
+    timeout: int,
+    max_wait_seconds: float = REFRESH_POST_SUBMIT_POLL_SECONDS,
+    poll_interval_seconds: float = REFRESH_POST_SUBMIT_POLL_INTERVAL_SECONDS,
+) -> dict | None:
+    if not job_id:
+        return None
+
+    deadline = time.monotonic() + max(0.0, float(max_wait_seconds))
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(max(0.0, float(poll_interval_seconds)), remaining))
+        try:
+            job = _http_json_request(
+                "GET",
+                f"{api_base}/api/refresh-jobs/{job_id}",
+                timeout=timeout,
+            )
+        except RuntimeError:
+            return None
+
+        status = str(job.get("status") or "").strip().lower()
+        if _refresh_job_has_failures(job):
+            return job
+        if status in REFRESH_JOB_TERMINAL_STATUSES:
+            return job
+
+
+def cmd_refresh_etfs(args):
+    symbols = parse_etf_symbols(args.symbols)
+    api_base = _normalize_api_base_url(args.api_base)
+    response = _http_json_request(
+        "POST",
+        f"{api_base}/api/refresh-jobs/etfs",
+        payload={
+            "symbols": symbols,
+            "source": "cli",
+        },
+        timeout=args.timeout,
+    )
+    job = response.get("job") or {}
+    _print_refresh_job_summary(
+        job,
+        command_hint=f"python -m app.cli refresh status {job.get('id')} --api-base {api_base}",
+    )
+
+
+def cmd_refresh_holdings(args):
+    symbols = parse_etf_symbols(args.symbols)
+    coverage_type, coverage_value, coverage_label = parse_refresh_holdings_coverage(args.coverage)
+    api_base = _normalize_api_base_url(args.api_base)
+    response = _http_json_request(
+        "POST",
+        f"{api_base}/api/refresh-jobs/holdings",
+        payload={
+            "items": [
+                {
+                    "symbol": symbol,
+                    "coverage_type": coverage_type,
+                    "coverage_value": coverage_value,
+                    "related_etf_symbols": [],
+                }
+                for symbol in symbols
+            ],
+            "source": "cli",
+        },
+        timeout=args.timeout,
+    )
+    job = response.get("job") or {}
+    command_hint = f"python -m app.cli refresh status {job.get('id')} --api-base {api_base}"
+    print(f"已提交 holdings refresh: {','.join(symbols)} ({coverage_label})")
+    _print_refresh_job_summary(
+        job,
+        command_hint=command_hint,
+    )
+    terminal_job = _poll_refresh_job_until_terminal(
+        int(job.get("id") or 0),
+        api_base=api_base,
+        timeout=args.timeout,
+    )
+    if terminal_job and _refresh_job_has_failures(terminal_job):
+        job_status = str(terminal_job.get("status") or "").strip().lower()
+        if job_status in REFRESH_JOB_TERMINAL_STATUSES:
+            print("后台任务快速返回错误:")
+        else:
+            print("后台任务已发现错误，任务仍在后台继续:")
+        if terminal_job.get("message"):
+            print(f"消息: {terminal_job.get('message')}")
+        if terminal_job.get("error"):
+            print(f"错误: {terminal_job.get('error')}")
+        _print_refresh_job_failure_details(terminal_job)
+        print(f"查询状态: {command_hint}")
+
+
+def cmd_refresh_status(args):
+    api_base = _normalize_api_base_url(args.api_base)
+    job = _http_json_request(
+        "GET",
+        f"{api_base}/api/refresh-jobs/{args.job_id}",
+        timeout=args.timeout,
+    )
+    print(f"Job ID: {job.get('id')}")
+    print(f"类型: {job.get('job_type')}")
+    print(f"状态: {job.get('status')}")
+    print(f"进度: {job.get('progress_completed')}/{job.get('progress_total')} (失败 {job.get('progress_failed')})")
+    if job.get("current_item"):
+        print(f"当前标的: {job.get('current_item')}")
+    if job.get("queue_position") is not None:
+        print(f"队列位置: {job.get('queue_position')}")
+    if job.get("message"):
+        print(f"消息: {job.get('message')}")
+    if job.get("error"):
+        print(f"错误: {job.get('error')}")
+    _print_refresh_job_failure_details(job)
+    if args.show_result and job.get("result") is not None:
+        print("结果:")
+        print(json.dumps(job.get("result"), ensure_ascii=False, indent=2))
+
+
+def cmd_refresh_list(args):
+    api_base = _normalize_api_base_url(args.api_base)
+    query_params = [f"limit={int(args.limit)}"]
+    if args.status:
+        query_params.append(f"status={args.status}")
+    response = _http_json_request(
+        "GET",
+        f"{api_base}/api/refresh-jobs?{'&'.join(query_params)}",
+        timeout=args.timeout,
+    )
+    items = response.get("items") or []
+    if not items:
+        print("暂无 refresh jobs")
+        return
+
+    print(f"{'ID':<6} {'TYPE':<10} {'STATUS':<12} {'PROGRESS':<14} {'QUEUE':<8} MESSAGE")
+    for item in items:
+        progress = f"{item.get('progress_completed', 0)}/{item.get('progress_total', 0)}"
+        queue_position = item.get("queue_position")
+        queue_text = "-" if queue_position is None else str(queue_position)
+        message = str(item.get("message") or "")
+        print(
+            f"{str(item.get('id')):<6} "
+            f"{str(item.get('job_type')):<10} "
+            f"{str(item.get('status')):<12} "
+            f"{progress:<14} "
+            f"{queue_text:<8} "
+            f"{message}"
+        )
 
 
 def load_mc_json_rows(file_path: str) -> list:
@@ -1483,6 +1753,11 @@ def build_parser():
   python -m app.cli mc etfs -d 2026-03-06 -s "XLK,XLC,XLV" -w 85 -f marketchameleon.json
   python -m app.cli mc etfs -s "XLK,XLC,XLV" -w t-10 -f marketchameleon.json
 
+  # 后台提交 refresh 任务（命令不会等待刷新完成）
+  python -m app.cli refresh etfs -s "XLK,XLF,SOXX"
+  python -m app.cli refresh holdings -s "XLK,SOXX" -w t-20
+  python -m app.cli refresh status 12
+
   # 旧写法仍兼容，会自动按 etfs 处理
   python -m app.cli finviz -f finviz_export.csv
   python -m app.cli mc -f marketchameleon_etfs.json
@@ -1601,6 +1876,94 @@ def build_parser():
     )
     import_mc_parser.set_defaults(resource=PROVIDER_ETF_SUBCOMMAND)
     import_mc_parser.set_defaults(func=cmd_import_mc)
+
+    refresh_parser = subparsers.add_parser(
+        'refresh',
+        help='提交后台 refresh 任务并由服务端串行执行'
+    )
+    refresh_subparsers = refresh_parser.add_subparsers(dest='resource')
+    refresh_subparsers.required = True
+
+    refresh_etfs_parser = refresh_subparsers.add_parser(
+        'etfs',
+        help='后台刷新多个 ETF，命令提交后立即返回'
+    )
+    refresh_etfs_parser.add_argument(
+        '-s', '--symbols', required=True,
+        help='ETF 列表，逗号分隔（如 "XLK,XLF,SOXX"）'
+    )
+    refresh_etfs_parser.add_argument(
+        '--api-base', default=DEFAULT_API_BASE_URL,
+        help=f'后端 API 地址，默认 {DEFAULT_API_BASE_URL}'
+    )
+    refresh_etfs_parser.add_argument(
+        '--timeout', type=int, default=10,
+        help='提交任务请求超时（秒）'
+    )
+    refresh_etfs_parser.set_defaults(func=cmd_refresh_etfs)
+
+    refresh_holdings_parser = refresh_subparsers.add_parser(
+        'holdings',
+        help='后台串行刷新多个 ETF holdings，命令提交后立即返回'
+    )
+    refresh_holdings_parser.add_argument(
+        '-s', '--symbols', required=True,
+        help='ETF 列表，逗号分隔（如 "XLK,SOXX"）'
+    )
+    refresh_holdings_parser.add_argument(
+        '-w', '--coverage', default='t-20',
+        help='覆盖范围，支持 t-20 / 85 / all，默认 t-20'
+    )
+    refresh_holdings_parser.add_argument(
+        '--api-base', default=DEFAULT_API_BASE_URL,
+        help=f'后端 API 地址，默认 {DEFAULT_API_BASE_URL}'
+    )
+    refresh_holdings_parser.add_argument(
+        '--timeout', type=int, default=10,
+        help='提交任务请求超时（秒）'
+    )
+    refresh_holdings_parser.set_defaults(func=cmd_refresh_holdings)
+
+    refresh_status_parser = refresh_subparsers.add_parser(
+        'status',
+        help='查看后台 refresh job 状态'
+    )
+    refresh_status_parser.add_argument('job_id', type=int, help='job id')
+    refresh_status_parser.add_argument(
+        '--api-base', default=DEFAULT_API_BASE_URL,
+        help=f'后端 API 地址，默认 {DEFAULT_API_BASE_URL}'
+    )
+    refresh_status_parser.add_argument(
+        '--timeout', type=int, default=10,
+        help='请求超时（秒）'
+    )
+    refresh_status_parser.add_argument(
+        '--show-result', action='store_true',
+        help='输出完整 result JSON'
+    )
+    refresh_status_parser.set_defaults(func=cmd_refresh_status)
+
+    refresh_list_parser = refresh_subparsers.add_parser(
+        'list',
+        help='列出最近的后台 refresh jobs'
+    )
+    refresh_list_parser.add_argument(
+        '--status', choices=['pending', 'running', 'completed', 'failed'],
+        help='按状态过滤'
+    )
+    refresh_list_parser.add_argument(
+        '--limit', type=int, default=10,
+        help='返回 job 数量，默认 10'
+    )
+    refresh_list_parser.add_argument(
+        '--api-base', default=DEFAULT_API_BASE_URL,
+        help=f'后端 API 地址，默认 {DEFAULT_API_BASE_URL}'
+    )
+    refresh_list_parser.add_argument(
+        '--timeout', type=int, default=10,
+        help='请求超时（秒）'
+    )
+    refresh_list_parser.set_defaults(func=cmd_refresh_list)
 
     return parser
 

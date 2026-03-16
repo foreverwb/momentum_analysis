@@ -935,6 +935,8 @@ class DataOrchestrator:
         mc_data: Optional[Dict[str, Any]] = None,
         iv_data: Optional[Dict[str, Any]] = None,
         duration: str = '1 Y',
+        price_df: Optional[pd.DataFrame] = None,
+        sector_df: Optional[pd.DataFrame] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         动能股池评分官方入口。
@@ -957,20 +959,22 @@ class DataOrchestrator:
         try:
             from .calculators.momentum_pool import calculate_momentum_pool_result
 
-            price_df = await asyncio.to_thread(
-                self._price_provider.get_ohlcv,
-                symbol=symbol,
-                duration=duration,
-                bar_size='1 day',
-            )
-            if price_df is None:
+            resolved_price_df = price_df
+            if resolved_price_df is None:
+                resolved_price_df = await asyncio.to_thread(
+                    self._price_provider.get_ohlcv,
+                    symbol=symbol,
+                    duration=duration,
+                    bar_size='1 day',
+                )
+            if resolved_price_df is None:
                 result = dict(empty_result)
                 result['error'] = 'symbol price data unavailable'
                 return result
 
-            sector_df = None
-            if sector_etf:
-                sector_df = await asyncio.to_thread(
+            resolved_sector_df = sector_df
+            if resolved_sector_df is None and sector_etf:
+                resolved_sector_df = await asyncio.to_thread(
                     self._price_provider.get_ohlcv,
                     symbol=sector_etf,
                     duration=duration,
@@ -979,8 +983,8 @@ class DataOrchestrator:
 
             pool_result = await asyncio.to_thread(
                 calculate_momentum_pool_result,
-                price_df=price_df,
-                sector_df=sector_df,
+                price_df=resolved_price_df,
+                sector_df=resolved_sector_df,
                 finviz_data=finviz_data,
                 mc_data=mc_data,
                 iv_data=iv_data,

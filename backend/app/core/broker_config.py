@@ -35,6 +35,7 @@ class FutuConfig:
 class RefreshConfig:
     etf_cooldown_minutes: int = 15
     holdings_cooldown_minutes: int = 60
+    serial_gap_seconds: int = 2
 
 
 @dataclass(frozen=True)
@@ -197,6 +198,10 @@ def load_broker_config(config_path: Optional[str] = None) -> BrokerConfig:
                 refresh_payload.get("holdings_cooldown_minutes"),
                 RefreshConfig.holdings_cooldown_minutes,
             ),
+            serial_gap_seconds=_to_int(
+                refresh_payload.get("serial_gap_seconds"),
+                RefreshConfig.serial_gap_seconds,
+            ),
         ),
         config_path=str(path),
         loaded_from_file=True,
@@ -210,6 +215,7 @@ def load_broker_config(config_path: Optional[str] = None) -> BrokerConfig:
         futu_port=config.futu.port,
         etf_cooldown_minutes=config.refresh.etf_cooldown_minutes,
         holdings_cooldown_minutes=config.refresh.holdings_cooldown_minutes,
+        serial_gap_seconds=config.refresh.serial_gap_seconds,
     )
     return config
 

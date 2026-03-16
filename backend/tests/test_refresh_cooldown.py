@@ -1,5 +1,6 @@
 from datetime import date, datetime, timedelta
 
+import pandas as pd
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -560,6 +561,55 @@ class _BatchOrchestrator(_DummyOrchestrator):
         return True
 
 
+def _price_frame(symbol: str, periods: int = 80) -> pd.DataFrame:
+    dates = pd.date_range(end=pd.Timestamp.today().normalize(), periods=periods, freq="B")
+    base = float(sum(ord(ch) for ch in symbol[:4])) / 10.0
+    closes = [base + idx * 0.5 for idx in range(periods)]
+    return pd.DataFrame(
+        {
+            "date": dates,
+            "open": closes,
+            "high": [value + 1.0 for value in closes],
+            "low": [value - 1.0 for value in closes],
+            "close": closes,
+            "volume": [1_000_000 + idx * 1000 for idx in range(periods)],
+        }
+    )
+
+
+class _IBKRReuseOrchestrator(_DummyOrchestrator):
+    def __init__(self):
+        self._futu = None
+        self.ohlcv_calls = []
+        self.pool_calls = []
+
+    def get_broker_status(self):
+        return {
+            "ibkr": {"is_connected": True},
+            "futu": {"is_connected": False, "last_error": "not connected"},
+        }
+
+    async def connect_ibkr(self):
+        return True
+
+    async def connect_futu(self):
+        return False
+
+    async def get_ohlcv_data(self, symbol, duration):
+        self.ohlcv_calls.append((str(symbol).upper(), duration))
+        return _price_frame(str(symbol).upper())
+
+    async def calculate_momentum_pool_score(self, **kwargs):
+        self.pool_calls.append(kwargs)
+        return {
+            "symbol": kwargs.get("symbol"),
+            "sector_etf": kwargs.get("sector_etf"),
+            "total_score": 72.0,
+            "scores": {"momentum": 60.0, "trend": 60.0},
+            "metrics": {},
+        }
+
+
 @pytest.mark.asyncio
 async def test_refresh_holdings_related_scope_uses_same_coverage(monkeypatch, db_session):
     now = datetime.utcnow()
@@ -738,7 +788,7 @@ async def test_refresh_holdings_batches_futu_iv_fetch(monkeypatch, db_session):
     assert len(futu.calls) == 1
     assert set(futu.calls[0]["symbols"]) == {"AAPL", "MSFT"}
     assert futu.calls[0]["kwargs"]["max_retries"] == 0
-    assert futu.calls[0]["kwargs"]["log_progress"] is False
+    assert futu.calls[0]["kwargs"]["log_progress"] is True
     assert futu.calls[0]["kwargs"]["log_fetch_summary"] is False
 
     rows = db_session.query(IVData).filter(IVData.symbol.in_(["AAPL", "MSFT"])).all()
@@ -746,3 +796,131 @@ async def test_refresh_holdings_batches_futu_iv_fetch(monkeypatch, db_session):
     assert set(row_map) == {"AAPL", "MSFT"}
     assert row_map["AAPL"].iv30 == 20.0
     assert row_map["MSFT"].iv30 == 19.0
+
+
+@pytest.mark.asyncio
+async def test_refresh_holdings_reuses_prefetched_ibkr_frames(monkeypatch, db_session):
+    today = date.today()
+    now = datetime.utcnow()
+
+    etf = ETF(symbol="XLF", name="Financials", type="sector")
+    db_session.add(etf)
+    db_session.flush()
+
+    db_session.add_all(
+        [
+            ETFHolding(
+                etf_id=etf.id,
+                etf_symbol="XLF",
+                ticker="JPM",
+                weight=8.0,
+                data_date=today,
+            ),
+            ETFHolding(
+                etf_id=etf.id,
+                etf_symbol="XLF",
+                ticker="BAC",
+                weight=6.0,
+                data_date=today,
+            ),
+        ]
+    )
+    for ticker in ("JPM", "BAC"):
+        db_session.add(
+            ImportedData(
+                symbol=ticker,
+                date=today,
+                source="finviz",
+                data={"symbol": ticker},
+                created_at=now,
+            )
+        )
+        db_session.add(
+            ImportedData(
+                symbol=ticker,
+                date=today,
+                source="marketchameleon",
+                data={"symbol": ticker},
+                created_at=now,
+            )
+        )
+    db_session.commit()
+
+    orchestrator = _IBKRReuseOrchestrator()
+    monkeypatch.setattr("app.services.orchestrator.get_orchestrator", lambda: orchestrator)
+
+    result = await refresh_holdings_by_coverage(
+        "XLF",
+        HoldingsCoverageRequest(coverage_type="top", coverage_value=2),
+        db=db_session,
+    )
+
+    assert result["status"] == "success"
+    assert result["futu_failed_count"] == 2
+    assert orchestrator.ohlcv_calls.count(("XLF", "1 Y")) == 1
+    assert orchestrator.ohlcv_calls.count(("JPM", "1 Y")) == 1
+    assert orchestrator.ohlcv_calls.count(("BAC", "1 Y")) == 1
+    assert len(orchestrator.ohlcv_calls) == 3
+    assert len(orchestrator.pool_calls) == 2
+    assert all(call.get("price_df") is not None for call in orchestrator.pool_calls)
+    assert all(call.get("sector_df") is not None for call in orchestrator.pool_calls)
+
+
+@pytest.mark.asyncio
+async def test_refresh_holdings_splits_futu_requests_into_small_batches(monkeypatch, db_session):
+    today = date.today()
+    now = datetime.utcnow()
+
+    etf = ETF(symbol="XLK", name="Technology", type="sector")
+    db_session.add(etf)
+    db_session.flush()
+
+    tickers = ["AAPL", "MSFT", "NVDA", "AVGO", "AMD"]
+    db_session.add_all(
+        [
+            ETFHolding(
+                etf_id=etf.id,
+                etf_symbol="XLK",
+                ticker=ticker,
+                weight=10.0 - idx,
+                data_date=today,
+            )
+            for idx, ticker in enumerate(tickers)
+        ]
+    )
+    for ticker in tickers:
+        db_session.add(
+            ImportedData(
+                symbol=ticker,
+                date=today,
+                source="finviz",
+                data={"symbol": ticker},
+                created_at=now,
+            )
+        )
+        db_session.add(
+            ImportedData(
+                symbol=ticker,
+                date=today,
+                source="marketchameleon",
+                data={"symbol": ticker},
+                created_at=now,
+            )
+        )
+    db_session.commit()
+
+    futu = _BatchFutuStub({ticker: IVTermResult(iv30=20.0, total_oi=1000) for ticker in tickers})
+    orchestrator = _BatchOrchestrator(futu=futu)
+    monkeypatch.setattr("app.services.orchestrator.get_orchestrator", lambda: orchestrator)
+
+    result = await refresh_holdings_by_coverage(
+        "XLK",
+        HoldingsCoverageRequest(coverage_type="top", coverage_value=5),
+        db=db_session,
+    )
+
+    assert result["status"] == "success"
+    assert result["stocks_count"] == 5
+    assert len(futu.calls) == 2
+    assert len(futu.calls[0]["symbols"]) == 4
+    assert len(futu.calls[1]["symbols"]) == 1

@@ -149,3 +149,273 @@ def test_normalize_cli_argv_inserts_default_etfs_subcommand_for_legacy_provider_
         "-f",
         "mc.json",
     ]
+
+
+def test_parse_cli_args_accepts_refresh_etfs() -> None:
+    args = cli.parse_cli_args(["refresh", "etfs", "-s", "XLK,XLF"])
+
+    assert args.command == "refresh"
+    assert args.resource == "etfs"
+    assert args.symbols == "XLK,XLF"
+    assert args.api_base == cli.DEFAULT_API_BASE_URL
+
+
+def test_parse_cli_args_accepts_refresh_holdings_defaults_coverage() -> None:
+    args = cli.parse_cli_args(["refresh", "holdings", "-s", "XLK,SOXX"])
+
+    assert args.command == "refresh"
+    assert args.resource == "holdings"
+    assert args.symbols == "XLK,SOXX"
+    assert args.coverage == "t-20"
+
+
+def test_cmd_refresh_holdings_posts_background_job(monkeypatch, capsys) -> None:
+    captured = {}
+
+    def fake_http_json_request(method: str, url: str, payload=None, timeout: int = 10):
+        captured["method"] = method
+        captured["url"] = url
+        captured["payload"] = payload
+        captured["timeout"] = timeout
+        return {
+            "job": {
+                "id": 12,
+                "status": "pending",
+                "queue_position": 1,
+                "message": "任务已进入队列",
+            }
+        }
+
+    monkeypatch.setattr(cli, "_http_json_request", fake_http_json_request)
+    monkeypatch.setattr(cli, "_poll_refresh_job_until_terminal", lambda *args, **kwargs: None)
+
+    args = cli.parse_cli_args(
+        [
+            "refresh",
+            "holdings",
+            "-s",
+            "XLK,SOXX",
+            "-w",
+            "all",
+            "--api-base",
+            "http://127.0.0.1:8000",
+        ]
+    )
+    args.func(args)
+
+    assert captured["method"] == "POST"
+    assert captured["url"] == "http://127.0.0.1:8000/api/refresh-jobs/holdings"
+    assert captured["payload"] == {
+        "items": [
+            {
+                "symbol": "XLK",
+                "coverage_type": "all",
+                "coverage_value": 0,
+                "related_etf_symbols": [],
+            },
+            {
+                "symbol": "SOXX",
+                "coverage_type": "all",
+                "coverage_value": 0,
+                "related_etf_symbols": [],
+            },
+        ],
+        "source": "cli",
+    }
+    assert captured["timeout"] == 10
+
+    stdout = capsys.readouterr().out
+    assert "Job ID: 12" in stdout
+    assert "查询状态" in stdout
+
+
+def test_cmd_refresh_holdings_prints_immediate_failure_details(monkeypatch, capsys) -> None:
+    captured = {}
+
+    def fake_http_json_request(method: str, url: str, payload=None, timeout: int = 10):
+        captured["method"] = method
+        captured["url"] = url
+        captured["payload"] = payload
+        captured["timeout"] = timeout
+        return {
+            "job": {
+                "id": 18,
+                "status": "pending",
+                "queue_position": 1,
+                "message": "任务已进入队列",
+            }
+        }
+
+    monkeypatch.setattr(cli, "_http_json_request", fake_http_json_request)
+    monkeypatch.setattr(
+        cli,
+        "_poll_refresh_job_until_terminal",
+        lambda *args, **kwargs: {
+            "id": 18,
+            "job_type": "holdings",
+            "status": "completed",
+            "progress_completed": 3,
+            "progress_total": 3,
+            "progress_failed": 3,
+            "message": "任务完成，3 项全部失败",
+            "result": {
+                "summary_status": "failed",
+                "items": [
+                    {
+                        "symbol": "SOXX",
+                        "coverage": "weight75",
+                        "status": "error",
+                        "message": "缺少 MarketChameleon 数据: ASML, TSM",
+                    }
+                ],
+            },
+        },
+    )
+
+    args = cli.parse_cli_args(
+        [
+            "refresh",
+            "holdings",
+            "-s",
+            "SOXX,SMH,IGV",
+            "-w",
+            "75",
+            "--api-base",
+            "http://127.0.0.1:8000",
+        ]
+    )
+    args.func(args)
+
+    assert captured["method"] == "POST"
+    assert captured["url"] == "http://127.0.0.1:8000/api/refresh-jobs/holdings"
+    stdout = capsys.readouterr().out
+    assert "后台任务快速返回错误:" in stdout
+    assert "消息: 任务完成，3 项全部失败" in stdout
+    assert "失败明细:" in stdout
+    assert "- SOXX (weight75): 缺少 MarketChameleon 数据: ASML, TSM" in stdout
+
+
+def test_poll_refresh_job_until_terminal_returns_running_job_when_failures_detected(monkeypatch) -> None:
+    calls = {"count": 0}
+
+    def fake_http_json_request(method: str, url: str, payload=None, timeout: int = 10):
+        calls["count"] += 1
+        return {
+            "id": 9,
+            "job_type": "holdings",
+            "status": "running",
+            "progress_completed": 1,
+            "progress_total": 3,
+            "progress_failed": 1,
+            "message": "已完成 1/3",
+            "result": {
+                "summary_status": "partial_success",
+                "items": [
+                    {
+                        "symbol": "SOXX",
+                        "coverage": "weight75",
+                        "status": "error",
+                        "message": "缺少 MarketChameleon 数据: ASML, TSM",
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(cli, "_http_json_request", fake_http_json_request)
+
+    job = cli._poll_refresh_job_until_terminal(
+        9,
+        api_base="http://127.0.0.1:8000",
+        timeout=10,
+        max_wait_seconds=0.01,
+        poll_interval_seconds=0.0,
+    )
+
+    assert calls["count"] >= 1
+    assert job is not None
+    assert job["status"] == "running"
+    assert job["progress_failed"] == 1
+
+
+def test_cmd_refresh_list_builds_query_params(monkeypatch, capsys) -> None:
+    captured = {}
+
+    def fake_http_json_request(method: str, url: str, payload=None, timeout: int = 10):
+        captured["method"] = method
+        captured["url"] = url
+        return {"items": []}
+
+    monkeypatch.setattr(cli, "_http_json_request", fake_http_json_request)
+
+    args = cli.parse_cli_args(
+        [
+            "refresh",
+            "list",
+            "--status",
+            "running",
+            "--limit",
+            "5",
+            "--api-base",
+            "http://127.0.0.1:8000",
+        ]
+    )
+    args.func(args)
+
+    assert captured["method"] == "GET"
+    assert captured["url"] == "http://127.0.0.1:8000/api/refresh-jobs?limit=5&status=running"
+    assert "暂无 refresh jobs" in capsys.readouterr().out
+
+
+def test_cmd_refresh_status_prints_failed_item_details(monkeypatch, capsys) -> None:
+    captured = {}
+
+    def fake_http_json_request(method: str, url: str, payload=None, timeout: int = 10):
+        captured["method"] = method
+        captured["url"] = url
+        return {
+            "id": 7,
+            "job_type": "holdings",
+            "status": "completed",
+            "progress_completed": 3,
+            "progress_total": 3,
+            "progress_failed": 3,
+            "message": "任务完成，3 项全部失败",
+            "result": {
+                "summary_status": "failed",
+                "items": [
+                    {
+                        "symbol": "SOXX",
+                        "coverage": "weight75",
+                        "status": "error",
+                        "message": "缺少 MarketChameleon 数据: ASML, TSM",
+                    },
+                    {
+                        "symbol": "SMH",
+                        "coverage": "weight75",
+                        "status": "error",
+                        "message": "缺少 MarketChameleon 数据: ASML",
+                    },
+                ],
+            },
+        }
+
+    monkeypatch.setattr(cli, "_http_json_request", fake_http_json_request)
+
+    args = cli.parse_cli_args(
+        [
+            "refresh",
+            "status",
+            "7",
+            "--api-base",
+            "http://127.0.0.1:8000",
+        ]
+    )
+    args.func(args)
+
+    assert captured["method"] == "GET"
+    assert captured["url"] == "http://127.0.0.1:8000/api/refresh-jobs/7"
+    stdout = capsys.readouterr().out
+    assert "Job ID: 7" in stdout
+    assert "失败明细:" in stdout
+    assert "- SOXX (weight75): 缺少 MarketChameleon 数据: ASML, TSM" in stdout
+    assert "- SMH (weight75): 缺少 MarketChameleon 数据: ASML" in stdout
