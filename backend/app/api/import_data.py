@@ -25,6 +25,7 @@ from app.models import (
     get_db, ETF, ETFHolding, HoldingsUploadLog, ImportedData,
     is_valid_ticker, is_valid_sector_symbol, VALID_SECTOR_SYMBOLS
 )
+from app.core.time_utils import beijing_today, utc_isoformat
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,7 @@ def _upsert_imported_data(db: Session, source: str, items: List[Dict[str, Any]])
     """将导入数据写入 imported_data 表，按 symbol+date+source 去重。"""
     if not items:
         return 0
-    today = date.today()
+    today = beijing_today()
     count = 0
     for item in items:
         symbol = item.get("symbol") if isinstance(item, dict) else None
@@ -688,7 +689,7 @@ async def get_holdings_upload_logs(
             "skippedCount": log.skipped_count,
             "status": log.status,
             "errorMessage": log.error_message,
-            "createdAt": log.created_at.isoformat() if log.created_at else None
+            "createdAt": utc_isoformat(log.created_at)
         }
         for log in logs
     ]

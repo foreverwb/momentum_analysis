@@ -7,6 +7,7 @@
 import React, { useEffect, useState } from 'react';
 import type { StockDetail, OptionsScoreData } from '../../types';
 import { getOptionsOverlayData, type OptionsOverlayData, type OptionsPositioningData } from '../../services/api';
+import { formatDateTimeInBeijing } from '../../utils/beijingTime';
 
 interface OptionsOverlayTabProps {
   stock: StockDetail;
@@ -630,7 +631,7 @@ export function OptionsOverlayTab({ stock }: OptionsOverlayTabProps) {
 
         {optionsOverlay?.updatedAt && (
           <p className="mt-4 text-xs text-[var(--text-muted)]">
-            数据更新时间: {new Date(optionsOverlay.updatedAt).toLocaleString('zh-CN')}
+            数据更新时间: {formatDateTimeInBeijing(optionsOverlay.updatedAt)}
           </p>
         )}
       </div>

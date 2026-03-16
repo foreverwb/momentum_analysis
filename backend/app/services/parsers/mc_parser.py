@@ -17,6 +17,8 @@ from datetime import datetime, date
 import statistics
 import logging
 
+from app.core.time_utils import beijing_today
+
 logger = logging.getLogger(__name__)
 
 
@@ -281,7 +283,7 @@ def _is_earnings_near(data: Dict[str, Any], horizon_days: int = 7) -> bool:
     earnings_date = _parse_earnings_date(data.get('earnings_date'))
     if earnings_date is None:
         return False
-    delta_days = (earnings_date - datetime.utcnow().date()).days
+    delta_days = (earnings_date - beijing_today()).days
     return 0 <= delta_days <= horizon_days
 
 

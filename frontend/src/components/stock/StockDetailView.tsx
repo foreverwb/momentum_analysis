@@ -62,7 +62,7 @@ export function StockDetailView({ symbol, onBack }: StockDetailViewProps) {
   const [activeTab, setActiveTab] = useState<'overview' | 'breakdown' | 'options'>('overview');
   const [trendPeriod, setTrendPeriod] = useState<'5d' | '20d' | '63d'>('20d');
   const [trendMetric, setTrendMetric] = useState<'relative' | 'sma20' | 'return20d' | 'score'>('relative');
-  const [trendLabelTimezone, setTrendLabelTimezone] = useState<'market' | 'beijing'>('beijing');
+  const trendLabelTimezone = 'beijing' as const;
   const [trendDates, setTrendDates] = useState<string[]>([]);
   const [trendSeries, setTrendSeries] = useState<RelativeTrendSeries[]>([]);
   const [trendPriceSeries, setTrendPriceSeries] = useState<RelativeTrendSeries[]>([]);
@@ -312,29 +312,8 @@ export function StockDetailView({ symbol, onBack }: StockDetailViewProps) {
           </div>
         )}
         <div className="flex justify-end mb-2">
-          <div className="inline-flex rounded border border-[var(--border-light)] overflow-hidden">
-            <button
-              type="button"
-              onClick={() => setTrendLabelTimezone('market')}
-              className={`px-2 py-1 text-xs transition-colors ${
-                trendLabelTimezone === 'market'
-                  ? 'bg-[var(--accent-blue)] text-white'
-                  : 'bg-[var(--bg-primary)] text-[var(--text-muted)] hover:text-[var(--text-primary)]'
-              }`}
-            >
-              美东交易日
-            </button>
-            <button
-              type="button"
-              onClick={() => setTrendLabelTimezone('beijing')}
-              className={`px-2 py-1 text-xs border-l border-[var(--border-light)] transition-colors ${
-                trendLabelTimezone === 'beijing'
-                  ? 'bg-[var(--accent-blue)] text-white'
-                  : 'bg-[var(--bg-primary)] text-[var(--text-muted)] hover:text-[var(--text-primary)]'
-              }`}
-            >
-              北京时间
-            </button>
+          <div className="px-2 py-1 text-xs rounded border border-[var(--border-light)] bg-[var(--bg-primary)] text-[var(--text-muted)]">
+            北京时间
           </div>
         </div>
         <RelativeTrendChart

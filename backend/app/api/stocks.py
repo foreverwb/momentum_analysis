@@ -13,6 +13,7 @@ from typing import List, Optional, Dict, Any
 
 from app.models import get_db, Stock, ImportedData, ETFHolding, ETF, PriceHistory, IVData, ScoreSnapshot
 from app.api.series_utils import build_metric_series, build_sma20_comparison_series
+from app.core.time_utils import utc_isoformat
 from app.services.parsers import normalize_heat_type
 router = APIRouter()
 
@@ -948,8 +949,8 @@ async def get_stock_detail(
             "riskScore": stock.risk_score or 0.0,
             "thresholdsPass": stock.thresholds_pass if stock.thresholds_pass is not None else True,
         },
-        "updatedAt": stock.updated_at.isoformat() if stock.updated_at else None,
-        "createdAt": stock.created_at.isoformat() if stock.created_at else None,
+        "updatedAt": utc_isoformat(stock.updated_at),
+        "createdAt": utc_isoformat(stock.created_at),
     }
     
     return response
@@ -960,7 +961,7 @@ async def get_stock_trend_comparison(
     symbol: str,
     period: int = Query(20, description="对比周期（交易日）: 5/20/63"),
     metric: str = Query("relative", description="指标: relative/sma20/return20d/score"),
-    label_tz: str = Query("market", description="日期标签时区: market/beijing"),
+    label_tz: str = Query("beijing", description="日期标签时区，默认北京时间"),
     db: Session = Depends(get_db)
 ):
     """
@@ -970,7 +971,7 @@ async def get_stock_trend_comparison(
         raise HTTPException(status_code=400, detail="period must be one of 5, 20, 63")
     if metric not in ("relative", "sma20", "return20d", "score"):
         raise HTTPException(status_code=400, detail="metric must be one of relative, sma20, return20d, score")
-    normalized_label_tz = (label_tz or "market").strip().lower()
+    normalized_label_tz = (label_tz or "beijing").strip().lower()
     if normalized_label_tz not in ("market", "beijing"):
         raise HTTPException(status_code=400, detail="label_tz must be one of market, beijing")
 

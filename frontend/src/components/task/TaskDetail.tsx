@@ -7,6 +7,13 @@ import { LoadingState, ErrorMessage } from '../common';
 import type { Task, ETF, Holding, RefreshResult } from '../../types';
 import { taskQueryKeys } from '../../hooks/useData';
 import * as api from '../../services/api';
+import {
+  formatBeijingBoundaryLabel,
+  formatDateInBeijing,
+  formatDateTimeInBeijing,
+  getBeijingCutoffBoundaryMs,
+  parseUtcTimestampMs,
+} from '../../utils/beijingTime';
 
 interface TaskDetailProps {
   task: Task;
@@ -138,8 +145,6 @@ const SOURCE_STATUS_LABEL: Record<SourceStatus, string> = {
 };
 
 const SOURCE_STATUS_STORAGE_PREFIX = 'task-detail-source-status-v1';
-const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000;
-const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
 const SOURCE_CIRCLE_META: Record<SourceKey, { label: string; borderColor: string }> = {
   finviz: { label: 'Finviz', borderColor: '#93c5fd' },
@@ -184,9 +189,9 @@ const loadStoredSourceUpdatedAt = (taskId: number): Partial<Record<SourceKey, st
     (Object.keys(SOURCE_CIRCLE_META) as SourceKey[]).forEach((key) => {
       const value = (parsed as Record<string, unknown>)[key];
       if (typeof value !== 'string') return;
-      const ts = new Date(value);
-      if (Number.isNaN(ts.getTime())) return;
-      result[key] = ts.toISOString();
+      const ts = parseUtcTimestampMs(value);
+      if (!Number.isFinite(ts)) return;
+      result[key] = new Date(ts).toISOString();
     });
     return result;
   } catch {
@@ -201,27 +206,14 @@ const saveStoredSourceUpdatedAt = (taskId: number, payload: Partial<Record<Sourc
     (Object.keys(SOURCE_CIRCLE_META) as SourceKey[]).forEach((key) => {
       const value = payload[key];
       if (!value) return;
-      const ts = new Date(value);
-      if (Number.isNaN(ts.getTime())) return;
-      sanitized[key] = ts.toISOString();
+      const ts = parseUtcTimestampMs(value);
+      if (!Number.isFinite(ts)) return;
+      sanitized[key] = new Date(ts).toISOString();
     });
     localStorage.setItem(getSourceStatusStorageKey(taskId), JSON.stringify(sanitized));
   } catch {
     // ignore storage errors
   }
-};
-
-const getBeijingResetBoundaryMs = (nowMs: number): number => {
-  const beijingNow = new Date(nowMs + BEIJING_OFFSET_MS);
-  const year = beijingNow.getUTCFullYear();
-  const month = beijingNow.getUTCMonth();
-  const day = beijingNow.getUTCDate();
-  const hour = beijingNow.getUTCHours();
-  let boundaryUtcMs = Date.UTC(year, month, day, 0, 0, 0, 0); // 08:00 BJT
-  if (hour < 8) {
-    boundaryUtcMs -= ONE_DAY_MS;
-  }
-  return boundaryUtcMs;
 };
 
 const mapDataSourcesToKeys = (dataSources?: Record<string, boolean>): SourceKey[] => {
@@ -232,39 +224,15 @@ const mapDataSourcesToKeys = (dataSources?: Record<string, boolean>): SourceKey[
 };
 
 const formatUpdateDate = (value?: string | null): string => {
-  if (!value) return '--';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  const year = date.getFullYear();
-  const month = `${date.getMonth() + 1}`.padStart(2, '0');
-  const day = `${date.getDate()}`.padStart(2, '0');
-  return `${year}-${month}-${day}`;
+  return formatDateInBeijing(value);
 };
 
 const formatUpdateDateTime = (value?: string | null): string => {
-  if (!value) return '--';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return '--';
-  const beijing = new Date(date.getTime() + BEIJING_OFFSET_MS);
-  const month = `${beijing.getUTCMonth() + 1}`.padStart(2, '0');
-  const day = `${beijing.getUTCDate()}`.padStart(2, '0');
-  const hours = `${beijing.getUTCHours()}`.padStart(2, '0');
-  const minutes = `${beijing.getUTCMinutes()}`.padStart(2, '0');
-  return `${month}-${day} ${hours}:${minutes}`;
+  return formatDateTimeInBeijing(value);
 };
 
 const parseTimestampMs = (value?: string | null): number => {
-  if (!value) return Number.NaN;
-  const ts = new Date(value).getTime();
-  return Number.isFinite(ts) ? ts : Number.NaN;
-};
-
-const formatBeijingBoundaryLabel = (boundaryUtcMs: number): string => {
-  const beijing = new Date(boundaryUtcMs + BEIJING_OFFSET_MS);
-  const year = beijing.getUTCFullYear();
-  const month = `${beijing.getUTCMonth() + 1}`.padStart(2, '0');
-  const day = `${beijing.getUTCDate()}`.padStart(2, '0');
-  return `${year}-${month}-${day} 08:00`;
+  return parseUtcTimestampMs(value);
 };
 
 const normalizeEtfs = (raw: unknown): string[] => {
@@ -562,12 +530,11 @@ const pickLatestIsoTimestamp = (values: Array<string | null | undefined>): strin
   let latestValue: string | undefined;
   values.forEach((value) => {
     if (typeof value !== 'string' || value.trim() === '') return;
-    const parsed = new Date(value);
-    const ts = parsed.getTime();
+    const ts = parseUtcTimestampMs(value);
     if (!Number.isFinite(ts)) return;
     if (ts > latestTs) {
       latestTs = ts;
-      latestValue = parsed.toISOString();
+      latestValue = new Date(ts).toISOString();
     }
   });
   return latestValue;
@@ -663,7 +630,7 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
   const queryClient = useQueryClient();
   const [trendPeriod, setTrendPeriod] = useState<'5d' | '20d' | '63d'>('20d');
   const [trendMetric, setTrendMetric] = useState<'relative' | 'sma20' | 'return20d' | 'score'>('relative');
-  const [trendLabelTimezone, setTrendLabelTimezone] = useState<'market' | 'beijing'>('market');
+  const trendLabelTimezone = 'beijing' as const;
   const [isAddETFModalOpen, setIsAddETFModalOpen] = useState(false);
   const [holdingsModalOpen, setHoldingsModalOpen] = useState(false);
   const [etfModalOpen, setETFModalOpen] = useState(false);
@@ -1265,7 +1232,7 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
     return task.updatedAt || task.createdAt;
   }, [lastRefreshAllAt, etfDetails, task.updatedAt, task.createdAt]);
   const latestUpdatedAtLabel = useMemo(() => formatUpdateDate(latestUpdatedAt), [latestUpdatedAt]);
-  const resetBoundaryMs = useMemo(() => getBeijingResetBoundaryMs(clockNowMs), [clockNowMs]);
+  const resetBoundaryMs = useMemo(() => getBeijingCutoffBoundaryMs(clockNowMs), [clockNowMs]);
   const effectiveSourceUpdatedAtMap = useMemo(
     () => ({
       ...sourceUpdatedAtMap,
@@ -1294,7 +1261,7 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
   const sourceIndicators = useMemo(() => {
     return (Object.keys(SOURCE_CIRCLE_META) as SourceKey[]).map((sourceKey) => {
       const updatedAt = effectiveSourceUpdatedAtMap[sourceKey] || null;
-      const updatedAtMs = updatedAt ? new Date(updatedAt).getTime() : Number.NaN;
+      const updatedAtMs = parseTimestampMs(updatedAt);
       const isUpdatedInCurrentWindow = Number.isFinite(updatedAtMs) && updatedAtMs >= resetBoundaryMs;
       const status: SourceStatus = isUpdatedInCurrentWindow ? 'complete' : 'missing';
       const borderColor =
@@ -1318,7 +1285,7 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
     const missing = requiredSources.filter((sourceKey) => {
       const updatedAt = effectiveSourceUpdatedAtMap[sourceKey];
       if (!updatedAt) return true;
-      const ts = new Date(updatedAt).getTime();
+      const ts = parseTimestampMs(updatedAt);
       return !Number.isFinite(ts) || ts < resetBoundaryMs;
     });
     if (!missing.length) return null;
@@ -1348,8 +1315,8 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
     if (!sources.length) return;
     const normalizedAt = (() => {
       if (!updatedAt) return new Date().toISOString();
-      const parsed = new Date(updatedAt);
-      return Number.isNaN(parsed.getTime()) ? new Date().toISOString() : parsed.toISOString();
+      const parsedMs = parseTimestampMs(updatedAt);
+      return Number.isFinite(parsedMs) ? new Date(parsedMs).toISOString() : new Date().toISOString();
     })();
     setSourceUpdatedAtMap((prev) => {
       const next = { ...prev };
@@ -1903,29 +1870,8 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
           </div>
         )}
         <div className="flex justify-end mb-2">
-          <div className="inline-flex rounded border border-[var(--border-light)] overflow-hidden">
-            <button
-              type="button"
-              onClick={() => setTrendLabelTimezone('market')}
-              className={`px-2 py-1 text-xs transition-colors ${
-                trendLabelTimezone === 'market'
-                  ? 'bg-[var(--accent-blue)] text-white'
-                  : 'bg-[var(--bg-primary)] text-[var(--text-muted)] hover:text-[var(--text-primary)]'
-              }`}
-            >
-              美东交易日
-            </button>
-            <button
-              type="button"
-              onClick={() => setTrendLabelTimezone('beijing')}
-              className={`px-2 py-1 text-xs border-l border-[var(--border-light)] transition-colors ${
-                trendLabelTimezone === 'beijing'
-                  ? 'bg-[var(--accent-blue)] text-white'
-                  : 'bg-[var(--bg-primary)] text-[var(--text-muted)] hover:text-[var(--text-primary)]'
-              }`}
-            >
-              北京时间
-            </button>
+          <div className="px-2 py-1 text-xs rounded border border-[var(--border-light)] bg-[var(--bg-primary)] text-[var(--text-muted)]">
+            北京时间
           </div>
         </div>
         <RelativeTrendChart

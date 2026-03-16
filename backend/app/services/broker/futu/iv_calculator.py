@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import structlog
 
 from ....core.paths import resolve_backend_storage_paths
+from ....core.time_utils import beijing_today
 from .connection import FutuConnection
 from .options_data import FutuOptionsDataFetcher, OptionContract
 from .utils import OPTION_TYPE
@@ -121,7 +122,7 @@ class FutuIVCalculator:
 
         results: Dict[str, IVTermResult] = {}
         total = progress_total if progress_total is not None else len(symbols_list)
-        today = datetime.now().date()
+        today = beijing_today()
         cache = self._load_oi_cache()
         cache_changed = False
 
@@ -198,7 +199,7 @@ class FutuIVCalculator:
         symbol_to_oi: Dict[str, Optional[int]],
     ) -> Dict[str, Tuple[Optional[int], Optional[int]]]:
         cache = self._load_oi_cache()
-        today = datetime.now().date()
+        today = beijing_today()
 
         results: Dict[str, Tuple[Optional[int], Optional[int]]] = {}
         for symbol, current_oi in symbol_to_oi.items():
@@ -287,7 +288,7 @@ class FutuIVCalculator:
             )
             return IVTermResult()
 
-        today = datetime.now().date()
+        today = beijing_today()
         near_term_expirations = self._count_near_term_expirations(expirations, today, max_day=90)
         if near_term_expirations == 0:
             logger.warning(
@@ -1061,7 +1062,7 @@ class FutuIVCalculator:
                                 rows,
                             )
                         cutoff_str = (
-                            datetime.utcnow().date() - timedelta(days=self.CACHE_RETENTION_DAYS)
+                            beijing_today() - timedelta(days=self.CACHE_RETENTION_DAYS)
                         ).strftime("%Y-%m-%d")
                         conn.execute(
                             f"DELETE FROM {self.CACHE_TABLE} WHERE snapshot_date < ?",

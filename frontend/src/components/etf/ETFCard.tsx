@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import type { ETF, Holding } from '../../types';
+import { formatDateTimeInBeijing } from '../../utils/beijingTime';
 
 interface ETFCardProps {
   etf: ETF;
@@ -30,41 +31,8 @@ function getOptionsHeatColor(heat?: string): string {
   return 'text-slate-500';
 }
 
-function normalizeIsoTimestamp(value?: string | null): string | null {
-  if (!value) return null;
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-  // Backend may return naive UTC timestamps; normalize to explicit UTC for stable parsing.
-  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(trimmed)) {
-    return `${trimmed}Z`;
-  }
-  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(trimmed)) {
-    return `${trimmed.replace(' ', 'T')}Z`;
-  }
-  return trimmed;
-}
-
-const BEIJING_DATETIME_FORMATTER = new Intl.DateTimeFormat('zh-CN', {
-  timeZone: 'Asia/Shanghai',
-  month: '2-digit',
-  day: '2-digit',
-  hour: '2-digit',
-  minute: '2-digit',
-  hour12: false,
-});
-
 function formatUpdatedAt(value?: string | null): string {
-  if (!value) return '--';
-  const normalized = normalizeIsoTimestamp(value);
-  if (!normalized) return '--';
-  const date = new Date(normalized);
-  if (Number.isNaN(date.getTime())) return '--';
-  const parts = BEIJING_DATETIME_FORMATTER.formatToParts(date);
-  const month = parts.find((part) => part.type === 'month')?.value ?? '--';
-  const day = parts.find((part) => part.type === 'day')?.value ?? '--';
-  const hour = parts.find((part) => part.type === 'hour')?.value ?? '--';
-  const minute = parts.find((part) => part.type === 'minute')?.value ?? '--';
-  return `${month}-${day} ${hour}:${minute}`;
+  return formatDateTimeInBeijing(value);
 }
 
 // 持仓表格组件

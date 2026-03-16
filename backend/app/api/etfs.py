@@ -24,7 +24,16 @@ from app.models import (
     get_db, ETF, ETFHolding, VALID_SECTOR_SYMBOLS, Stock, ImportedData,
     PriceHistory, IVData, ScoreSnapshot
 )
+from app.api.series_utils import resolve_latest_trade_date
 from app.core.broker_config import load_broker_config
+from app.core.time_utils import (
+    beijing_today,
+    format_beijing_datetime,
+    get_beijing_cutoff_boundary,
+    utc_isoformat,
+    utc_now_iso as core_utc_now_iso,
+    utc_now_naive,
+)
 from app.services.parsers import normalize_heat_type
 
 router = APIRouter()
@@ -62,7 +71,7 @@ _SHARE_CLASS_ALIAS_PATTERN = re.compile(r"^([A-Z][A-Z0-9]{0,5})[.-]([A-Z])$")
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return core_utc_now_iso()
 
 
 def _normalize_progress_token(value: Optional[str]) -> Optional[str]:
@@ -200,16 +209,7 @@ def _iso_utc(value: Optional[datetime]) -> Optional[str]:
 
 
 def _beijing_import_boundary(now_utc: Optional[datetime] = None) -> Dict[str, Any]:
-    now_dt = _coerce_datetime(now_utc) or datetime.utcnow()
-    now_beijing = now_dt + timedelta(hours=8)
-    boundary_beijing = now_beijing.replace(hour=8, minute=0, second=0, microsecond=0)
-    if now_beijing < boundary_beijing:
-        boundary_beijing -= timedelta(days=1)
-    return {
-        "boundary_utc": boundary_beijing - timedelta(hours=8),
-        "boundary_date": boundary_beijing.date(),
-        "boundary_beijing": boundary_beijing,
-    }
+    return get_beijing_cutoff_boundary(_coerce_datetime(now_utc))
 
 
 def _is_fresh_for_boundary(
@@ -346,10 +346,7 @@ def _build_etf_source_updated_at(
 
 
 def _format_beijing_time(value: Optional[datetime]) -> Optional[str]:
-    dt = _coerce_datetime(value)
-    if dt is None:
-        return None
-    return (dt + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
+    return format_beijing_datetime(_coerce_datetime(value))
 
 
 def _build_refresh_gate_state(
@@ -358,7 +355,7 @@ def _build_refresh_gate_state(
     cooldown: Optional[timedelta] = None,
 ) -> Dict[str, Any]:
     cooldown_window = cooldown or ETF_REFRESH_COOLDOWN
-    now_dt = _coerce_datetime(now_utc) or datetime.utcnow()
+    now_dt = _coerce_datetime(now_utc) or utc_now_naive()
     latest_dt = _coerce_datetime(latest_at)
     if latest_dt is None:
         return {
@@ -648,13 +645,16 @@ def _recalculate_etf_score_from_db(
 
     etf.score = total_score
     etf.completeness = completeness
-    etf.updated_at = datetime.utcnow()
+    etf.updated_at = utc_now_naive()
 
-    today = date.today()
+    snapshot_date = resolve_latest_trade_date(
+        db.query(func.max(PriceHistory.date)).filter(PriceHistory.symbol == etf.symbol).scalar(),
+        fallback=beijing_today(),
+    ) or beijing_today()
     existing_snapshot = db.query(ScoreSnapshot).filter(
         ScoreSnapshot.symbol == etf.symbol,
         ScoreSnapshot.symbol_type == 'etf',
-        ScoreSnapshot.date == today,
+        ScoreSnapshot.date == snapshot_date,
     ).first()
 
     if existing_snapshot:
@@ -665,7 +665,7 @@ def _recalculate_etf_score_from_db(
         db.add(ScoreSnapshot(
             symbol=etf.symbol,
             symbol_type='etf',
-            date=today,
+            date=snapshot_date,
             total_score=total_score,
             score_breakdown=score_result,
             thresholds_pass=thresholds_pass,
@@ -768,8 +768,8 @@ def format_etf_response(etf: ETF, include_holdings: bool = False, db: Session = 
         "coverageRanges": ordered_coverage_ranges,
         "sourceUpdatedAt": _build_etf_source_updated_at(etf.symbol, db),
         # 兼容旧字段(lastUpdated)并提供统一字段(updatedAt)
-        "updatedAt": etf.updated_at.isoformat() if etf.updated_at else None,
-        "lastUpdated": etf.updated_at.isoformat() if etf.updated_at else None,
+        "updatedAt": utc_isoformat(etf.updated_at),
+        "lastUpdated": utc_isoformat(etf.updated_at),
     }
 
     if etf.type == "industry" and etf.parent_sector:
@@ -829,13 +829,9 @@ def format_etf_response(etf: ETF, include_holdings: bool = False, db: Session = 
                             stock_price_map[resolved_ticker] = stock_price_value
 
                         # 北京时间 08:00 为日切边界
-                        now_utc = datetime.utcnow()
-                        now_beijing = now_utc + timedelta(hours=8)
-                        boundary_beijing = now_beijing.replace(hour=8, minute=0, second=0, microsecond=0)
-                        if now_beijing < boundary_beijing:
-                            boundary_beijing -= timedelta(days=1)
-                        boundary_utc = boundary_beijing - timedelta(hours=8)
-                        boundary_date = boundary_beijing.date()
+                        boundary = get_beijing_cutoff_boundary()
+                        boundary_utc = boundary["boundary_utc"]
+                        boundary_date = boundary["boundary_date"]
 
                         source_map = {
                             ticker: {
@@ -1352,7 +1348,7 @@ async def refresh_etf_data(
     if latest_snapshot and isinstance(latest_snapshot.score_breakdown, dict):
         score_result = _load_etf_score_result(latest_snapshot.score_breakdown)
 
-    now_utc = datetime.utcnow()
+    now_utc = utc_now_naive()
     latest_ibkr_created_at = _coerce_datetime(
         db.query(func.max(PriceHistory.created_at)).filter(
             PriceHistory.symbol == etf.symbol,
@@ -1490,8 +1486,6 @@ async def refresh_etf_data(
                 last_close = price_df['close'].iloc[-1]
                 
                 # 保存价格数据到数据库
-                from datetime import date as date_type
-                today = date_type.today()
                 for _, row in price_df.iterrows():
                     try:
                         row_date = row['date'].date() if hasattr(row['date'], 'date') else row['date']
@@ -1688,7 +1682,7 @@ async def refresh_etf_data(
                     
                     # 保存 IV 数据
                     from datetime import date as date_type
-                    today = date_type.today()
+                    today = beijing_today()
                     existing_iv = db.query(IVData).filter(
                         IVData.symbol == etf.symbol,
                         IVData.date == today
@@ -1825,7 +1819,7 @@ async def refresh_holdings_data(
     ).scalar()
     
     etf.holdings_count = holdings_count
-    etf.updated_at = datetime.now()
+    etf.updated_at = utc_now_naive()
 
     db.commit()
     
@@ -1879,7 +1873,7 @@ async def calculate_etf_score(
             'delta3d': result.get('delta3d'),
             'delta5d': result.get('delta5d')
         }
-        etf.updated_at = datetime.now()
+        etf.updated_at = utc_now_naive()
         
         # 重新计算排名
         etfs_of_same_type = db.query(ETF).filter(
@@ -2196,16 +2190,7 @@ async def refresh_holdings_by_coverage(
 
     # 刷新前置校验：当前覆盖范围下，Finviz + MarketChameleon 必须是北京时间 08:00 起算后的最新导入数据
     def _beijing_import_boundary() -> Dict[str, Any]:
-        now_utc = datetime.utcnow()
-        now_beijing = now_utc + timedelta(hours=8)
-        boundary_beijing = now_beijing.replace(hour=8, minute=0, second=0, microsecond=0)
-        if now_beijing < boundary_beijing:
-            boundary_beijing -= timedelta(days=1)
-        return {
-            "boundary_utc": boundary_beijing - timedelta(hours=8),
-            "boundary_beijing": boundary_beijing,
-            "boundary_date": boundary_beijing.date(),
-        }
+        return get_beijing_cutoff_boundary()
 
     def _summarize_missing(symbols: List[str], max_items: int = 6) -> str:
         if not symbols:
@@ -2350,7 +2335,7 @@ async def refresh_holdings_by_coverage(
             len(duplicate_scope_symbols),
         )
 
-    now_utc = datetime.utcnow()
+    now_utc = utc_now_naive()
     ibkr_latest_rows = []
     futu_latest_rows = []
     if coverage_symbols:
@@ -3330,7 +3315,7 @@ async def refresh_holdings_by_coverage(
         data_sources_list = result.get('data_sources') or []
 
         if 'futu' in data_sources_list:
-            today = date.today()
+            today = beijing_today()
             ticker_upper = str(result['ticker']).upper()
             total_oi_int = _as_int(result.get('total_oi'))
             bucket_totals = _extract_bucket_totals(result)
@@ -3623,11 +3608,11 @@ async def refresh_holdings_by_coverage(
                 db.add(stock)
                 db.flush()
 
-                today = date.today()
+                snapshot_date = resolve_latest_trade_date(price_df, fallback=beijing_today()) or beijing_today()
                 existing_snapshot = db.query(ScoreSnapshot).filter(
                     ScoreSnapshot.symbol == stock.symbol,
                     ScoreSnapshot.symbol_type == 'stock',
-                    ScoreSnapshot.date == today
+                    ScoreSnapshot.date == snapshot_date
                 ).first()
                 snapshot_payload = {
                     'scores': pool_scores,
@@ -3656,7 +3641,7 @@ async def refresh_holdings_by_coverage(
                     db.add(ScoreSnapshot(
                         symbol=stock.symbol,
                         symbol_type='stock',
-                        date=today,
+                        date=snapshot_date,
                         total_score=score_value,
                         score_breakdown=snapshot_payload,
                         thresholds_pass=thresholds_pass

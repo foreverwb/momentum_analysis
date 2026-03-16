@@ -8,6 +8,7 @@ import structlog
 from sqlalchemy.orm import Session
 
 from app.core.broker_config import load_broker_config
+from app.core.time_utils import utc_now_naive
 from app.models import RefreshJob, SessionLocal
 
 logger = structlog.get_logger(__name__)
@@ -16,7 +17,7 @@ SessionFactory = Callable[[], Session]
 
 
 def _utc_now() -> datetime:
-    return datetime.utcnow()
+    return utc_now_naive()
 
 
 def _normalize_symbol(value: Any) -> Optional[str]:

@@ -15,6 +15,7 @@ import type {
   Task, 
   CreateTaskInput
 } from '../types';
+import { getBeijingCutoffBoundaryMs, getBeijingSyncWindowKey, parseUtcTimestampMs } from '../utils/beijingTime';
 
 // ----------------------------------------------------------------------------
 // Configuration
@@ -987,30 +988,6 @@ const marketPriceDailySyncedAt = new Map<string, number>();
 let marketPriceDailyCacheLoaded = false;
 const MARKET_PRICE_SYNC_MAX_AGE_MS = 5 * 60 * 1000;
 const MARKET_PRICE_DAILY_SYNC_STORAGE_KEY = 'market-price-daily-sync-v1';
-const MARKET_PRICE_BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000;
-const MARKET_PRICE_ONE_DAY_MS = 24 * 60 * 60 * 1000;
-
-const getBeijingSyncBoundaryMs = (nowMs: number): number => {
-  const beijingNow = new Date(nowMs + MARKET_PRICE_BEIJING_OFFSET_MS);
-  const year = beijingNow.getUTCFullYear();
-  const month = beijingNow.getUTCMonth();
-  const day = beijingNow.getUTCDate();
-  const hour = beijingNow.getUTCHours();
-  let boundaryUtcMs = Date.UTC(year, month, day, 0, 0, 0, 0); // 08:00 BJT
-  if (hour < 8) {
-    boundaryUtcMs -= MARKET_PRICE_ONE_DAY_MS;
-  }
-  return boundaryUtcMs;
-};
-
-const getBeijingSyncWindowKey = (nowMs: number): string => {
-  const boundaryMs = getBeijingSyncBoundaryMs(nowMs);
-  const beijingBoundary = new Date(boundaryMs + MARKET_PRICE_BEIJING_OFFSET_MS);
-  const year = beijingBoundary.getUTCFullYear();
-  const month = `${beijingBoundary.getUTCMonth() + 1}`.padStart(2, '0');
-  const day = `${beijingBoundary.getUTCDate()}`.padStart(2, '0');
-  return `${year}-${month}-${day}`;
-};
 
 const loadMarketPriceDailySyncCache = (): void => {
   if (marketPriceDailyCacheLoaded || typeof window === 'undefined') {
@@ -1025,7 +1002,7 @@ const loadMarketPriceDailySyncCache = (): void => {
     Object.entries(parsed as Record<string, unknown>).forEach(([symbol, value]) => {
       if (typeof symbol !== 'string' || !symbol.trim()) return;
       if (typeof value !== 'string') return;
-      const ts = new Date(value).getTime();
+      const ts = parseUtcTimestampMs(value);
       if (!Number.isFinite(ts)) return;
       marketPriceDailySyncedAt.set(symbol.trim().toUpperCase(), ts);
     });
@@ -1094,7 +1071,7 @@ export async function syncPriceDataForSymbols(
   }
 
   const nowMs = Date.now();
-  const boundaryMs = getBeijingSyncBoundaryMs(nowMs);
+  const boundaryMs = getBeijingCutoffBoundaryMs(nowMs);
   if (!options?.force) {
     const alreadyFresh = cleanedSymbols.filter((symbol) =>
       isMarketPriceFreshInCurrentBeijingWindow(symbol, boundaryMs)
@@ -1255,10 +1232,15 @@ export async function ensureDailyPriceSync(symbols: string[]): Promise<boolean> 
         `[DailySync] ${freshness.stale.length} stale symbols, syncing:`,
         freshness.stale
       );
-      await syncPriceDataForSymbols(freshness.stale, { force: true });
-      // 同步完成，标记为 confirmed
+      const syncResult = await syncPriceDataForSymbols(freshness.stale, { force: true });
+      const failedSet = new Set(syncResult.failed.map((symbol) => symbol.trim().toUpperCase()));
       for (const s of freshness.stale) {
-        dailySyncConfirmed.add(s.toUpperCase());
+        if (!failedSet.has(s.toUpperCase())) {
+          dailySyncConfirmed.add(s.toUpperCase());
+        }
+      }
+      if (syncResult.failed.length > 0) {
+        console.warn('[DailySync] some symbols still stale after sync:', syncResult.failed);
       }
       return true;
     } catch (err) {
@@ -1745,7 +1727,7 @@ export async function getTaskTrendComparison(
   taskId: string | number,
   period: 5 | 20 | 63 = 20,
   metric: 'relative' | 'sma20' | 'return20d' | 'score' = 'relative',
-  labelTimezone: 'market' | 'beijing' = 'market'
+  labelTimezone: 'market' | 'beijing' = 'beijing'
 ): Promise<{
   task_id: number;
   period: number;
@@ -1779,7 +1761,7 @@ export async function getStockTrendComparison(
   symbol: string,
   period: 5 | 20 | 63 = 20,
   metric: 'relative' | 'sma20' | 'return20d' | 'score' = 'relative',
-  labelTimezone: 'market' | 'beijing' = 'market'
+  labelTimezone: 'market' | 'beijing' = 'beijing'
 ): Promise<{
   symbol: string;
   period: number;

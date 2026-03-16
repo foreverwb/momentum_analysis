@@ -17,7 +17,8 @@ import pandas as pd
 from app.models import get_db, Task, ETF, ETFHolding, Stock, PriceHistory, ImportedData, IVData, ScoreSnapshot
 from app.schemas import TaskCreate, TaskEtfsAdd
 from app.api.etfs import refresh_etf_data, ETF_REFRESH_COOLDOWN_MINUTES
-from app.api.series_utils import build_metric_series, build_sma20_comparison_series
+from app.api.series_utils import build_metric_series, build_sma20_comparison_series, resolve_latest_trade_date
+from app.core.time_utils import beijing_today, format_beijing_date, utc_isoformat, utc_now_iso
 
 router = APIRouter()
 
@@ -33,8 +34,8 @@ def format_task_response(task: Task) -> dict:
         "baseIndices": base_indices,
         "sector": task.sector,
         "etfs": task.etfs or [],
-        "createdAt": task.created_at.strftime("%Y-%m-%d") if task.created_at else None,
-        "updatedAt": task.updated_at.isoformat() if task.updated_at else None,
+        "createdAt": format_beijing_date(task.created_at),
+        "updatedAt": utc_isoformat(task.updated_at),
     }
 
 
@@ -318,7 +319,7 @@ async def get_task_trend_comparison(
     task_id: int,
     period: int = Query(20, description="对比周期（交易日）: 5/20/63"),
     metric: str = Query("relative", description="指标: relative/sma20/return20d/score"),
-    label_tz: str = Query("market", description="日期标签时区: market/beijing"),
+    label_tz: str = Query("beijing", description="日期标签时区，默认北京时间"),
     db: Session = Depends(get_db)
 ):
     """
@@ -332,7 +333,7 @@ async def get_task_trend_comparison(
         raise HTTPException(status_code=400, detail="period must be one of 5, 20, 63")
     if metric not in ("relative", "sma20", "return20d", "score"):
         raise HTTPException(status_code=400, detail="metric must be one of relative, sma20, return20d, score")
-    normalized_label_tz = (label_tz or "market").strip().lower()
+    normalized_label_tz = (label_tz or "beijing").strip().lower()
     if normalized_label_tz not in ("market", "beijing"):
         raise HTTPException(status_code=400, detail="label_tz must be one of market, beijing")
 
@@ -786,11 +787,11 @@ async def refresh_momentum_stocks(
         db.add(stock)
         db.flush()
 
-        today = date_type.today()
+        snapshot_date = resolve_latest_trade_date(price_df, fallback=beijing_today()) or beijing_today()
         existing_snapshot = db.query(ScoreSnapshot).filter(
             ScoreSnapshot.symbol == ticker,
             ScoreSnapshot.symbol_type == "stock",
-            ScoreSnapshot.date == today
+            ScoreSnapshot.date == snapshot_date
         ).first()
 
         score_breakdown = {
@@ -810,7 +811,7 @@ async def refresh_momentum_stocks(
             db.add(ScoreSnapshot(
                 symbol=ticker,
                 symbol_type="stock",
-                date=today,
+                date=snapshot_date,
                 total_score=stock.score_total,
                 score_breakdown=score_breakdown,
                 thresholds_pass=thresholds_pass
@@ -885,7 +886,7 @@ async def websocket_refresh_stream(websocket: WebSocket, task_id: int, db: Sessi
                 "message": "任务中没有 ETF",
                 "total_count": 0,
                 "completed_count": 0,
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": utc_now_iso()
             })
             return
 
@@ -907,7 +908,7 @@ async def websocket_refresh_stream(websocket: WebSocket, task_id: int, db: Sessi
                     "total_count": len(etf_symbols),
                     "current_etf": symbol,
                     "error": None,
-                    "timestamp": datetime.utcnow().isoformat()
+                    "timestamp": utc_now_iso()
                 })
                 await asyncio.sleep(0.1)
 
@@ -926,7 +927,7 @@ async def websocket_refresh_stream(websocket: WebSocket, task_id: int, db: Sessi
                         "total_count": len(etf_symbols),
                         "current_etf": symbol if idx < len(etf_symbols) else None,
                         "error": None,
-                        "timestamp": datetime.utcnow().isoformat()
+                        "timestamp": utc_now_iso()
                     })
                 else:
                     # 推送部分失败消息
@@ -940,7 +941,7 @@ async def websocket_refresh_stream(websocket: WebSocket, task_id: int, db: Sessi
                         "total_count": len(etf_symbols),
                         "current_etf": symbol,
                         "error": result.get('message'),
-                        "timestamp": datetime.utcnow().isoformat()
+                        "timestamp": utc_now_iso()
                     })
 
             except Exception as e:
@@ -955,7 +956,7 @@ async def websocket_refresh_stream(websocket: WebSocket, task_id: int, db: Sessi
                     "total_count": len(etf_symbols),
                     "current_etf": symbol,
                     "error": str(e),
-                    "timestamp": datetime.utcnow().isoformat()
+                    "timestamp": utc_now_iso()
                 })
 
             await asyncio.sleep(0.2)
@@ -966,7 +967,7 @@ async def websocket_refresh_stream(websocket: WebSocket, task_id: int, db: Sessi
             "message": f"任务完成: {len(etf_symbols)} 个 ETF 已刷新",
             "total_count": len(etf_symbols),
             "completed_count": len(etf_symbols),
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": utc_now_iso()
         })
 
     except WebSocketDisconnect:
@@ -975,6 +976,6 @@ async def websocket_refresh_stream(websocket: WebSocket, task_id: int, db: Sessi
         await websocket.send_json({
             "event": "error",
             "message": str(e),
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": utc_now_iso()
         })
         await websocket.close()

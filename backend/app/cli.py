@@ -70,6 +70,8 @@ REFRESH_POST_SUBMIT_POLL_INTERVAL_SECONDS = 0.25
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_ROOT))
 
+from app.core.time_utils import beijing_today, utc_now_naive
+
 
 TOP_LEVEL_COMMANDS = {
     "uploads",
@@ -267,7 +269,7 @@ def parse_cli_args(argv=None, prog: str | None = None):
 
 
 def _today_iso_date() -> str:
-    return date.today().isoformat()
+    return beijing_today().isoformat()
 
 
 def parse_xlsx_holdings(file_path: str) -> list:
@@ -1065,7 +1067,7 @@ def cmd_import_finviz(args):
 
     init_db()
 
-    data_date_str = args.date if args.date else datetime.now().strftime("%Y-%m-%d")
+    data_date_str = args.date if args.date else _today_iso_date()
     file_path = args.file
 
     try:
@@ -1315,7 +1317,7 @@ def cmd_import_mc(args):
 
     init_db()
 
-    data_date_str = args.date if args.date else datetime.now().strftime("%Y-%m-%d")
+    data_date_str = args.date if args.date else _today_iso_date()
     file_path = args.file
 
     try:
@@ -1558,7 +1560,7 @@ def cmd_uploads(args):
     # 验证参数
     etf_type = args.type
     etf_symbol = args.etf_symbol.upper()
-    data_date_str = args.date if args.date else datetime.now().strftime("%Y-%m-%d")
+    data_date_str = args.date if args.date else _today_iso_date()
     file_path = args.file
     parent_sector = args.sector.upper() if args.sector else None
     
@@ -1683,7 +1685,7 @@ def cmd_uploads(args):
         
         # 更新 ETF 的持仓数量
         etf.holdings_count = len(valid_holdings)
-        etf.updated_at = datetime.now()
+        etf.updated_at = utc_now_naive()
         
         # 删除该 ETF 在指定日期的旧上传日志（支持重复上传）
         db.query(HoldingsUploadLog).filter(
