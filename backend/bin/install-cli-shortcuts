@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Install short CLI wrappers into the active or local virtualenv."""
+
+from __future__ import annotations
+
+import os
+import stat
+import sys
+from pathlib import Path
+
+
+COMMANDS = [
+    "refresh",
+    "finviz",
+    "mc",
+    "uploads",
+    "update",
+    "list-etfs",
+    "list-holdings",
+]
+
+
+def _backend_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _candidate_script_dirs(backend_root: Path) -> list[Path]:
+    candidates: list[Path] = []
+    seen: set[str] = set()
+
+    def add(path: Path) -> None:
+        expanded = path.expanduser()
+        key = str(expanded)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(expanded)
+
+    virtual_env = os.environ.get("VIRTUAL_ENV")
+    if virtual_env:
+        venv_root = Path(virtual_env)
+        add(venv_root / "bin")
+        add(venv_root / "Scripts")
+
+    for venv_root in (backend_root / ".venv", backend_root.parent / ".venv"):
+        add(venv_root / "bin")
+        add(venv_root / "Scripts")
+
+    return candidates
+
+
+def _resolve_scripts_dir(backend_root: Path) -> Path:
+    for candidate in _candidate_script_dirs(backend_root):
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+    raise SystemExit("错误: 未找到虚拟环境目录，请先创建并激活 backend/.venv")
+
+
+def _resolve_python_executable(scripts_dir: Path) -> Path:
+    names = ["python", "python3"]
+    if scripts_dir.name.lower() == "scripts":
+        names = ["python.exe", "python", "python3.exe", "python3"]
+
+    for name in names:
+        candidate = scripts_dir / name
+        if candidate.exists():
+            return candidate
+    raise SystemExit(f"错误: 未在 {scripts_dir} 中找到 Python 可执行文件")
+
+
+def _render_posix_script(backend_root: Path, python_bin: Path, command: str) -> str:
+    return "\n".join(
+        [
+            "#!/bin/sh",
+            f'BACKEND_ROOT="{backend_root}"',
+            'export PYTHONPATH="$BACKEND_ROOT${PYTHONPATH:+:$PYTHONPATH}"',
+            f'exec "{python_bin}" -m app.cli {command} "$@"',
+            "",
+        ]
+    )
+
+
+def _render_windows_script(backend_root: Path, python_bin: Path, command: str) -> str:
+    return "\r\n".join(
+        [
+            "@echo off",
+            f'set "BACKEND_ROOT={backend_root}"',
+            'if defined PYTHONPATH (',
+            '  set "PYTHONPATH=%BACKEND_ROOT%;%PYTHONPATH%"',
+            ") else (",
+            '  set "PYTHONPATH=%BACKEND_ROOT%"',
+            ")",
+            f'"{python_bin}" -m app.cli {command} %*',
+            "",
+        ]
+    )
+
+
+def _install_posix_shortcuts(scripts_dir: Path, backend_root: Path, python_bin: Path) -> list[Path]:
+    installed: list[Path] = []
+    for command in COMMANDS:
+        target = scripts_dir / command
+        target.write_text(_render_posix_script(backend_root, python_bin, command), encoding="utf-8")
+        current_mode = target.stat().st_mode
+        target.chmod(current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        installed.append(target)
+    return installed
+
+
+def _install_windows_shortcuts(scripts_dir: Path, backend_root: Path, python_bin: Path) -> list[Path]:
+    installed: list[Path] = []
+    for command in COMMANDS:
+        target = scripts_dir / f"{command}.cmd"
+        target.write_text(_render_windows_script(backend_root, python_bin, command), encoding="utf-8")
+        installed.append(target)
+    return installed
+
+
+def main() -> int:
+    backend_root = _backend_root()
+    scripts_dir = _resolve_scripts_dir(backend_root)
+    python_bin = _resolve_python_executable(scripts_dir)
+
+    if scripts_dir.name.lower() == "scripts":
+        installed = _install_windows_shortcuts(scripts_dir, backend_root, python_bin)
+    else:
+        installed = _install_posix_shortcuts(scripts_dir, backend_root, python_bin)
+
+    print(f"已安装 {len(installed)} 个 CLI 快捷命令到: {scripts_dir}")
+    for item in installed:
+        print(f"- {item.name}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

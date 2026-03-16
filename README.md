@@ -148,25 +148,46 @@ ETF 评分 `breakdown` 现在同时输出：
 关闭 "Momentum Radar - Backend" 和 "Momentum Radar - Frontend" 两个命令行窗口
 
 ## CLI
-运行 CLI 前请先激活后端虚拟环境或直接使用 `.venv` 的 Python。以下示例默认在 `backend` 目录下执行。
+运行 CLI 前请先激活后端虚拟环境，并在 `backend` 目录执行一次 `./bin/install-cli-shortcuts`。该脚本会把 `refresh` / `finviz` / `mc` / `uploads` / `update` / `list-etfs` / `list-holdings` 写入当前虚拟环境的 `bin` 目录，之后可直接使用短命令。旧写法 `python -m app.cli ...` 仍兼容。
 
 ### 导入命令
 
 | 命令 | 说明 | 关键参数 | 示例 |
 | --- | --- | --- | --- |
-| `uploads` | 上传 ETF holdings 文件 | `-t` ETF 类型，`-a` ETF 代码，`file` 文件路径；行业 ETF 需额外提供 `-s` 父板块；`-d` 可选，默认当天 | `python -m app.cli uploads -t sector -a XLK holdings.xlsx`<br>`python -m app.cli uploads -d 2026-01-25 -t sector -a XLK holdings.xlsx` |
-| `update` | 更新 ETF holdings，参数与 `uploads` 相同 | 同 `uploads` | `python -m app.cli update -t industry -s XLK -a SOXX soxx.xlsx`<br>`python -m app.cli update -d 2026-01-28 -t industry -s XLK -a SOXX soxx.xlsx` |
-| `finviz etfs` | 导入 Finviz `JSON/CSV` ETF 数据；可整文件导入，也可按 ETF 覆盖范围筛选导入 | `-f` 文件路径；`-d` 可选；`-s` ETF 列表与 `-w` 覆盖范围需同时提供，`-w` 支持 `t-10` 或 `85` | `python -m app.cli finviz etfs -f finviz_export.csv`<br>`python -m app.cli finviz etfs -s "XLK,XLC,XLV" -w 85 -f finviz_export.csv` |
-| `mc etfs` | 导入 MarketChameleon ETF JSON 数据；支持整文件导入，也支持按 ETF 覆盖范围筛选导入 | `-f` 文件路径；`-d` 可选；`-s` ETF 列表与 `-w` 覆盖范围可选且需同时提供 | `python -m app.cli mc etfs -f marketchameleon_etfs.json`<br>`python -m app.cli mc etfs -s "XLK,XLC,XLV" -w 85 -f marketchameleon.json`<br>`python -m app.cli mc etfs -d 2026-03-06 -s "XLK,XLC,XLV" -w t-10 -f marketchameleon.json` |
+| `uploads` | 上传 ETF holdings 文件 | `-t` ETF 类型，`-a` ETF 代码；行业 ETF 需额外提供 `-s` 父板块；文件支持位置参数 `file` 或 `-f`；`-d` 可选，默认当天 | `uploads -t sector -a XLK -f xlk.xlsx`<br>`uploads -d 2026-01-25 -t industry -s XLK -a SOXX soxx.xlsx` |
+| `update` | 更新 ETF holdings，参数与 `uploads` 相同 | 同 `uploads` | `update -t industry -s XLK -a SOXX -f soxx.xlsx`<br>`update -d 2026-01-28 -t sector -a XLE xle.xlsx` |
+| `finviz` | 导入 Finviz `JSON/CSV` ETF 数据；可整文件导入，也可按 ETF 覆盖范围筛选导入 | `-f` 文件名或文件路径；`-d` 可选；`-s` ETF 列表与 `-w` 覆盖范围需同时提供，`-w` 支持 `t-10` 或 `85` | `finviz -f XLC_E_F_V_Y-75%w_03-16_06_14.json`<br>`finviz -s "XLK,XLC,XLV" -w 85 -f export.csv` |
+| `mc` | 导入 MarketChameleon ETF JSON 数据；支持整文件导入，也支持按 ETF 覆盖范围筛选导入 | `-f` 文件名或文件路径；`-d` 可选；`-s` ETF 列表与 `-w` 覆盖范围可选且需同时提供 | `mc -f marketchameleon_etfs.json`<br>`mc -s "XLK,XLC,XLV" -w 85 -f marketchameleon.json`<br>`mc -d 2026-03-06 -s "XLK,XLC,XLV" -w t-10 -f marketchameleon.json` |
 
-说明：旧写法 `python -m app.cli finviz ...` / `python -m app.cli mc ...` 仍兼容，会自动按 `etfs` 子命令处理。
+说明：
+
+- `finviz` / `mc` 的旧写法 `python -m app.cli finviz ...`、`python -m app.cli mc ...` 仍兼容，会自动补上 `etfs` 子命令。
+- `uploads` / `update` 仍兼容旧的文件位置参数写法。
+
+### CLI 文件配置
+
+`cfg.yaml` 现在支持：
+
+```yaml
+cli:
+  downloads_dir: '~/Downloads'
+  finviz_file_prefix: 'Finviz_'
+  mc_file_prefix: 'MarketChameleon_'
+  holdings_file_prefix: ''
+```
+
+说明：
+
+- 在当前机器上，`~/Downloads` 会解析到 `/Users/bin/Downloads`。
+- `-f` 只填文件名时，CLI 会优先在 `downloads_dir` 中查找。
+- 若配置了对应 prefix，例如 `finviz_file_prefix: 'Finviz_'`，则 `finviz -f XLC_E_F_V_Y-75%w_03-16_06_14.json` 会自动匹配 `/Users/bin/Downloads/Finviz_XLC_E_F_V_Y-75%w_03-16_06_14.json`。
 
 ### 查询命令
 
 | 命令 | 说明 | 示例 |
 | --- | --- | --- |
-| `list-etfs` | 列出所有 ETF | `python -m app.cli list-etfs` |
-| `list-holdings` | 列出指定 ETF 持仓 | `python -m app.cli list-holdings XLK` |
+| `list-etfs` | 列出所有 ETF | `list-etfs` |
+| `list-holdings` | 列出指定 ETF 持仓 | `list-holdings XLK` |
 
 ### 后台刷新命令
 
@@ -174,10 +195,10 @@ ETF 评分 `breakdown` 现在同时输出：
 
 | 命令 | 说明 | 示例 |
 | --- | --- | --- |
-| `refresh etfs` | 后台串行刷新多个 ETF | `python -m app.cli refresh etfs -s "XLK,XLF,SOXX"` |
-| `refresh holdings` | 后台串行刷新多个 ETF holdings；支持 `t-20` / `85` / `all` | `python -m app.cli refresh holdings -s "XLK,SOXX" -w t-20` |
-| `refresh status` | 查询单个后台 refresh job 状态 | `python -m app.cli refresh status 12` |
-| `refresh list` | 查看最近的后台 refresh jobs | `python -m app.cli refresh list --status running` |
+| `refresh etfs` | 后台串行刷新多个 ETF | `refresh etfs -s "XLK,XLF,SOXX"` |
+| `refresh holdings` | 后台串行刷新多个 ETF holdings；支持 `t-20` / `85` / `all` | `refresh holdings -s "XLK,SOXX" -w t-20` |
+| `refresh status` | 查询单个后台 refresh job 状态 | `refresh status 12` |
+| `refresh list` | 查看最近的后台 refresh jobs | `refresh list --status running` |
 
 说明：
 
@@ -189,5 +210,6 @@ ETF 评分 `breakdown` 现在同时输出：
 
 | 命令 | 说明 | 示例 |
 | --- | --- | --- |
-| `./bin/finviz ...` | 在 `backend` 目录下直接调用 Finviz 便捷脚本 | `./bin/finviz etfs -f ../../../Downloads/finviz_export.csv`<br>`./bin/finviz etfs -s "XLK,XLC,XLV" -w 85 -f ../../../Downloads/finviz_export.csv` |
-| `./bin/mc ...` | 在 `backend` 目录下直接调用 MarketChameleon 便捷脚本 | `./bin/mc etfs -f ../../../Downloads/marketchameleon_etfs.json`<br>`./bin/mc etfs -s "XLF" -w 85 -f ../../../Downloads/marketchameleon_06_03_10_18.json` |
+| `./bin/install-cli-shortcuts` | 将短命令安装到当前虚拟环境的 `bin` 目录 | `cd backend && ./bin/install-cli-shortcuts` |
+| `./bin/finviz ...` | 在 `backend` 目录下直接调用 Finviz 便捷脚本 | `./bin/finviz -f export.csv`<br>`./bin/finviz -s "XLK,XLC,XLV" -w 85 -f export.csv` |
+| `./bin/mc ...` | 在 `backend` 目录下直接调用 MarketChameleon 便捷脚本 | `./bin/mc -f marketchameleon_etfs.json`<br>`./bin/mc -s "XLF" -w 85 -f marketchameleon_06_03_10_18.json` |

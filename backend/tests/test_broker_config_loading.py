@@ -19,6 +19,12 @@ def test_load_broker_config_from_custom_path(tmp_path: Path) -> None:
                 "  host: '10.0.0.8'",
                 "  port: 21111",
                 "  market: 'HK'",
+                "cli:",
+                "  downloads_dir: './downloads'",
+                "  file_prefix: 'Data_'",
+                "  finviz_file_prefix: 'Finviz_'",
+                "  mc_file_prefix: 'MC_'",
+                "  holdings_file_prefix: 'Holdings_'",
             ]
         ),
         encoding="utf-8",
@@ -35,6 +41,11 @@ def test_load_broker_config_from_custom_path(tmp_path: Path) -> None:
     assert cfg.futu.host == "10.0.0.8"
     assert cfg.futu.port == 21111
     assert cfg.futu.market == "HK"
+    assert cfg.cli.downloads_dir == "./downloads"
+    assert cfg.cli.file_prefix == "Data_"
+    assert cfg.cli.finviz_file_prefix == "Finviz_"
+    assert cfg.cli.mc_file_prefix == "MC_"
+    assert cfg.cli.holdings_file_prefix == "Holdings_"
 
 
 def test_load_broker_config_falls_back_to_defaults_on_invalid_values(tmp_path: Path) -> None:
@@ -51,6 +62,9 @@ def test_load_broker_config_falls_back_to_defaults_on_invalid_values(tmp_path: P
                 "  host: null",
                 "  port: -100",
                 "  market: ''",
+                "cli:",
+                "  downloads_dir: ''",
+                "  file_prefix: ''",
             ]
         ),
         encoding="utf-8",
@@ -65,3 +79,5 @@ def test_load_broker_config_falls_back_to_defaults_on_invalid_values(tmp_path: P
     assert cfg.futu.host == "127.0.0.1"
     assert cfg.futu.port == 11111
     assert cfg.futu.market == "US"
+    assert cfg.cli.downloads_dir.endswith("Downloads")
+    assert cfg.cli.file_prefix == ""

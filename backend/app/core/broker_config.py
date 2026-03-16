@@ -14,6 +14,7 @@ import structlog
 logger = structlog.get_logger(__name__)
 
 _CONFIG_ENV_VAR = "MOMENTUM_CFG_PATH"
+_DEFAULT_CLI_DOWNLOADS_DIR = str(Path.home() / "Downloads")
 
 
 @dataclass(frozen=True)
@@ -39,10 +40,20 @@ class RefreshConfig:
 
 
 @dataclass(frozen=True)
+class CLIConfig:
+    downloads_dir: str = _DEFAULT_CLI_DOWNLOADS_DIR
+    file_prefix: str = ""
+    finviz_file_prefix: str = ""
+    mc_file_prefix: str = ""
+    holdings_file_prefix: str = ""
+
+
+@dataclass(frozen=True)
 class BrokerConfig:
     ibkr: IBKRConfig = field(default_factory=IBKRConfig)
     futu: FutuConfig = field(default_factory=FutuConfig)
     refresh: RefreshConfig = field(default_factory=RefreshConfig)
+    cli: CLIConfig = field(default_factory=CLIConfig)
     config_path: Optional[str] = None
     loaded_from_file: bool = False
 
@@ -176,6 +187,7 @@ def load_broker_config(config_path: Optional[str] = None) -> BrokerConfig:
     ibkr_payload = payload.get("ibkr", {}) if isinstance(payload.get("ibkr"), dict) else {}
     futu_payload = payload.get("futu", {}) if isinstance(payload.get("futu"), dict) else {}
     refresh_payload = payload.get("refresh", {}) if isinstance(payload.get("refresh"), dict) else {}
+    cli_payload = payload.get("cli", {}) if isinstance(payload.get("cli"), dict) else {}
 
     config = BrokerConfig(
         ibkr=IBKRConfig(
@@ -203,6 +215,22 @@ def load_broker_config(config_path: Optional[str] = None) -> BrokerConfig:
                 RefreshConfig.serial_gap_seconds,
             ),
         ),
+        cli=CLIConfig(
+            downloads_dir=_to_str(cli_payload.get("downloads_dir"), _DEFAULT_CLI_DOWNLOADS_DIR),
+            file_prefix=_to_str(cli_payload.get("file_prefix"), CLIConfig.file_prefix),
+            finviz_file_prefix=_to_str(
+                cli_payload.get("finviz_file_prefix"),
+                CLIConfig.finviz_file_prefix,
+            ),
+            mc_file_prefix=_to_str(
+                cli_payload.get("mc_file_prefix"),
+                CLIConfig.mc_file_prefix,
+            ),
+            holdings_file_prefix=_to_str(
+                cli_payload.get("holdings_file_prefix"),
+                CLIConfig.holdings_file_prefix,
+            ),
+        ),
         config_path=str(path),
         loaded_from_file=True,
     )
@@ -216,6 +244,7 @@ def load_broker_config(config_path: Optional[str] = None) -> BrokerConfig:
         etf_cooldown_minutes=config.refresh.etf_cooldown_minutes,
         holdings_cooldown_minutes=config.refresh.holdings_cooldown_minutes,
         serial_gap_seconds=config.refresh.serial_gap_seconds,
+        cli_downloads_dir=config.cli.downloads_dir,
     )
     return config
 

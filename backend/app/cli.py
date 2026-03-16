@@ -71,6 +71,24 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_ROOT))
 
 
+TOP_LEVEL_COMMANDS = {
+    "uploads",
+    "update",
+    "init",
+    "list-etfs",
+    "list-holdings",
+    "finviz",
+    "mc",
+    "refresh",
+}
+FILE_PREFIX_ATTR_BY_COMMAND = {
+    "uploads": "holdings_file_prefix",
+    "update": "holdings_file_prefix",
+    "finviz": "finviz_file_prefix",
+    "mc": "mc_file_prefix",
+}
+
+
 def _running_in_venv() -> bool:
     base_prefix = getattr(sys, "base_prefix", sys.prefix)
     return base_prefix != sys.prefix
@@ -117,8 +135,98 @@ def _ensure_db_dependencies() -> None:
 _maybe_reexec_in_venv()
 
 
-def normalize_cli_argv(argv=None) -> list:
+def _infer_cli_invoked_command(prog: str | None = None) -> str | None:
+    program = Path(prog or sys.argv[0]).name
+    candidates = [program, Path(program).stem]
+    stem = Path(program).stem
+    if stem.endswith("-script"):
+        candidates.append(stem[:-7])
+    for candidate in candidates:
+        if candidate in TOP_LEVEL_COMMANDS:
+            return candidate
+    return None
+
+
+def _is_plain_filename(raw_value: str) -> bool:
+    if not raw_value:
+        return False
+    if raw_value.startswith("."):
+        return False
+    separators = [os.sep]
+    if os.altsep:
+        separators.append(os.altsep)
+    if any(separator in raw_value for separator in separators):
+        return False
+    return True
+
+
+def _resolve_cli_downloads_dir(config) -> Path:
+    configured = (config.cli.downloads_dir or "").strip()
+    downloads_dir = Path(configured).expanduser() if configured else Path.home() / "Downloads"
+    if downloads_dir.is_absolute():
+        return downloads_dir.resolve()
+
+    if config.loaded_from_file and config.config_path:
+        base_dir = Path(config.config_path).expanduser().resolve().parent
+    else:
+        base_dir = BACKEND_ROOT.parent
+    return (base_dir / downloads_dir).resolve()
+
+
+def _resolve_cli_file_prefix(command: str, config) -> str:
+    command_prefix_attr = FILE_PREFIX_ATTR_BY_COMMAND.get(command)
+    if command_prefix_attr:
+        command_prefix = getattr(config.cli, command_prefix_attr, "").strip()
+        if command_prefix:
+            return command_prefix
+    return (config.cli.file_prefix or "").strip()
+
+
+def resolve_cli_file_arg(file_value: str, command: str) -> str:
+    raw_value = str(file_value).strip()
+    if not raw_value:
+        return raw_value
+
+    candidate = Path(raw_value).expanduser()
+    if candidate.is_absolute():
+        return str(candidate)
+
+    direct_candidate = (Path.cwd() / candidate).resolve()
+    if candidate.exists():
+        return str(candidate.resolve())
+    if direct_candidate.exists():
+        return str(direct_candidate)
+    if not _is_plain_filename(raw_value):
+        return str(direct_candidate)
+
+    try:
+        from app.core.broker_config import load_broker_config
+    except Exception:
+        return raw_value
+
+    config = load_broker_config()
+    downloads_dir = _resolve_cli_downloads_dir(config)
+    file_prefix = _resolve_cli_file_prefix(command, config)
+
+    prefixed_candidate = None
+    if file_prefix and not raw_value.startswith(file_prefix):
+        prefixed_candidate = downloads_dir / f"{file_prefix}{raw_value}"
+        if prefixed_candidate.exists():
+            return str(prefixed_candidate.resolve())
+
+    downloads_candidate = downloads_dir / raw_value
+    if downloads_candidate.exists():
+        return str(downloads_candidate.resolve())
+
+    return raw_value
+
+
+def normalize_cli_argv(argv=None, prog: str | None = None) -> list:
     raw_args = list(sys.argv[1:] if argv is None else argv)
+    invoked_command = _infer_cli_invoked_command(prog)
+    if invoked_command and (not raw_args or raw_args[0] not in TOP_LEVEL_COMMANDS):
+        raw_args = [invoked_command, *raw_args]
+
     if not raw_args:
         return raw_args
 
@@ -135,9 +243,27 @@ def normalize_cli_argv(argv=None) -> list:
     return raw_args
 
 
-def parse_cli_args(argv=None):
+def _finalize_cli_args(parser: argparse.ArgumentParser, args):
+    if args.command in {"uploads", "update"}:
+        positional_file = getattr(args, "file_arg", None)
+        optional_file = getattr(args, "file", None)
+        if positional_file and optional_file:
+            parser.error("uploads/update 不能同时使用位置参数 file 和 -f/--file")
+        resolved_file = optional_file or positional_file
+        if not resolved_file:
+            parser.error("uploads/update 需要提供文件路径，可使用位置参数 file 或 -f/--file")
+        args.file = resolved_file
+
+    if args.command in FILE_PREFIX_ATTR_BY_COMMAND and getattr(args, "file", None):
+        args.file = resolve_cli_file_arg(args.file, args.command)
+
+    return args
+
+
+def parse_cli_args(argv=None, prog: str | None = None):
     parser = build_parser()
-    return parser.parse_args(normalize_cli_argv(argv))
+    args = parser.parse_args(normalize_cli_argv(argv, prog=prog))
+    return _finalize_cli_args(parser, args)
 
 
 def _today_iso_date() -> str:
@@ -1753,6 +1879,11 @@ def build_parser():
   python -m app.cli mc etfs -d 2026-03-06 -s "XLK,XLC,XLV" -w 85 -f marketchameleon.json
   python -m app.cli mc etfs -s "XLK,XLC,XLV" -w t-10 -f marketchameleon.json
 
+  # 激活 backend 虚拟环境并执行 ./bin/install-cli-shortcuts 后，可直接使用短命令
+  refresh etfs -s "XLK,XLF,SOXX"
+  finviz -f export.csv
+  mc -f marketchameleon.json
+
   # 后台提交 refresh 任务（命令不会等待刷新完成）
   python -m app.cli refresh etfs -s "XLK,XLF,SOXX"
   python -m app.cli refresh holdings -s "XLK,SOXX" -w t-20
@@ -1781,7 +1912,16 @@ def build_parser():
     uploads_parser.add_argument('-a', '--etf-symbol', required=True, dest='etf_symbol',
                                help='ETF 符号 (如 XLK, SOXX)')
     uploads_parser.add_argument('-s', '--sector', help='父板块符号 (仅 industry 类型需要)')
-    uploads_parser.add_argument('file', help='Holdings 文件路径 (xlsx/xls/csv)')
+    uploads_parser.add_argument(
+        '-f', '--file',
+        required=False,
+        help='Holdings 文件路径或文件名；仅填文件名时会按 cfg.yaml 的 cli.downloads_dir / holdings_file_prefix 自动补全'
+    )
+    uploads_parser.add_argument(
+        'file_arg',
+        nargs='?',
+        help='兼容旧写法的 Holdings 文件路径 (xlsx/xls/csv)'
+    )
     uploads_parser.set_defaults(func=cmd_uploads)
     
     # update 命令 (uploads 的别名，更语义化)
@@ -1798,7 +1938,16 @@ def build_parser():
     update_parser.add_argument('-a', '--etf-symbol', required=True, dest='etf_symbol',
                               help='ETF 符号 (如 XLK, SOXX)')
     update_parser.add_argument('-s', '--sector', help='父板块符号 (仅 industry 类型需要)')
-    update_parser.add_argument('file', help='Holdings 文件路径 (xlsx/xls/csv)')
+    update_parser.add_argument(
+        '-f', '--file',
+        required=False,
+        help='Holdings 文件路径或文件名；仅填文件名时会按 cfg.yaml 的 cli.downloads_dir / holdings_file_prefix 自动补全'
+    )
+    update_parser.add_argument(
+        'file_arg',
+        nargs='?',
+        help='兼容旧写法的 Holdings 文件路径 (xlsx/xls/csv)'
+    )
     update_parser.set_defaults(func=cmd_uploads)
     
     # init 命令
@@ -1834,7 +1983,7 @@ def build_parser():
     )
     import_finviz_parser.add_argument(
         '-f', '--file', required=True,
-        help='Finviz JSON/CSV 文件路径'
+        help='Finviz JSON/CSV 文件路径或文件名；仅填文件名时会按 cfg.yaml 的 cli.downloads_dir / finviz_file_prefix 自动补全'
     )
     import_finviz_parser.add_argument(
         '-s', '--etfs', required=False,
@@ -1864,7 +2013,7 @@ def build_parser():
     )
     import_mc_parser.add_argument(
         '-f', '--file', required=True,
-        help='MarketChameleon JSON 文件路径'
+        help='MarketChameleon JSON 文件路径或文件名；仅填文件名时会按 cfg.yaml 的 cli.downloads_dir / mc_file_prefix 自动补全'
     )
     import_mc_parser.add_argument(
         '-s', '--etfs', required=False,

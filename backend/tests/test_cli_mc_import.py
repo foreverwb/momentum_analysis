@@ -7,6 +7,23 @@ os.environ["CLI_NO_VENV"] = "1"
 from app import cli
 
 
+@pytest.fixture(autouse=True)
+def _isolated_cli_cfg(tmp_path, monkeypatch) -> None:
+    downloads_dir = tmp_path / "downloads"
+    downloads_dir.mkdir()
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text(
+        "\n".join(
+            [
+                "cli:",
+                "  downloads_dir: './downloads'",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MOMENTUM_CFG_PATH", str(cfg_file))
+
+
 def test_parse_mc_coverage_supports_requested_formats() -> None:
     assert cli.parse_mc_coverage("t-10") == ("top", 10, "top10")
     assert cli.parse_mc_coverage("85") == ("weight", 85, "weight85")
@@ -149,6 +166,77 @@ def test_normalize_cli_argv_inserts_default_etfs_subcommand_for_legacy_provider_
         "-f",
         "mc.json",
     ]
+
+
+def test_parse_cli_args_accepts_short_refresh_entrypoint() -> None:
+    args = cli.parse_cli_args(["status", "12"], prog="refresh")
+
+    assert args.command == "refresh"
+    assert args.resource == "status"
+    assert args.job_id == 12
+
+
+def test_parse_cli_args_accepts_short_finviz_entrypoint() -> None:
+    args = cli.parse_cli_args(["-f", "finviz.csv"], prog="finviz")
+
+    assert args.command == "finviz"
+    assert args.resource == "etfs"
+    assert args.file == "finviz.csv"
+
+
+def test_parse_cli_args_resolves_prefixed_download_file_from_cfg(tmp_path, monkeypatch) -> None:
+    downloads_dir = tmp_path / "downloads"
+    downloads_dir.mkdir(exist_ok=True)
+    expected_file = downloads_dir / "Finviz_export.csv"
+    expected_file.write_text("Ticker,Price\nAAPL,185.5\n", encoding="utf-8")
+
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text(
+        "\n".join(
+            [
+                "cli:",
+                f"  downloads_dir: '{downloads_dir}'",
+                "  finviz_file_prefix: 'Finviz_'",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MOMENTUM_CFG_PATH", str(cfg_file))
+
+    args = cli.parse_cli_args(["finviz", "-f", "export.csv"])
+
+    assert args.file == str(expected_file.resolve())
+
+
+def test_parse_cli_args_accepts_uploads_file_option_and_download_prefix(tmp_path, monkeypatch) -> None:
+    downloads_dir = tmp_path / "downloads"
+    downloads_dir.mkdir(exist_ok=True)
+    expected_file = downloads_dir / "Holdings_xlk.xlsx"
+    expected_file.write_text("placeholder", encoding="utf-8")
+
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text(
+        "\n".join(
+            [
+                "cli:",
+                f"  downloads_dir: '{downloads_dir}'",
+                "  holdings_file_prefix: 'Holdings_'",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MOMENTUM_CFG_PATH", str(cfg_file))
+    monkeypatch.setattr(cli, "_today_iso_date", lambda: "2026-03-14")
+
+    args = cli.parse_cli_args(["uploads", "-t", "sector", "-a", "XLK", "-f", "xlk.xlsx"])
+
+    assert args.command == "uploads"
+    assert args.file == str(expected_file.resolve())
+
+
+def test_parse_cli_args_rejects_uploads_when_both_file_forms_are_provided() -> None:
+    with pytest.raises(SystemExit):
+        cli.parse_cli_args(["uploads", "-t", "sector", "-a", "XLK", "-f", "a.xlsx", "b.xlsx"])
 
 
 def test_parse_cli_args_accepts_refresh_etfs() -> None:
