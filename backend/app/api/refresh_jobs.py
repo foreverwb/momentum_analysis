@@ -13,6 +13,7 @@ router = APIRouter(prefix="/api/refresh-jobs", tags=["RefreshJobs"])
 class RefreshEtfsJobRequest(BaseModel):
     symbols: List[str] = Field(..., min_length=1, description="需要刷新的 ETF 列表")
     source: str = Field("cli", description="触发来源")
+    refresh_source: Literal["all", "ibkr", "futu"] = Field("all", description="刷新数据源")
 
 
 class RefreshHoldingsJobItem(BaseModel):
@@ -25,13 +26,18 @@ class RefreshHoldingsJobItem(BaseModel):
 class RefreshHoldingsJobRequest(BaseModel):
     items: List[RefreshHoldingsJobItem] = Field(..., min_length=1, description="需要串行刷新的 holdings 列表")
     source: str = Field("cli", description="触发来源")
+    refresh_source: Literal["all", "ibkr", "futu"] = Field("all", description="刷新数据源")
 
 
 @router.post("/etfs", status_code=status.HTTP_202_ACCEPTED)
 async def enqueue_etf_refresh_job(request: RefreshEtfsJobRequest) -> dict:
     manager = get_refresh_job_manager()
     try:
-        job = await manager.enqueue_etfs_job(request.symbols, source=request.source)
+        job = await manager.enqueue_etfs_job(
+            request.symbols,
+            source=request.source,
+            refresh_source=request.refresh_source,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
@@ -48,6 +54,7 @@ async def enqueue_holdings_refresh_job(request: RefreshHoldingsJobRequest) -> di
         job = await manager.enqueue_holdings_job(
             [item.model_dump() for item in request.items],
             source=request.source,
+            refresh_source=request.refresh_source,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

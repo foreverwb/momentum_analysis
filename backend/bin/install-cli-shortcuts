@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 COMMANDS = [
-    "refresh",
+    "Actualiser",
     "finviz",
     "mc",
     "uploads",
@@ -18,6 +18,7 @@ COMMANDS = [
     "list-etfs",
     "list-holdings",
 ]
+LEGACY_COMMANDS = ["refresh"]
 
 
 def _backend_root() -> Path:
@@ -116,6 +117,17 @@ def _install_windows_shortcuts(scripts_dir: Path, backend_root: Path, python_bin
     return installed
 
 
+def _remove_legacy_shortcuts(scripts_dir: Path) -> None:
+    if scripts_dir.name.lower() == "scripts":
+        candidates = [scripts_dir / f"{command}.cmd" for command in LEGACY_COMMANDS]
+    else:
+        candidates = [scripts_dir / command for command in LEGACY_COMMANDS]
+
+    for candidate in candidates:
+        if candidate.exists():
+            candidate.unlink()
+
+
 def main() -> int:
     backend_root = _backend_root()
     scripts_dir = _resolve_scripts_dir(backend_root)
@@ -125,6 +137,7 @@ def main() -> int:
         installed = _install_windows_shortcuts(scripts_dir, backend_root, python_bin)
     else:
         installed = _install_posix_shortcuts(scripts_dir, backend_root, python_bin)
+    _remove_legacy_shortcuts(scripts_dir)
 
     print(f"已安装 {len(installed)} 个 CLI 快捷命令到: {scripts_dir}")
     for item in installed:

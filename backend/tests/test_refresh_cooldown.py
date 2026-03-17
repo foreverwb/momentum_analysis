@@ -2,6 +2,7 @@ from datetime import date, datetime, timedelta
 
 import pandas as pd
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -12,7 +13,7 @@ from app.api.etfs import (
     refresh_etf_data,
     refresh_holdings_by_coverage,
 )
-from app.models.database import Base, ETF, ETFHolding, IVData, ImportedData, PriceHistory, ScoreSnapshot
+from app.models.database import Base, ETF, ETFHolding, IVData, ImportedData, PriceHistory, ScoreSnapshot, Stock
 from app.services.broker.futu.iv_calculator import IVTermResult
 
 
@@ -219,6 +220,165 @@ async def test_refresh_etf_data_snapshot_recalculates_breadth_score(db_session):
 
 
 @pytest.mark.asyncio
+async def test_refresh_etf_data_ibkr_source_skips_when_ibkr_recent_only(db_session):
+    now = datetime.utcnow()
+    today = date.today()
+
+    etf = ETF(
+        symbol="XLK",
+        name="Technology",
+        type="sector",
+        score=71.2,
+        rank=1,
+        completeness=80.0,
+    )
+    db_session.add(etf)
+    db_session.flush()
+
+    db_session.add(
+        PriceHistory(
+            symbol="XLK",
+            date=today,
+            open=100.0,
+            high=101.0,
+            low=99.0,
+            close=100.5,
+            volume=1000,
+            source="ibkr",
+            created_at=now - timedelta(minutes=5),
+        )
+    )
+    db_session.add(
+        ScoreSnapshot(
+            symbol="XLK",
+            symbol_type="etf",
+            date=today,
+            total_score=71.2,
+            score_breakdown={
+                "rel_mom": {"score": 65, "data": {"RS_20D": 0.01}},
+                "trend_quality": {"score": 75, "data": {"price_above_sma50": True}},
+                "breadth": {"score": 50, "data": None},
+                "options_confirm": {"score": 50, "data": None},
+            },
+            thresholds_pass=True,
+        )
+    )
+    db_session.commit()
+
+    result = await refresh_etf_data("XLK", refresh_source="ibkr", db=db_session)
+
+    assert result["status"] == "snapshot"
+    assert result["refresh_source"] == "ibkr"
+    assert "IBKR 数据在" in result.get("message", "")
+    assert result.get("next_refresh_at")
+    refresh_gate = result.get("refresh_gate") or {}
+    assert (refresh_gate.get("ibkr") or {}).get("is_recent") is True
+    assert (refresh_gate.get("futu") or {}).get("is_recent") is False
+
+
+@pytest.mark.asyncio
+async def test_refresh_etf_data_ibkr_source_does_not_recalculate_score(db_session):
+    now = datetime.utcnow()
+    today = date.today()
+
+    etf = ETF(
+        symbol="XLK",
+        name="Technology",
+        type="sector",
+        score=64.0,
+        rank=1,
+        completeness=70.0,
+    )
+    db_session.add(etf)
+    db_session.flush()
+
+    db_session.add_all(
+        [
+            ETFHolding(
+                etf_id=etf.id,
+                etf_symbol="XLK",
+                ticker="AAPL",
+                weight=6.0,
+                data_date=today,
+            ),
+            ETFHolding(
+                etf_id=etf.id,
+                etf_symbol="XLK",
+                ticker="MSFT",
+                weight=5.0,
+                data_date=today,
+            ),
+        ]
+    )
+    for ticker in ("AAPL", "MSFT"):
+        db_session.add(
+            ImportedData(
+                symbol=ticker,
+                date=today,
+                source="finviz",
+                data={
+                    "symbol": ticker,
+                    "price": 100.0,
+                    "sma20": 0.05,
+                    "sma50": 0.06,
+                    "sma200": 0.08,
+                    "week52_high": 102.0,
+                    "week52_low": 80.0,
+                    "rsi": 62.0,
+                },
+                created_at=now,
+            )
+        )
+
+    db_session.add(
+        PriceHistory(
+            symbol="XLK",
+            date=today,
+            open=100.0,
+            high=101.0,
+            low=99.0,
+            close=100.5,
+            volume=1000,
+            source="ibkr",
+            created_at=now - timedelta(minutes=5),
+        )
+    )
+    db_session.add(
+        ScoreSnapshot(
+            symbol="XLK",
+            symbol_type="etf",
+            date=today,
+            total_score=64.0,
+            score_breakdown={
+                "rel_mom": {"score": 65, "data": {"RS_20D": 0.01}},
+                "trend_quality": {"score": 75, "data": {"price_above_sma50": True}},
+                "breadth": {"score": 50, "data": None},
+                "options_confirm": {"score": 50, "data": None},
+            },
+            thresholds_pass=True,
+        )
+    )
+    db_session.commit()
+
+    result = await refresh_etf_data("XLK", refresh_source="ibkr", db=db_session)
+
+    refreshed_etf = db_session.query(ETF).filter(ETF.symbol == "XLK").first()
+    refreshed_snapshot = db_session.query(ScoreSnapshot).filter(
+        ScoreSnapshot.symbol == "XLK",
+        ScoreSnapshot.symbol_type == "etf",
+        ScoreSnapshot.date == today,
+    ).first()
+
+    assert result["status"] == "snapshot"
+    assert result["score"] == pytest.approx(64.0)
+    assert refreshed_etf is not None
+    assert refreshed_etf.score == pytest.approx(64.0)
+    assert refreshed_snapshot is not None
+    assert refreshed_snapshot.total_score == pytest.approx(64.0)
+    assert refreshed_snapshot.score_breakdown["breadth"]["data"] is None
+
+
+@pytest.mark.asyncio
 async def test_refresh_holdings_by_coverage_skips_when_ibkr_and_futu_recent(db_session):
     now = datetime.utcnow()
     today = date.today()
@@ -305,6 +465,87 @@ async def test_refresh_holdings_by_coverage_skips_when_ibkr_and_futu_recent(db_s
     assert result.get("next_refresh_at")
     refresh_gate = result.get("refresh_gate") or {}
     assert refresh_gate.get("cooldown_minutes") == HOLDINGS_REFRESH_COOLDOWN_MINUTES
+
+
+@pytest.mark.asyncio
+async def test_refresh_holdings_by_coverage_ibkr_source_skips_when_ibkr_recent_only(db_session):
+    now = datetime.utcnow()
+    today = date.today()
+
+    etf = ETF(symbol="XLK", name="Technology", type="sector")
+    db_session.add(etf)
+    db_session.flush()
+
+    db_session.add_all(
+        [
+            ETFHolding(
+                etf_id=etf.id,
+                etf_symbol="XLK",
+                ticker="AAPL",
+                weight=6.0,
+                data_date=today,
+            ),
+            ETFHolding(
+                etf_id=etf.id,
+                etf_symbol="XLK",
+                ticker="MSFT",
+                weight=5.0,
+                data_date=today,
+            ),
+        ]
+    )
+
+    for ticker in ("AAPL", "MSFT"):
+        db_session.add(
+            ImportedData(
+                symbol=ticker,
+                date=today,
+                source="finviz",
+                data={"symbol": ticker},
+                created_at=now,
+            )
+        )
+        db_session.add(
+            ImportedData(
+                symbol=ticker,
+                date=today,
+                source="marketchameleon",
+                data={"symbol": ticker},
+                created_at=now,
+            )
+        )
+        db_session.add(
+            PriceHistory(
+                symbol=ticker,
+                date=today,
+                open=100.0,
+                high=101.0,
+                low=99.0,
+                close=100.5,
+                volume=1000,
+                source="ibkr",
+                created_at=now - timedelta(minutes=20),
+            )
+        )
+    db_session.commit()
+
+    result = await refresh_holdings_by_coverage(
+        "XLK",
+        HoldingsCoverageRequest(
+            coverage_type="top",
+            coverage_value=2,
+            refresh_source="ibkr",
+        ),
+        db=db_session,
+    )
+
+    assert result["status"] == "snapshot"
+    assert result["refresh_source"] == "ibkr"
+    assert result["stocks_count"] == 2
+    assert "IBKR 数据在" in result.get("message", "")
+    refresh_gate = result.get("refresh_gate") or {}
+    assert (refresh_gate.get("ibkr") or {}).get("all_recent") is True
+    assert (refresh_gate.get("futu") or {}).get("all_recent") is False
 
 
 @pytest.mark.asyncio
@@ -559,6 +800,31 @@ class _BatchOrchestrator(_DummyOrchestrator):
 
     async def connect_futu(self):
         return True
+
+
+class _FutuScoreOrchestrator(_DummyOrchestrator):
+    def __init__(self, futu):
+        self._futu = futu
+        self.pool_calls = []
+
+    def get_broker_status(self):
+        return {
+            "ibkr": {"is_connected": False, "last_error": "not connected"},
+            "futu": {"is_connected": True},
+        }
+
+    async def connect_futu(self):
+        return True
+
+    async def calculate_momentum_pool_score(self, **kwargs):
+        self.pool_calls.append(kwargs)
+        return {
+            "symbol": kwargs.get("symbol"),
+            "sector_etf": kwargs.get("sector_etf"),
+            "total_score": 68.0,
+            "scores": {"momentum": 55.0, "trend": 58.0},
+            "metrics": {},
+        }
 
 
 def _price_frame(symbol: str, periods: int = 80) -> pd.DataFrame:
@@ -864,6 +1130,245 @@ async def test_refresh_holdings_reuses_prefetched_ibkr_frames(monkeypatch, db_se
     assert len(orchestrator.pool_calls) == 2
     assert all(call.get("price_df") is not None for call in orchestrator.pool_calls)
     assert all(call.get("sector_df") is not None for call in orchestrator.pool_calls)
+
+
+@pytest.mark.asyncio
+async def test_refresh_holdings_ibkr_source_skips_import_guard(monkeypatch, db_session):
+    today = date.today()
+
+    etf = ETF(symbol="XLF", name="Financials", type="sector")
+    db_session.add(etf)
+    db_session.flush()
+
+    db_session.add_all(
+        [
+            ETFHolding(
+                etf_id=etf.id,
+                etf_symbol="XLF",
+                ticker="JPM",
+                weight=8.0,
+                data_date=today,
+            ),
+            ETFHolding(
+                etf_id=etf.id,
+                etf_symbol="XLF",
+                ticker="BAC",
+                weight=6.0,
+                data_date=today,
+            ),
+        ]
+    )
+    db_session.commit()
+
+    orchestrator = _IBKRReuseOrchestrator()
+    monkeypatch.setattr("app.services.orchestrator.get_orchestrator", lambda: orchestrator)
+
+    result = await refresh_holdings_by_coverage(
+        "XLF",
+        HoldingsCoverageRequest(coverage_type="top", coverage_value=2, refresh_source="ibkr"),
+        db=db_session,
+    )
+
+    assert result["status"] == "success"
+    assert result["refresh_source"] == "ibkr"
+    assert "未触发评分计算" in result["message"]
+    assert orchestrator.pool_calls == []
+    assert db_session.query(PriceHistory).filter(PriceHistory.symbol.in_(["JPM", "BAC"])).count() > 0
+
+
+@pytest.mark.asyncio
+async def test_refresh_holdings_futu_source_still_requires_fresh_imports(db_session):
+    today = date.today()
+
+    etf = ETF(symbol="XLK", name="Technology", type="sector")
+    db_session.add(etf)
+    db_session.flush()
+
+    db_session.add_all(
+        [
+            ETFHolding(
+                etf_id=etf.id,
+                etf_symbol="XLK",
+                ticker="AAPL",
+                weight=6.0,
+                data_date=today,
+            ),
+            ETFHolding(
+                etf_id=etf.id,
+                etf_symbol="XLK",
+                ticker="MSFT",
+                weight=5.0,
+                data_date=today,
+            ),
+        ]
+    )
+    db_session.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await refresh_holdings_by_coverage(
+            "XLK",
+            HoldingsCoverageRequest(coverage_type="top", coverage_value=2, refresh_source="futu"),
+            db=db_session,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "Finviz 与 MarketChameleon 最新数据" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_refresh_holdings_ibkr_source_refreshes_data_without_scoring(monkeypatch, db_session):
+    today = date.today()
+    now = datetime.utcnow()
+
+    etf = ETF(symbol="XLF", name="Financials", type="sector")
+    db_session.add(etf)
+    db_session.flush()
+
+    db_session.add_all(
+        [
+            ETFHolding(
+                etf_id=etf.id,
+                etf_symbol="XLF",
+                ticker="JPM",
+                weight=8.0,
+                data_date=today,
+            ),
+            ETFHolding(
+                etf_id=etf.id,
+                etf_symbol="XLF",
+                ticker="BAC",
+                weight=6.0,
+                data_date=today,
+            ),
+        ]
+    )
+    for ticker in ("JPM", "BAC"):
+        db_session.add(
+            ImportedData(
+                symbol=ticker,
+                date=today,
+                source="finviz",
+                data={"symbol": ticker},
+                created_at=now,
+            )
+        )
+        db_session.add(
+            ImportedData(
+                symbol=ticker,
+                date=today,
+                source="marketchameleon",
+                data={"symbol": ticker},
+                created_at=now,
+            )
+        )
+    db_session.commit()
+
+    orchestrator = _IBKRReuseOrchestrator()
+    monkeypatch.setattr("app.services.orchestrator.get_orchestrator", lambda: orchestrator)
+
+    result = await refresh_holdings_by_coverage(
+        "XLF",
+        HoldingsCoverageRequest(coverage_type="top", coverage_value=2, refresh_source="ibkr"),
+        db=db_session,
+    )
+
+    assert result["status"] == "success"
+    assert result["refresh_source"] == "ibkr"
+    assert "未触发评分计算" in result["message"]
+    assert orchestrator.ohlcv_calls.count(("XLF", "1 Y")) == 1
+    assert orchestrator.ohlcv_calls.count(("JPM", "1 Y")) == 1
+    assert orchestrator.ohlcv_calls.count(("BAC", "1 Y")) == 1
+    assert orchestrator.pool_calls == []
+    assert db_session.query(Stock).count() == 0
+    assert db_session.query(PriceHistory).filter(PriceHistory.symbol.in_(["JPM", "BAC"])).count() > 0
+
+
+@pytest.mark.asyncio
+async def test_refresh_holdings_futu_source_uses_cached_prices_to_score(monkeypatch, db_session):
+    today = date.today()
+    now = datetime.utcnow()
+
+    etf = ETF(symbol="XLK", name="Technology", type="sector")
+    db_session.add(etf)
+    db_session.flush()
+
+    db_session.add_all(
+        [
+            ETFHolding(
+                etf_id=etf.id,
+                etf_symbol="XLK",
+                ticker="AAPL",
+                weight=6.0,
+                data_date=today,
+            ),
+            ETFHolding(
+                etf_id=etf.id,
+                etf_symbol="XLK",
+                ticker="MSFT",
+                weight=5.0,
+                data_date=today,
+            ),
+        ]
+    )
+    for ticker in ("AAPL", "MSFT"):
+        db_session.add(
+            ImportedData(
+                symbol=ticker,
+                date=today,
+                source="finviz",
+                data={"symbol": ticker},
+                created_at=now,
+            )
+        )
+        db_session.add(
+            ImportedData(
+                symbol=ticker,
+                date=today,
+                source="marketchameleon",
+                data={"symbol": ticker},
+                created_at=now,
+            )
+        )
+
+    for symbol in ("XLK", "AAPL", "MSFT"):
+        frame = _price_frame(symbol)
+        for _, row in frame.iterrows():
+            row_date = row["date"].date() if hasattr(row["date"], "date") else row["date"]
+            db_session.add(
+                PriceHistory(
+                    symbol=symbol,
+                    date=row_date,
+                    open=float(row["open"]),
+                    high=float(row["high"]),
+                    low=float(row["low"]),
+                    close=float(row["close"]),
+                    volume=int(row["volume"]),
+                    source="ibkr",
+                    created_at=now - timedelta(days=1),
+                )
+            )
+    db_session.commit()
+
+    futu = _BatchFutuStub(
+        {
+            "AAPL": IVTermResult(iv7=18.0, iv30=20.0, iv60=21.0, iv90=22.0, total_oi=1000),
+            "MSFT": IVTermResult(iv7=17.0, iv30=19.0, iv60=20.0, iv90=21.0, total_oi=2000),
+        }
+    )
+    orchestrator = _FutuScoreOrchestrator(futu=futu)
+    monkeypatch.setattr("app.services.orchestrator.get_orchestrator", lambda: orchestrator)
+
+    result = await refresh_holdings_by_coverage(
+        "XLK",
+        HoldingsCoverageRequest(coverage_type="top", coverage_value=2, refresh_source="futu"),
+        db=db_session,
+    )
+
+    assert result["status"] == "success"
+    assert result["refresh_source"] == "futu"
+    assert len(orchestrator.pool_calls) == 2
+    assert db_session.query(Stock).filter(Stock.symbol.in_(["AAPL", "MSFT"])).count() == 2
+    assert any(stock.get("score") is not None for stock in result["updated_stocks"])
 
 
 @pytest.mark.asyncio

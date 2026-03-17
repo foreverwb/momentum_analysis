@@ -45,8 +45,8 @@ async def refresh_job_manager(monkeypatch):
 async def test_refresh_job_manager_runs_etfs_serially(monkeypatch, refresh_job_manager: RefreshJobManager):
     calls = []
 
-    async def fake_refresh(symbol, db):
-        calls.append(symbol)
+    async def fake_refresh(symbol, refresh_source="all", db=None):
+        calls.append((symbol, refresh_source))
         await asyncio.sleep(0.01)
         return {
             "symbol": symbol,
@@ -56,17 +56,66 @@ async def test_refresh_job_manager_runs_etfs_serially(monkeypatch, refresh_job_m
 
     monkeypatch.setattr("app.api.etfs.refresh_etf_data", fake_refresh)
 
-    first_job = await refresh_job_manager.enqueue_etfs_job(["XLK", "XLF"], source="test")
-    second_job = await refresh_job_manager.enqueue_etfs_job(["SOXX"], source="test")
+    first_job = await refresh_job_manager.enqueue_etfs_job(
+        ["XLK", "XLF"],
+        source="test",
+        refresh_source="ibkr",
+    )
+    second_job = await refresh_job_manager.enqueue_etfs_job(
+        ["SOXX"],
+        source="test",
+        refresh_source="futu",
+    )
 
     first_result = await _wait_for_job_completion(refresh_job_manager, first_job["id"])
     second_result = await _wait_for_job_completion(refresh_job_manager, second_job["id"])
 
-    assert calls == ["XLK", "XLF", "SOXX"]
+    assert calls == [("XLK", "ibkr"), ("XLF", "ibkr"), ("SOXX", "futu")]
     assert first_result["status"] == "completed"
     assert first_result["result"]["summary_status"] == "success"
     assert second_result["status"] == "completed"
     assert second_result["result"]["summary_status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_enqueue_etf_refresh_job_api_accepts_refresh_source(
+    monkeypatch,
+    refresh_job_manager: RefreshJobManager,
+):
+    calls = []
+
+    async def fake_refresh(symbol, refresh_source="all", db=None):
+        calls.append((symbol, refresh_source))
+        return {
+            "symbol": symbol,
+            "status": "success",
+        }
+
+    monkeypatch.setattr("app.api.etfs.refresh_etf_data", fake_refresh)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(
+            "/api/refresh-jobs/etfs",
+            json={
+                "symbols": ["XLK", "SOXX"],
+                "refresh_source": "futu",
+            },
+        )
+
+    assert response.status_code == 202
+    payload = response.json()
+    job_id = payload["job"]["id"]
+    assert payload["status"] == "accepted"
+    assert payload["job"]["job_type"] == "etfs"
+
+    completed_job = await _wait_for_job_completion(refresh_job_manager, job_id)
+
+    assert calls == [("XLK", "futu"), ("SOXX", "futu")]
+    assert completed_job["status"] == "completed"
+    assert completed_job["result"]["summary_status"] == "success"
 
 
 @pytest.mark.asyncio
@@ -77,7 +126,7 @@ async def test_enqueue_holdings_refresh_job_api_accepts_and_completes(
     calls = []
 
     async def fake_refresh_holdings(symbol, request, db):
-        calls.append((symbol, request.coverage_type, request.coverage_value))
+        calls.append((symbol, request.coverage_type, request.coverage_value, request.refresh_source))
         return {
             "symbol": symbol,
             "coverage": (
@@ -99,7 +148,8 @@ async def test_enqueue_holdings_refresh_job_api_accepts_and_completes(
                 "items": [
                     {"symbol": "XLK", "coverage_type": "top", "coverage_value": 20},
                     {"symbol": "SOXX", "coverage_type": "all", "coverage_value": 0},
-                ]
+                ],
+                "refresh_source": "ibkr",
             },
         )
 
@@ -111,6 +161,6 @@ async def test_enqueue_holdings_refresh_job_api_accepts_and_completes(
 
     completed_job = await _wait_for_job_completion(refresh_job_manager, job_id)
 
-    assert calls == [("XLK", "top", 20), ("SOXX", "all", 0)]
+    assert calls == [("XLK", "top", 20, "ibkr"), ("SOXX", "all", 0, "ibkr")]
     assert completed_job["status"] == "completed"
     assert completed_job["result"]["summary_status"] == "success"

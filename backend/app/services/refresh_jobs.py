@@ -94,21 +94,34 @@ class RefreshJobManager:
         self._queued_job_ids.clear()
         logger.info("refresh_job_worker_stopped")
 
-    async def enqueue_etfs_job(self, symbols: List[Any], source: str = "cli") -> Dict[str, Any]:
+    async def enqueue_etfs_job(
+        self,
+        symbols: List[Any],
+        source: str = "cli",
+        refresh_source: str = "all",
+    ) -> Dict[str, Any]:
         normalized_symbols = _dedupe_symbols(symbols)
         if not normalized_symbols:
             raise ValueError("symbols 不能为空")
         job = self._create_job(
             job_type="etfs",
             source=source,
-            payload={"symbols": normalized_symbols},
+            payload={
+                "symbols": normalized_symbols,
+                "refresh_source": str(refresh_source or "all").strip().lower() or "all",
+            },
             progress_total=len(normalized_symbols),
         )
         await self.ensure_started()
         self._queue_job_id(job.id)
         return self.get_job(job.id) or {}
 
-    async def enqueue_holdings_job(self, items: List[Dict[str, Any]], source: str = "cli") -> Dict[str, Any]:
+    async def enqueue_holdings_job(
+        self,
+        items: List[Dict[str, Any]],
+        source: str = "cli",
+        refresh_source: str = "all",
+    ) -> Dict[str, Any]:
         normalized_items: List[Dict[str, Any]] = []
         for item in items:
             symbol = _normalize_symbol(item.get("symbol"))
@@ -140,7 +153,10 @@ class RefreshJobManager:
         job = self._create_job(
             job_type="holdings",
             source=source,
-            payload={"items": normalized_items},
+            payload={
+                "items": normalized_items,
+                "refresh_source": str(refresh_source or "all").strip().lower() or "all",
+            },
             progress_total=len(normalized_items),
         )
         await self.ensure_started()
@@ -251,6 +267,7 @@ class RefreshJobManager:
         from app.api.etfs import refresh_etf_data
 
         symbols = _dedupe_symbols((job.payload or {}).get("symbols") or [])
+        refresh_source = str((job.payload or {}).get("refresh_source") or "all").strip().lower() or "all"
         results: List[Dict[str, Any]] = []
         failures = 0
 
@@ -260,7 +277,7 @@ class RefreshJobManager:
             db.commit()
 
             try:
-                result = await refresh_etf_data(symbol, db)
+                result = await refresh_etf_data(symbol, refresh_source=refresh_source, db=db)
             except Exception as exc:
                 failures += 1
                 result = {
@@ -288,6 +305,7 @@ class RefreshJobManager:
         from app.api.etfs import HoldingsCoverageRequest, refresh_holdings_by_coverage
 
         items = (job.payload or {}).get("items") or []
+        refresh_source = str((job.payload or {}).get("refresh_source") or "all").strip().lower() or "all"
         results: List[Dict[str, Any]] = []
         failures = 0
 
@@ -308,6 +326,7 @@ class RefreshJobManager:
                     coverage_type=coverage_type,
                     coverage_value=coverage_value,
                     related_etf_symbols=item.get("related_etf_symbols") or [],
+                    refresh_source=refresh_source,
                 )
                 result = await refresh_holdings_by_coverage(symbol, request, db)
             except Exception as exc:

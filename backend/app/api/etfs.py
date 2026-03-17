@@ -15,7 +15,7 @@ import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 from datetime import date, datetime, timedelta, timezone
 from time import perf_counter
 from pydantic import BaseModel
@@ -404,6 +404,41 @@ def _build_refresh_gate_payload(state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _normalize_refresh_source(value: Any) -> Literal["all", "ibkr", "futu"]:
+    token = str(value or "all").strip().lower()
+    if token in {"ibkr", "futu"}:
+        return token
+    return "all"
+
+
+def _refresh_source_label(refresh_source: Literal["all", "ibkr", "futu"]) -> str:
+    if refresh_source == "ibkr":
+        return "IBKR"
+    if refresh_source == "futu":
+        return "Futu"
+    return "IBKR 与 Futu"
+
+
+def _refresh_source_data_label(refresh_source: Literal["all", "ibkr", "futu"]) -> str:
+    if refresh_source == "ibkr":
+        return "市场数据"
+    if refresh_source == "futu":
+        return "期权数据"
+    return "市场+期权数据"
+
+
+def _selected_refresh_gate_states(
+    refresh_source: Literal["all", "ibkr", "futu"],
+    ibkr_gate_state: Dict[str, Any],
+    futu_gate_state: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    if refresh_source == "ibkr":
+        return [ibkr_gate_state]
+    if refresh_source == "futu":
+        return [futu_gate_state]
+    return [ibkr_gate_state, futu_gate_state]
+
+
 def _filter_holdings_by_coverage(
     holdings: List[ETFHolding],
     coverage_type: str,
@@ -437,6 +472,7 @@ class HoldingsCoverageRequest(BaseModel):
     coverage_type: str
     coverage_value: int
     sources: Optional[List[str]] = None
+    refresh_source: Literal["all", "ibkr", "futu"] = "all"
     concurrent: Optional[bool] = None
     progress_token: Optional[str] = None
     related_etf_symbols: Optional[List[str]] = None
@@ -475,6 +511,43 @@ def _load_etf_score_result(payload: Any) -> Dict[str, Dict[str, Any]]:
     for key in score_result:
         score_result[key] = _normalize_etf_dimension(score_result[key], payload.get(key))
     return score_result
+
+
+def _build_existing_etf_score_view(
+    etf: ETF,
+    latest_snapshot: Optional[ScoreSnapshot],
+    *,
+    latest_ibkr_created_at: Optional[datetime] = None,
+    latest_futu_created_at: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    from app.services.calculators.etf_score import ETFScoreCalculator
+
+    score_result = _load_etf_score_result(
+        latest_snapshot.score_breakdown if latest_snapshot and isinstance(latest_snapshot.score_breakdown, dict) else None
+    )
+    calculator = ETFScoreCalculator()
+    thresholds_payload = calculator.check_thresholds(
+        rel_mom_data=score_result["rel_mom"],
+        trend_data=score_result["trend_quality"],
+        breadth_data=score_result["breadth"],
+    )
+    normalized_sources = {
+        "ibkr_price": latest_ibkr_created_at is not None,
+        "ibkr_relmom": score_result["rel_mom"].get("data") is not None,
+        "ibkr_trend": score_result["trend_quality"].get("data") is not None,
+        "futu_iv": latest_futu_created_at is not None or score_result["options_confirm"].get("data") is not None,
+        "finviz_breadth": score_result["breadth"].get("data") is not None,
+        "mc_options": False,
+    }
+    return {
+        "score": etf.score,
+        "rank": etf.rank,
+        "completeness": etf.completeness,
+        "thresholds_pass": latest_snapshot.thresholds_pass if latest_snapshot else bool(thresholds_payload.get("all_pass")),
+        "thresholds": thresholds_payload.get("details") or {},
+        "breakdown": score_result,
+        "data_sources": normalized_sources,
+    }
 
 
 def _get_latest_import_payload(
@@ -1303,6 +1376,7 @@ async def get_valid_sector_symbols():
 @router.post("/symbol/{symbol}/refresh", response_model=dict)
 async def refresh_etf_data(
     symbol: str,
+    refresh_source: Literal["all", "ibkr", "futu"] = "all",
     db: Session = Depends(get_db)
 ):
     """
@@ -1327,6 +1401,10 @@ async def refresh_etf_data(
     
     if not etf:
         raise HTTPException(status_code=404, detail=f"ETF '{symbol}' not found")
+
+    refresh_source = _normalize_refresh_source(refresh_source)
+    refresh_ibkr = refresh_source in {"all", "ibkr"}
+    refresh_futu = refresh_source in {"all", "futu"}
     
     # 跟踪数据完整性
     data_sources = {
@@ -1368,11 +1446,13 @@ async def refresh_etf_data(
         and score_result['trend_quality'].get('data') is not None
     )
     has_cached_futu_breakdown = score_result['options_confirm'].get('data') is not None
-    skip_ibkr_refresh = bool(ibkr_gate_state.get("is_recent")) and has_cached_ibkr_breakdown
-    skip_futu_refresh = bool(futu_gate_state.get("is_recent")) and (
+    skip_ibkr_refresh = refresh_ibkr and bool(ibkr_gate_state.get("is_recent")) and has_cached_ibkr_breakdown
+    skip_futu_refresh = refresh_futu and bool(futu_gate_state.get("is_recent")) and (
         has_cached_futu_breakdown or latest_futu_created_at is not None
     )
-    next_refresh_at = _pick_next_refresh_at([ibkr_gate_state, futu_gate_state])
+    next_refresh_at = _pick_next_refresh_at(
+        _selected_refresh_gate_states(refresh_source, ibkr_gate_state, futu_gate_state)
+    )
 
     if skip_ibkr_refresh:
         data_sources['ibkr_price'] = latest_ibkr_created_at is not None
@@ -1384,21 +1464,49 @@ async def refresh_etf_data(
             or score_result['options_confirm'].get('data') is not None
         )
 
-    if skip_ibkr_refresh and skip_futu_refresh:
+    if (not refresh_ibkr or skip_ibkr_refresh) and (not refresh_futu or skip_futu_refresh):
+        next_refresh_bjt = _format_beijing_time(next_refresh_at)
+        skip_message = (
+            f"{_refresh_source_label(refresh_source)} 数据在 {ETF_REFRESH_COOLDOWN_MINUTES} 分钟内已刷新，已跳过。"
+            + (f"下次可刷新时间（北京时间）{next_refresh_bjt}" if next_refresh_bjt else "")
+        )
+        if refresh_source == "ibkr":
+            current_view = _build_existing_etf_score_view(
+                etf,
+                latest_snapshot,
+                latest_ibkr_created_at=latest_ibkr_created_at,
+                latest_futu_created_at=latest_futu_created_at,
+            )
+            return {
+                "status": "snapshot",
+                "symbol": etf.symbol,
+                "refresh_source": refresh_source,
+                "message": skip_message,
+                "score": current_view["score"],
+                "rank": current_view["rank"],
+                "completeness": current_view["completeness"],
+                "thresholds_pass": current_view["thresholds_pass"],
+                "thresholds": current_view["thresholds"],
+                "breakdown": current_view["breakdown"],
+                "data_sources": current_view["data_sources"],
+                "next_refresh_at": _iso_utc(next_refresh_at),
+                "refresh_gate": {
+                    "cooldown_minutes": ETF_REFRESH_COOLDOWN_MINUTES,
+                    "ibkr": _build_refresh_gate_payload(ibkr_gate_state),
+                    "futu": _build_refresh_gate_payload(futu_gate_state),
+                },
+                "warnings": [skip_message],
+            }
         recalculated = _recalculate_etf_score_from_db(
             etf,
             db,
             base_breakdown=score_result,
             base_data_sources=data_sources,
         )
-        next_refresh_bjt = _format_beijing_time(next_refresh_at)
-        skip_message = (
-            f"IBKR 与 Futu 数据在 {ETF_REFRESH_COOLDOWN_MINUTES} 分钟内已刷新，已跳过。"
-            + (f"下次可刷新时间（北京时间）{next_refresh_bjt}" if next_refresh_bjt else "")
-        )
         return {
             "status": "snapshot",
             "symbol": etf.symbol,
+            "refresh_source": refresh_source,
             "message": skip_message,
             "score": recalculated["score"],
             "rank": recalculated["rank"],
@@ -1416,13 +1524,13 @@ async def refresh_etf_data(
         }
 
     warnings = []
-    if skip_ibkr_refresh:
+    if refresh_ibkr and skip_ibkr_refresh:
         next_ibkr_text = _format_beijing_time(_coerce_datetime(ibkr_gate_state.get("next_refresh_at")))
         warnings.append(
             f"IBKR 数据在 {ETF_REFRESH_COOLDOWN_MINUTES} 分钟内已刷新，跳过 IBKR 拉取"
             + (f"（北京时间可刷新时间 {next_ibkr_text}）" if next_ibkr_text else "")
         )
-    if skip_futu_refresh:
+    if refresh_futu and skip_futu_refresh:
         next_futu_text = _format_beijing_time(_coerce_datetime(futu_gate_state.get("next_refresh_at")))
         warnings.append(
             f"Futu 数据在 {ETF_REFRESH_COOLDOWN_MINUTES} 分钟内已刷新，跳过 Futu 拉取"
@@ -1434,9 +1542,9 @@ async def refresh_etf_data(
 
     price_df = None
     ibkr_started_at = perf_counter()
-    ibkr_price_log = "N/A (not_started)"
-    ibkr_relmom_log = "N/A (not_started)"
-    ibkr_trend_log = "N/A (not_started)"
+    ibkr_price_log = "N/A (not_requested)"
+    ibkr_relmom_log = "N/A (not_requested)"
+    ibkr_trend_log = "N/A (not_requested)"
 
     def _fmt_float(value: Optional[Any], digits: int = 2) -> str:
         if isinstance(value, (int, float)):
@@ -1447,8 +1555,8 @@ async def refresh_etf_data(
     ibkr_status = broker_status.get('ibkr', {})
     ibkr_connected = ibkr_status.get('is_connected', False)
     ibkr_disconnect_reason = ibkr_status.get('last_error')
-    
-    if (not skip_ibkr_refresh) and (not ibkr_connected):
+
+    if refresh_ibkr and (not skip_ibkr_refresh) and (not ibkr_connected):
         # 尝试连接 IBKR
         try:
             ibkr_connected = await orchestrator.connect_ibkr()
@@ -1460,7 +1568,9 @@ async def refresh_etf_data(
             warnings.append(f"IBKR 连接失败: {str(e)}")
             ibkr_disconnect_reason = str(e)
     
-    if skip_ibkr_refresh:
+    if not refresh_ibkr:
+        pass
+    elif skip_ibkr_refresh:
         ibkr_refresh_time = _format_beijing_time(_coerce_datetime(ibkr_gate_state.get("next_refresh_at")))
         ibkr_price_log = (
             f"N/A (skip_cooldown_until_bjt={ibkr_refresh_time})"
@@ -1658,8 +1768,8 @@ async def refresh_etf_data(
     
     # ==================== 2. 从 Futu 获取 IV 数据 ====================
     futu_connected = broker_status.get('futu', {}).get('is_connected', False)
-    
-    if (not skip_futu_refresh) and (not futu_connected):
+
+    if refresh_futu and (not skip_futu_refresh) and (not futu_connected):
         # 尝试连接 Futu
         try:
             futu_connected = await orchestrator.connect_futu()
@@ -1668,7 +1778,9 @@ async def refresh_etf_data(
         except Exception:
             pass  # Futu 是可选的
 
-    if skip_futu_refresh:
+    if not refresh_futu:
+        pass
+    elif skip_futu_refresh:
         pass
     elif futu_connected and orchestrator._futu:
         futu = orchestrator._futu
@@ -1755,6 +1867,44 @@ async def refresh_etf_data(
     else:
         warnings.append("Futu 未连接，使用默认期权评分")
     
+    score_should_recalculate = refresh_source == "all" or (
+        refresh_source == "futu"
+        and (skip_futu_refresh or data_sources["futu_iv"])
+    )
+    if not score_should_recalculate:
+        if refresh_source == "futu":
+            warnings.append("未获取到可用于评分的期权数据，已跳过评分计算")
+        current_view = _build_existing_etf_score_view(
+            etf,
+            latest_snapshot,
+            latest_ibkr_created_at=(
+                utc_now_naive() if data_sources["ibkr_price"] else latest_ibkr_created_at
+            ),
+            latest_futu_created_at=(
+                utc_now_naive() if data_sources["futu_iv"] else latest_futu_created_at
+            ),
+        )
+        return {
+            "status": "success",
+            "symbol": etf.symbol,
+            "refresh_source": refresh_source,
+            "message": f"ETF {etf.symbol} 的{_refresh_source_data_label(refresh_source)}已刷新，未触发评分计算",
+            "score": current_view["score"],
+            "rank": current_view["rank"],
+            "completeness": current_view["completeness"],
+            "thresholds_pass": current_view["thresholds_pass"],
+            "thresholds": current_view["thresholds"],
+            "breakdown": current_view["breakdown"],
+            "data_sources": current_view["data_sources"],
+            "warnings": warnings if warnings else None,
+            "next_refresh_at": _iso_utc(next_refresh_at),
+            "refresh_gate": {
+                "cooldown_minutes": ETF_REFRESH_COOLDOWN_MINUTES,
+                "ibkr": _build_refresh_gate_payload(ibkr_gate_state),
+                "futu": _build_refresh_gate_payload(futu_gate_state),
+            },
+        }
+
     recalculated = _recalculate_etf_score_from_db(
         etf,
         db,
@@ -1765,7 +1915,8 @@ async def refresh_etf_data(
     return {
         "status": "success",
         "symbol": etf.symbol,
-        "message": f"ETF {etf.symbol} 数据已刷新",
+        "refresh_source": refresh_source,
+        "message": f"ETF {etf.symbol} 的{_refresh_source_data_label(refresh_source)}已刷新并完成评分计算",
         "score": recalculated["score"],
         "rank": recalculated["rank"],
         "completeness": recalculated["completeness"],
@@ -2141,6 +2292,9 @@ async def refresh_holdings_by_coverage(
 
     coverage_type = request.coverage_type
     coverage_value = request.coverage_value
+    refresh_source = _normalize_refresh_source(request.refresh_source)
+    refresh_ibkr = refresh_source in {"all", "ibkr"}
+    refresh_futu = refresh_source in {"all", "futu"}
 
     # 获取最新的持仓数据
     from sqlalchemy import func
@@ -2182,13 +2336,19 @@ async def refresh_holdings_by_coverage(
                 "total": total_targets,
                 "failed": 0,
                 "current_item": "",
-                "message": "正在校验导入数据...",
+                "message": (
+                    "正在校验导入数据..."
+                    if refresh_source != "ibkr"
+                    else "正在准备 IBKR 刷新任务..."
+                ),
                 "started_at": _utc_now_iso(),
                 "finished_at": None,
             },
         )
 
-    # 刷新前置校验：当前覆盖范围下，Finviz + MarketChameleon 必须是北京时间 08:00 起算后的最新导入数据
+    # 评分型刷新前置校验：当前覆盖范围下，Finviz + MarketChameleon
+    # 必须是北京时间 08:00 起算后的最新导入数据。
+    # 对 source=ibkr 的纯价格刷新，只发现 fresh imports，不阻塞执行。
     def _beijing_import_boundary() -> Dict[str, Any]:
         return get_beijing_cutoff_boundary()
 
@@ -2213,6 +2373,7 @@ async def refresh_holdings_by_coverage(
         }
     )
     coverage_fresh_imports: Dict[str, set] = {}
+    require_scoring_imports = refresh_source != "ibkr"
     if coverage_symbols and coverage_query_symbols:
         boundary = _beijing_import_boundary()
         boundary_utc = boundary["boundary_utc"]
@@ -2253,8 +2414,9 @@ async def refresh_holdings_by_coverage(
 
         missing_finviz = [s for s in coverage_symbols if (s, "finviz") not in fresh_imports]
         missing_mc = [s for s in coverage_symbols if (s, "marketchameleon") not in fresh_imports]
+        coverage_fresh_imports = fresh_imports_by_symbol
 
-        if missing_finviz or missing_mc:
+        if require_scoring_imports and (missing_finviz or missing_mc):
             detail_parts = [
                 f"请先导入当前覆盖范围（{coverage_label}）Finviz 与 MarketChameleon 最新数据（北京时间 {boundary_bjt} 起算）"
             ]
@@ -2274,21 +2436,37 @@ async def refresh_holdings_by_coverage(
                 )
             raise HTTPException(status_code=400, detail=detail)
 
-        logger.info(
-            "refresh_holdings_import_guard_passed symbol=%s coverage=%s boundary_bjt=%s symbols=%s",
-            symbol.upper(),
-            coverage_label,
-            boundary_bjt,
-            len(coverage_symbols),
-        )
-        coverage_fresh_imports = fresh_imports_by_symbol
-        if progress_token:
-            _patch_holdings_refresh_progress(
-                progress_token,
-                {
-                    "message": f"导入校验通过，准备刷新 {len(filtered_holdings)} 个标的...",
-                },
+        if require_scoring_imports:
+            logger.info(
+                "refresh_holdings_import_guard_passed symbol=%s coverage=%s boundary_bjt=%s symbols=%s",
+                symbol.upper(),
+                coverage_label,
+                boundary_bjt,
+                len(coverage_symbols),
             )
+            if progress_token:
+                _patch_holdings_refresh_progress(
+                    progress_token,
+                    {
+                        "message": f"导入校验通过，准备刷新 {len(filtered_holdings)} 个标的...",
+                    },
+                )
+        else:
+            logger.info(
+                "refresh_holdings_import_guard_skipped symbol=%s coverage=%s refresh_source=%s fresh_finviz=%s fresh_mc=%s",
+                symbol.upper(),
+                coverage_label,
+                refresh_source,
+                len([s for s in coverage_symbols if (s, "finviz") in fresh_imports]),
+                len([s for s in coverage_symbols if (s, "marketchameleon") in fresh_imports]),
+            )
+            if progress_token:
+                _patch_holdings_refresh_progress(
+                    progress_token,
+                    {
+                        "message": f"IBKR-only 刷新跳过导入校验，准备刷新 {len(filtered_holdings)} 个标的...",
+                    },
+                )
 
     related_etf_symbols: List[str] = []
     if isinstance(request.related_etf_symbols, list):
@@ -2384,13 +2562,22 @@ async def refresh_holdings_by_coverage(
     futu_recent_all = bool(coverage_symbols) and all(
         bool(state.get("is_recent")) for state in futu_gate_by_symbol.values()
     )
-    if (not has_related_etf_scope) and ibkr_recent_all and futu_recent_all:
-        _recalculate_etf_score_from_db(etf, db)
-        all_gate_states = list(ibkr_gate_by_symbol.values()) + list(futu_gate_by_symbol.values())
-        next_refresh_at = _pick_next_refresh_at(all_gate_states)
+    selected_gate_states = (
+        list(ibkr_gate_by_symbol.values()) if refresh_source == "ibkr"
+        else list(futu_gate_by_symbol.values()) if refresh_source == "futu"
+        else list(ibkr_gate_by_symbol.values()) + list(futu_gate_by_symbol.values())
+    )
+    all_requested_recent = (
+        (not refresh_ibkr or ibkr_recent_all)
+        and (not refresh_futu or futu_recent_all)
+    )
+    if (not has_related_etf_scope) and all_requested_recent:
+        if refresh_source != "ibkr":
+            _recalculate_etf_score_from_db(etf, db)
+        next_refresh_at = _pick_next_refresh_at(selected_gate_states)
         next_refresh_bjt = _format_beijing_time(next_refresh_at)
         skip_message = (
-            f"IBKR 与 Futu 数据在 {HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟内已刷新，已跳过。"
+            f"{_refresh_source_label(refresh_source)} 数据在 {HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟内已刷新，已跳过。"
             + (f"下次可刷新时间（北京时间）{next_refresh_bjt}" if next_refresh_bjt else "")
         )
         if progress_token:
@@ -2409,6 +2596,7 @@ async def refresh_holdings_by_coverage(
         return {
             "status": "snapshot",
             "symbol": symbol.upper(),
+            "refresh_source": refresh_source,
             "coverage": coverage_label,
             "stocks_count": len(filtered_holdings),
             "total_weight": round(total_weight, 2),
@@ -2443,8 +2631,8 @@ async def refresh_holdings_by_coverage(
     recent_skip_symbol_set = {
         ticker
         for ticker in cooldown_scope_symbols
-        if bool(ibkr_gate_by_symbol.get(ticker, {}).get("is_recent"))
-        and bool(futu_gate_by_symbol.get(ticker, {}).get("is_recent"))
+        if (not refresh_ibkr or bool(ibkr_gate_by_symbol.get(ticker, {}).get("is_recent")))
+        and (not refresh_futu or bool(futu_gate_by_symbol.get(ticker, {}).get("is_recent")))
     }
     if has_related_etf_scope:
         ibkr_recent_duplicates = sum(
@@ -2454,13 +2642,14 @@ async def refresh_holdings_by_coverage(
             1 for ticker in cooldown_scope_symbols if bool(futu_gate_by_symbol.get(ticker, {}).get("is_recent"))
         )
         logger.info(
-            "refresh_holdings_duplicate_cooldown_eval symbol=%s coverage=%s duplicates=%s both_recent=%s ibkr_recent=%s futu_recent=%s",
+            "refresh_holdings_duplicate_cooldown_eval symbol=%s coverage=%s duplicates=%s requested_recent=%s ibkr_recent=%s futu_recent=%s refresh_source=%s",
             symbol.upper(),
             coverage_label,
             len(cooldown_scope_symbols),
             len(recent_skip_symbol_set),
             ibkr_recent_duplicates,
             futu_recent_duplicates,
+            refresh_source,
         )
     skipped_recent_holdings: List[ETFHolding] = []
     holdings_to_refresh: List[ETFHolding] = []
@@ -2481,10 +2670,13 @@ async def refresh_holdings_by_coverage(
         if has_related_etf_scope:
             skip_reason = (
                 f"同任务重复标的共 {duplicate_scope_count} 只，"
-                f"其中 {skipped_recent_count} 只在 {HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟冷却内已具备市场+期权数据"
+                f"其中 {skipped_recent_count} 只在 {HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟冷却内已具备{_refresh_source_data_label(refresh_source)}"
             )
         else:
-            skip_reason = f"已跳过 {skipped_recent_count} 只（{HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟内已有市场+期权数据）"
+            skip_reason = (
+                f"已跳过 {skipped_recent_count} 只"
+                f"（{HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟内已有{_refresh_source_data_label(refresh_source)}）"
+            )
         logger.info(
             "refresh_holdings_symbol_skip_recent symbol=%s coverage=%s skipped=%s total=%s cooldown_scope=%s preview=%s",
             symbol.upper(),
@@ -2689,14 +2881,17 @@ async def refresh_holdings_by_coverage(
             data_sources.append("finviz")
         if "marketchameleon" in imported_sources:
             data_sources.extend(["marketchameleon", "market_chameleon", "mc"])
-        data_sources.extend(["ibkr", "market_data", "futu", "options_data"])
+        if refresh_ibkr and bool(ibkr_gate_by_symbol.get(ticker, {}).get("is_recent")):
+            data_sources.extend(["ibkr", "market_data"])
+        if refresh_futu and bool(futu_gate_by_symbol.get(ticker, {}).get("is_recent")):
+            data_sources.extend(["futu", "options_data"])
         data_sources = list(dict.fromkeys(data_sources))
 
         latest_candidates = [
             dt
             for dt in (
-                ibkr_latest_map.get(ticker),
-                futu_latest_map.get(ticker),
+                ibkr_latest_map.get(ticker) if refresh_ibkr else None,
+                futu_latest_map.get(ticker) if refresh_futu else None,
             )
             if isinstance(dt, datetime)
         ]
@@ -2752,8 +2947,9 @@ async def refresh_holdings_by_coverage(
     skipped_recent_results = [_build_skipped_recent_result(holding) for holding in skipped_recent_holdings]
     for item in skipped_recent_results:
         logger.info(
-            "HOLDINGS- [SKIP] %s - 市场数据与期权数据在 %s 分钟冷却内，跳过抓取",
+            "HOLDINGS- [SKIP] %s - %s在 %s 分钟冷却内，跳过抓取",
             str(item.get("ticker") or "").upper(),
+            _refresh_source_data_label(refresh_source),
             HOLDINGS_REFRESH_COOLDOWN_MINUTES,
         )
 
@@ -2766,18 +2962,18 @@ async def refresh_holdings_by_coverage(
         _patch_holdings_refresh_progress(
             progress_token,
             {
-                "message": "正在连接/检查 IBKR 与 Futu...",
+                "message": f"正在连接/检查{_refresh_source_label(refresh_source)}...",
             },
         )
 
     broker_status = orchestrator.get_broker_status()
-    if not broker_status.get("ibkr", {}).get("is_connected", False):
+    if refresh_ibkr and not broker_status.get("ibkr", {}).get("is_connected", False):
         try:
             await orchestrator.connect_ibkr()
         except Exception as e:
             logger.warning(f"IBKR connect failed: {e}")
 
-    if not broker_status.get("futu", {}).get("is_connected", False):
+    if refresh_futu and not broker_status.get("futu", {}).get("is_connected", False):
         try:
             await orchestrator.connect_futu()
         except Exception as e:
@@ -2794,7 +2990,7 @@ async def refresh_holdings_by_coverage(
                 )
             else:
                 start_fetch_message = (
-                    f"已跳过 {skipped_recent_count} 只（{HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟内已有市场+期权数据），"
+                    f"已跳过 {skipped_recent_count} 只（{HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟内已有{_refresh_source_data_label(refresh_source)}），"
                     f"开始抓取剩余 {refresh_targets_count} 只..."
                 )
         _patch_holdings_refresh_progress(
@@ -2808,14 +3004,14 @@ async def refresh_holdings_by_coverage(
     sector_symbol = etf.parent_sector if etf.type == "industry" and etf.parent_sector else etf.symbol
     sector_df = _load_price_history(sector_symbol)
     ibkr_connected = orchestrator.get_broker_status().get("ibkr", {}).get("is_connected", False)
-    if not ibkr_connected:
+    if refresh_ibkr and not ibkr_connected:
         logger.warning(
             "refresh_holdings_ibkr_unavailable symbol=%s coverage=%s",
             symbol.upper(),
             coverage_label,
         )
     ibkr_price_timeout_seconds = 30
-    if sector_df is None and ibkr_connected:
+    if sector_df is None and refresh_ibkr and ibkr_connected:
         logger.info(
             "refresh_holdings_sector_prefetch symbol=%s coverage=%s sector_symbol=%s",
             symbol.upper(),
@@ -2848,25 +3044,30 @@ async def refresh_holdings_by_coverage(
 
     updated_stocks = list(skipped_recent_results)
     stock_semaphore = asyncio.Semaphore(5)  # 限制并发数为 5
-    futu_symbols = list(
-        dict.fromkeys(
-            str(holding.ticker).upper()
-            for holding in holdings_to_refresh
-            if isinstance(getattr(holding, "ticker", None), str) and holding.ticker.strip()
+    futu_symbols = (
+        list(
+            dict.fromkeys(
+                str(holding.ticker).upper()
+                for holding in holdings_to_refresh
+                if isinstance(getattr(holding, "ticker", None), str) and holding.ticker.strip()
+            )
         )
+        if refresh_futu
+        else []
     )
-    estimated_futu_seconds = estimate_iv_fetch_time(symbol_count=max(1, len(futu_symbols)))
-    futu_iv_timeout_seconds = max(45, int(estimated_futu_seconds + 15))
+    estimated_futu_seconds = estimate_iv_fetch_time(symbol_count=max(1, len(futu_symbols))) if futu_symbols else 0
+    futu_iv_timeout_seconds = max(45, int(estimated_futu_seconds + 15)) if futu_symbols else 45
     futu_chunk_count = math.ceil(len(futu_symbols) / HOLDINGS_FUTU_BATCH_SYMBOLS) if futu_symbols else 0
-    logger.info(
-        "refresh_holdings_futu_timeout_budget symbol=%s coverage=%s timeout_seconds=%s tickers=%s chunk_size=%s chunks=%s",
-        symbol.upper(),
-        coverage_label,
-        futu_iv_timeout_seconds,
-        len(futu_symbols),
-        HOLDINGS_FUTU_BATCH_SYMBOLS,
-        futu_chunk_count,
-    )
+    if futu_symbols:
+        logger.info(
+            "refresh_holdings_futu_timeout_budget symbol=%s coverage=%s timeout_seconds=%s tickers=%s chunk_size=%s chunks=%s",
+            symbol.upper(),
+            coverage_label,
+            futu_iv_timeout_seconds,
+            len(futu_symbols),
+            HOLDINGS_FUTU_BATCH_SYMBOLS,
+            futu_chunk_count,
+        )
 
     def _has_futu_payload(payload: Any) -> bool:
         if payload is None:
@@ -3022,7 +3223,7 @@ async def refresh_holdings_by_coverage(
     futu_unavailable_reason: Optional[str] = None
     futu_status = orchestrator.get_broker_status().get("futu", {})
     futu_connected = bool(futu_status.get("is_connected", False))
-    if futu_symbols:
+    if refresh_futu and futu_symbols:
         if futu_connected and orchestrator._futu and orchestrator._futu.is_connected():
             futu_iv_task = asyncio.create_task(_fetch_futu_iv_batches(futu_symbols))
         else:
@@ -3070,8 +3271,8 @@ async def refresh_holdings_by_coverage(
                 data_sources = list(dict.fromkeys(data_sources))
 
                 stock_df = None
-                ibkr_price_log = "N/A (not_connected)"
-                if ibkr_connected:
+                ibkr_price_log = "N/A (not_requested)"
+                if refresh_ibkr and ibkr_connected:
                     try:
                         # 获取股票的日线数据（用于动能评分）
                         stock_df = await asyncio.wait_for(
@@ -3116,7 +3317,10 @@ async def refresh_holdings_by_coverage(
                         latest_row = stock_df.iloc[-1]
                         price_data = float(latest_row.get('close', 0))
                         volume_data = float(latest_row.get('volume', 0))
-                        ibkr_price_log = f"N/A (not_connected; cache_rows={len(stock_df)})"
+                        if refresh_ibkr:
+                            ibkr_price_log = f"N/A (not_connected; cache_rows={len(stock_df)})"
+                        else:
+                            ibkr_price_log = f"N/A (not_requested; cache_rows={len(stock_df)})"
 
                 data_sources = list(dict.fromkeys(data_sources))
 
@@ -3257,9 +3461,27 @@ async def refresh_holdings_by_coverage(
                 },
             )
         futu_results, futu_failed_symbols, futu_batch_error = await asyncio.shield(futu_iv_task)
-    elif futu_symbols and futu_unavailable_reason:
+    elif refresh_futu and futu_symbols and futu_unavailable_reason:
         futu_failed_symbols = set(futu_symbols)
         futu_batch_error = futu_unavailable_reason
+
+    futu_ready_symbol_set: set[str] = set()
+    if refresh_source == "all":
+        futu_ready_symbol_set = set(coverage_symbols)
+    elif refresh_source == "futu":
+        futu_ready_symbol_set = {
+            ticker
+            for ticker in coverage_symbols
+            if bool(futu_gate_by_symbol.get(ticker, {}).get("is_recent"))
+        }
+        futu_ready_symbol_set.update(
+            ticker
+            for ticker, payload in futu_results.items()
+            if _has_futu_payload(payload)
+        )
+    score_calculation_enabled = refresh_source == "all" or (
+        refresh_source == "futu" and len(futu_ready_symbol_set) > 0
+    )
 
     for result in prefetched_results:
         holding_data = result.pop('holding_data', {})
@@ -3402,9 +3624,15 @@ async def refresh_holdings_by_coverage(
         if price_df is None:
             price_df = _load_price_history(result['ticker'])
 
-        if price_df is not None and not price_df.empty:
-            if 'ibkr' in data_sources_list:
-                _save_price_history(result['ticker'], price_df)
+        if price_df is not None and not price_df.empty and 'ibkr' in data_sources_list:
+            _save_price_history(result['ticker'], price_df)
+
+        if (
+            score_calculation_enabled
+            and price_df is not None
+            and not price_df.empty
+            and (refresh_source == "all" or ticker_text in futu_ready_symbol_set)
+        ):
 
             finviz_data = _get_imported(result['ticker'], 'finviz')
             mc_data = _get_imported(result['ticker'], 'marketchameleon')
@@ -3698,7 +3926,8 @@ async def refresh_holdings_by_coverage(
             )
 
     db.commit()
-    _recalculate_etf_score_from_db(etf, db)
+    if score_calculation_enabled:
+        _recalculate_etf_score_from_db(etf, db)
 
     # 评估覆盖范围的整体完整度
     holdings_with_data = [
@@ -3733,7 +3962,7 @@ async def refresh_holdings_by_coverage(
     else:
         final_message = (
             f"覆盖 {len(filtered_holdings)} 只持仓：刷新 {refreshed_count} 只，"
-            f"跳过 {skipped_recent_count} 只（{HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟内已有市场+期权数据），"
+            f"跳过 {skipped_recent_count} 只（{HOLDINGS_REFRESH_COOLDOWN_MINUTES} 分钟内已有{_refresh_source_data_label(refresh_source)}），"
             f"平均完备度 {round(coverage_completeness.average_completeness, 1)}%"
         )
     if futu_unavailable_reason:
@@ -3742,6 +3971,10 @@ async def refresh_holdings_by_coverage(
         final_message += f"（Futu 期权批量抓取异常: {futu_batch_error}）"
     elif futu_failed_count > 0:
         final_message += f"（Futu 期权数据部分缺失 {futu_failed_count} 只）"
+    if refresh_source == "ibkr":
+        final_message += "；未触发评分计算"
+    elif refresh_source == "futu" and not score_calculation_enabled:
+        final_message += "；未获取到可用于评分的期权数据，未触发评分计算"
 
     if progress_token:
         _patch_holdings_refresh_progress(
@@ -3759,6 +3992,7 @@ async def refresh_holdings_by_coverage(
     return {
         "status": "success",
         "symbol": symbol.upper(),
+        "refresh_source": refresh_source,
         "coverage": coverage_label,
         "stocks_count": len(filtered_holdings),
         "refreshed_stocks_count": refreshed_count,

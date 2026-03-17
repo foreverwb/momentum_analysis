@@ -168,10 +168,18 @@ def test_normalize_cli_argv_inserts_default_etfs_subcommand_for_legacy_provider_
     ]
 
 
-def test_parse_cli_args_accepts_short_refresh_entrypoint() -> None:
+def test_parse_cli_args_accepts_short_actualiser_entrypoint() -> None:
+    args = cli.parse_cli_args(["status", "12"], prog="Actualiser")
+
+    assert args.command == "Actualiser"
+    assert args.resource == "status"
+    assert args.job_id == 12
+
+
+def test_parse_cli_args_accepts_legacy_refresh_entrypoint() -> None:
     args = cli.parse_cli_args(["status", "12"], prog="refresh")
 
-    assert args.command == "refresh"
+    assert args.command == "Actualiser"
     assert args.resource == "status"
     assert args.job_id == 12
 
@@ -240,21 +248,131 @@ def test_parse_cli_args_rejects_uploads_when_both_file_forms_are_provided() -> N
 
 
 def test_parse_cli_args_accepts_refresh_etfs() -> None:
-    args = cli.parse_cli_args(["refresh", "etfs", "-s", "XLK,XLF"])
+    args = cli.parse_cli_args(["Actualiser", "etfs", "-s", "XLK,XLF"])
 
-    assert args.command == "refresh"
+    assert args.command == "Actualiser"
     assert args.resource == "etfs"
     assert args.symbols == "XLK,XLF"
+    assert args.source == "all"
     assert args.api_base == cli.DEFAULT_API_BASE_URL
 
 
-def test_parse_cli_args_accepts_refresh_holdings_defaults_coverage() -> None:
-    args = cli.parse_cli_args(["refresh", "holdings", "-s", "XLK,SOXX"])
+def test_parse_cli_args_accepts_refresh_etfs_without_symbols() -> None:
+    args = cli.parse_cli_args(["Actualiser", "etfs", "--source", "futu"])
 
-    assert args.command == "refresh"
+    assert args.command == "Actualiser"
+    assert args.resource == "etfs"
+    assert args.symbols is None
+    assert args.source == "futu"
+
+
+def test_parse_cli_args_accepts_refresh_holdings_defaults_coverage() -> None:
+    args = cli.parse_cli_args(["Actualiser", "holdings", "-s", "XLK,SOXX"])
+
+    assert args.command == "Actualiser"
     assert args.resource == "holdings"
     assert args.symbols == "XLK,SOXX"
     assert args.coverage == "t-20"
+    assert args.source == "all"
+
+
+def test_parse_cli_args_accepts_refresh_source_choices() -> None:
+    etf_args = cli.parse_cli_args(["Actualiser", "etfs", "-s", "XLK", "--source", "ibkr"])
+    holdings_args = cli.parse_cli_args(["Actualiser", "holdings", "-s", "SOXX", "--source", "futu"])
+
+    assert etf_args.source == "ibkr"
+    assert holdings_args.source == "futu"
+
+
+def test_cmd_refresh_etfs_posts_selected_source(monkeypatch, capsys) -> None:
+    captured = {}
+
+    def fake_http_json_request(method: str, url: str, payload=None, timeout: int = 10):
+        captured["method"] = method
+        captured["url"] = url
+        captured["payload"] = payload
+        captured["timeout"] = timeout
+        return {
+            "job": {
+                "id": 21,
+                "status": "pending",
+                "queue_position": 1,
+                "message": "任务已进入队列",
+            }
+        }
+
+    monkeypatch.setattr(cli, "_http_json_request", fake_http_json_request)
+
+    args = cli.parse_cli_args(
+        [
+            "Actualiser",
+            "etfs",
+            "-s",
+            "XLK,XLF",
+            "--source",
+            "ibkr",
+            "--api-base",
+            "http://127.0.0.1:8000",
+        ]
+    )
+    args.func(args)
+
+    assert captured["method"] == "POST"
+    assert captured["url"] == "http://127.0.0.1:8000/api/refresh-jobs/etfs"
+    assert captured["payload"] == {
+        "symbols": ["XLK", "XLF"],
+        "source": "cli",
+        "refresh_source": "ibkr",
+    }
+    assert captured["timeout"] == 10
+    assert "Job ID: 21" in capsys.readouterr().out
+
+
+def test_cmd_refresh_etfs_fetches_all_symbols_when_omitted(monkeypatch, capsys) -> None:
+    captured = {"calls": []}
+
+    def fake_http_json_request(method: str, url: str, payload=None, timeout: int = 10):
+        captured["calls"].append((method, url, payload, timeout))
+        if method == "GET":
+            return [
+                {"symbol": "XLK"},
+                {"symbol": "XLF"},
+                {"symbol": "SOXX"},
+            ]
+        return {
+            "job": {
+                "id": 22,
+                "status": "pending",
+                "queue_position": 1,
+                "message": "任务已进入队列",
+            }
+        }
+
+    monkeypatch.setattr(cli, "_http_json_request", fake_http_json_request)
+
+    args = cli.parse_cli_args(
+        [
+            "Actualiser",
+            "etfs",
+            "--source",
+            "futu",
+            "--api-base",
+            "http://127.0.0.1:8000",
+        ]
+    )
+    args.func(args)
+
+    assert captured["calls"][0] == ("GET", "http://127.0.0.1:8000/api/etfs", None, 10)
+    assert captured["calls"][1][0] == "POST"
+    assert captured["calls"][1][1] == "http://127.0.0.1:8000/api/refresh-jobs/etfs"
+    assert captured["calls"][1][2] == {
+        "symbols": ["XLK", "XLF", "SOXX"],
+        "source": "cli",
+        "refresh_source": "futu",
+    }
+    stdout = capsys.readouterr().out
+    assert "未提供 ETF 列表，已自动加载全部 ETF: 3 个" in stdout
+    assert "Job ID: 22" in stdout
 
 
 def test_cmd_refresh_holdings_posts_background_job(monkeypatch, capsys) -> None:
@@ -279,7 +397,7 @@ def test_cmd_refresh_holdings_posts_background_job(monkeypatch, capsys) -> None:
 
     args = cli.parse_cli_args(
         [
-            "refresh",
+            "Actualiser",
             "holdings",
             "-s",
             "XLK,SOXX",
@@ -309,6 +427,7 @@ def test_cmd_refresh_holdings_posts_background_job(monkeypatch, capsys) -> None:
             },
         ],
         "source": "cli",
+        "refresh_source": "all",
     }
     assert captured["timeout"] == 10
 
@@ -362,7 +481,7 @@ def test_cmd_refresh_holdings_prints_immediate_failure_details(monkeypatch, caps
 
     args = cli.parse_cli_args(
         [
-            "refresh",
+            "Actualiser",
             "holdings",
             "-s",
             "SOXX,SMH,IGV",
@@ -437,7 +556,7 @@ def test_cmd_refresh_list_builds_query_params(monkeypatch, capsys) -> None:
 
     args = cli.parse_cli_args(
         [
-            "refresh",
+            "Actualiser",
             "list",
             "--status",
             "running",
@@ -451,7 +570,7 @@ def test_cmd_refresh_list_builds_query_params(monkeypatch, capsys) -> None:
 
     assert captured["method"] == "GET"
     assert captured["url"] == "http://127.0.0.1:8000/api/refresh-jobs?limit=5&status=running"
-    assert "暂无 refresh jobs" in capsys.readouterr().out
+    assert "暂无刷新任务" in capsys.readouterr().out
 
 
 def test_cmd_refresh_status_prints_failed_item_details(monkeypatch, capsys) -> None:
@@ -491,7 +610,7 @@ def test_cmd_refresh_status_prints_failed_item_details(monkeypatch, capsys) -> N
 
     args = cli.parse_cli_args(
         [
-            "refresh",
+            "Actualiser",
             "status",
             "7",
             "--api-base",

@@ -7,8 +7,8 @@ Momentum Radar 命令行工具
 - update: 更新 ETF Holdings 数据（与 uploads 相同，更语义化的命令）
 - finviz etfs: 导入 Finviz JSON/CSV ETF 数据
 - mc etfs: 导入 MarketChameleon ETF 数据（支持整文件或按覆盖范围导入）
-- refresh etfs: 后台串行刷新多个 ETF
-- refresh holdings: 后台串行刷新多个 ETF holdings
+- Actualiser etfs: 后台串行刷新多个 ETF
+- Actualiser holdings: 后台串行刷新多个 ETF holdings
 - init: 初始化数据库和默认数据
 
 使用示例:
@@ -33,9 +33,9 @@ Momentum Radar 命令行工具
     python -m app.cli finviz etfs -f finviz_export.csv
     python -m app.cli finviz etfs -s "XLK,XLC,XLV" -w 85 -f finviz_export.csv
 
-    # 后台提交 refresh 任务（命令立即返回）
-    python -m app.cli refresh etfs -s "XLK,XLF,SOXX"
-    python -m app.cli refresh holdings -s "XLK,SOXX" -w t-20
+    # 后台提交刷新任务（命令立即返回）
+    python -m app.cli Actualiser etfs -s "XLK,XLF,SOXX"
+    python -m app.cli Actualiser holdings -s "XLK,SOXX" -w t-20
 
     # 初始化数据库
     python -m app.cli init
@@ -65,6 +65,9 @@ DEFAULT_API_BASE_URL = os.environ.get("MOMENTUM_API_BASE_URL", "http://127.0.0.1
 REFRESH_JOB_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 REFRESH_POST_SUBMIT_POLL_SECONDS = 2.0
 REFRESH_POST_SUBMIT_POLL_INTERVAL_SECONDS = 0.25
+ACTUALISER_COMMAND = "Actualiser"
+LEGACY_REFRESH_COMMANDS = {"refresh", "actualiser"}
+ALL_REFRESH_COMMANDS = {ACTUALISER_COMMAND, *LEGACY_REFRESH_COMMANDS}
 
 # 添加 backend 根目录到 Python 路径，兼容直接执行 app/cli.py。
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -81,7 +84,7 @@ TOP_LEVEL_COMMANDS = {
     "list-holdings",
     "finviz",
     "mc",
-    "refresh",
+    *ALL_REFRESH_COMMANDS,
 }
 FILE_PREFIX_ATTR_BY_COMMAND = {
     "uploads": "holdings_file_prefix",
@@ -246,6 +249,9 @@ def normalize_cli_argv(argv=None, prog: str | None = None) -> list:
 
 
 def _finalize_cli_args(parser: argparse.ArgumentParser, args):
+    if getattr(args, "command", None) in LEGACY_REFRESH_COMMANDS:
+        args.command = ACTUALISER_COMMAND
+
     if args.command in {"uploads", "update"}:
         positional_file = getattr(args, "file_arg", None)
         optional_file = getattr(args, "file", None)
@@ -535,7 +541,7 @@ def _normalize_api_base_url(raw_url: str) -> str:
     return base_url.rstrip("/")
 
 
-def _http_json_request(method: str, url: str, payload=None, timeout: int = 10) -> dict:
+def _http_json_request(method: str, url: str, payload=None, timeout: int = 10):
     headers = {"Accept": "application/json"}
     body = None
     if payload is not None:
@@ -657,22 +663,49 @@ def _poll_refresh_job_until_terminal(
             return job
 
 
+def _fetch_all_etf_symbols(api_base: str, *, timeout: int) -> list[str]:
+    response = _http_json_request(
+        "GET",
+        f"{api_base}/api/etfs",
+        timeout=timeout,
+    )
+    items = response if isinstance(response, list) else response.get("items") if isinstance(response, dict) else None
+    if not isinstance(items, list):
+        raise RuntimeError("无法从后端获取 ETF 列表")
+
+    symbols = parse_etf_symbols(
+        ",".join(
+            str(item.get("symbol") or "").strip()
+            for item in items
+            if isinstance(item, dict) and str(item.get("symbol") or "").strip()
+        )
+    )
+    if not symbols:
+        raise RuntimeError("后端未返回可刷新的 ETF 列表")
+    return symbols
+
+
 def cmd_refresh_etfs(args):
-    symbols = parse_etf_symbols(args.symbols)
     api_base = _normalize_api_base_url(args.api_base)
+    if args.symbols:
+        symbols = parse_etf_symbols(args.symbols)
+    else:
+        symbols = _fetch_all_etf_symbols(api_base, timeout=args.timeout)
+        print(f"未提供 ETF 列表，已自动加载全部 ETF: {len(symbols)} 个")
     response = _http_json_request(
         "POST",
         f"{api_base}/api/refresh-jobs/etfs",
         payload={
             "symbols": symbols,
             "source": "cli",
+            "refresh_source": args.source,
         },
         timeout=args.timeout,
     )
     job = response.get("job") or {}
     _print_refresh_job_summary(
         job,
-        command_hint=f"python -m app.cli refresh status {job.get('id')} --api-base {api_base}",
+        command_hint=f"python -m app.cli {ACTUALISER_COMMAND} status {job.get('id')} --api-base {api_base}",
     )
 
 
@@ -694,12 +727,13 @@ def cmd_refresh_holdings(args):
                 for symbol in symbols
             ],
             "source": "cli",
+            "refresh_source": args.source,
         },
         timeout=args.timeout,
     )
     job = response.get("job") or {}
-    command_hint = f"python -m app.cli refresh status {job.get('id')} --api-base {api_base}"
-    print(f"已提交 holdings refresh: {','.join(symbols)} ({coverage_label})")
+    command_hint = f"python -m app.cli {ACTUALISER_COMMAND} status {job.get('id')} --api-base {api_base}"
+    print(f"已提交 holdings 刷新任务: {','.join(symbols)} ({coverage_label})")
     _print_refresh_job_summary(
         job,
         command_hint=command_hint,
@@ -760,7 +794,7 @@ def cmd_refresh_list(args):
     )
     items = response.get("items") or []
     if not items:
-        print("暂无 refresh jobs")
+        print("暂无刷新任务")
         return
 
     print(f"{'ID':<6} {'TYPE':<10} {'STATUS':<12} {'PROGRESS':<14} {'QUEUE':<8} MESSAGE")
@@ -1882,14 +1916,14 @@ def build_parser():
   python -m app.cli mc etfs -s "XLK,XLC,XLV" -w t-10 -f marketchameleon.json
 
   # 激活 backend 虚拟环境并执行 ./bin/install-cli-shortcuts 后，可直接使用短命令
-  refresh etfs -s "XLK,XLF,SOXX"
+  Actualiser etfs -s "XLK,XLF,SOXX"
   finviz -f export.csv
   mc -f marketchameleon.json
 
-  # 后台提交 refresh 任务（命令不会等待刷新完成）
-  python -m app.cli refresh etfs -s "XLK,XLF,SOXX"
-  python -m app.cli refresh holdings -s "XLK,SOXX" -w t-20
-  python -m app.cli refresh status 12
+  # 后台提交刷新任务（命令不会等待刷新完成）
+  python -m app.cli Actualiser etfs -s "XLK,XLF,SOXX"
+  python -m app.cli Actualiser holdings -s "XLK,SOXX" -w t-20
+  python -m app.cli Actualiser status 12
 
   # 旧写法仍兼容，会自动按 etfs 处理
   python -m app.cli finviz -f finviz_export.csv
@@ -2029,8 +2063,9 @@ def build_parser():
     import_mc_parser.set_defaults(func=cmd_import_mc)
 
     refresh_parser = subparsers.add_parser(
-        'refresh',
-        help='提交后台 refresh 任务并由服务端串行执行'
+        ACTUALISER_COMMAND,
+        aliases=sorted(LEGACY_REFRESH_COMMANDS),
+        help='提交后台刷新任务并由服务端串行执行'
     )
     refresh_subparsers = refresh_parser.add_subparsers(dest='resource')
     refresh_subparsers.required = True
@@ -2040,8 +2075,12 @@ def build_parser():
         help='后台刷新多个 ETF，命令提交后立即返回'
     )
     refresh_etfs_parser.add_argument(
-        '-s', '--symbols', required=True,
-        help='ETF 列表，逗号分隔（如 "XLK,XLF,SOXX"）'
+        '-s', '--symbols', required=False,
+        help='ETF 列表，逗号分隔（如 "XLK,XLF,SOXX"）；省略时默认刷新全部 ETF'
+    )
+    refresh_etfs_parser.add_argument(
+        '--source', choices=['all', 'ibkr', 'futu'], default='all',
+        help='刷新数据源，默认 all'
     )
     refresh_etfs_parser.add_argument(
         '--api-base', default=DEFAULT_API_BASE_URL,
@@ -2066,6 +2105,10 @@ def build_parser():
         help='覆盖范围，支持 t-20 / 85 / all，默认 t-20'
     )
     refresh_holdings_parser.add_argument(
+        '--source', choices=['all', 'ibkr', 'futu'], default='all',
+        help='刷新数据源，默认 all'
+    )
+    refresh_holdings_parser.add_argument(
         '--api-base', default=DEFAULT_API_BASE_URL,
         help=f'后端 API 地址，默认 {DEFAULT_API_BASE_URL}'
     )
@@ -2077,7 +2120,7 @@ def build_parser():
 
     refresh_status_parser = refresh_subparsers.add_parser(
         'status',
-        help='查看后台 refresh job 状态'
+        help='查看后台刷新任务状态'
     )
     refresh_status_parser.add_argument('job_id', type=int, help='job id')
     refresh_status_parser.add_argument(
@@ -2096,7 +2139,7 @@ def build_parser():
 
     refresh_list_parser = refresh_subparsers.add_parser(
         'list',
-        help='列出最近的后台 refresh jobs'
+        help='列出最近的后台刷新任务'
     )
     refresh_list_parser.add_argument(
         '--status', choices=['pending', 'running', 'completed', 'failed'],
