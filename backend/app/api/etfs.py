@@ -3498,15 +3498,35 @@ async def refresh_holdings_by_coverage(
             result['iv60'] = getattr(futu_payload, 'iv60', None)
             result['iv90'] = getattr(futu_payload, 'iv90', None)
             result['total_oi'] = getattr(futu_payload, 'total_oi', None)
+            result['risk_total_oi'] = getattr(futu_payload, 'risk_total_oi', None)
             result['oi_bucket_0_7'] = getattr(futu_payload, 'oi_bucket_0_7', None)
             result['oi_bucket_8_30'] = getattr(futu_payload, 'oi_bucket_8_30', None)
             result['oi_bucket_31_90'] = getattr(futu_payload, 'oi_bucket_31_90', None)
+            result['risk_oi_bucket_0_7'] = getattr(futu_payload, 'risk_oi_bucket_0_7', None)
+            result['risk_oi_bucket_8_30'] = getattr(futu_payload, 'risk_oi_bucket_8_30', None)
+            result['risk_oi_bucket_31_90'] = getattr(futu_payload, 'risk_oi_bucket_31_90', None)
             result['call_oi_bucket_0_7'] = getattr(futu_payload, 'call_oi_bucket_0_7', None)
             result['call_oi_bucket_8_30'] = getattr(futu_payload, 'call_oi_bucket_8_30', None)
             result['call_oi_bucket_31_90'] = getattr(futu_payload, 'call_oi_bucket_31_90', None)
             result['put_oi_bucket_0_7'] = getattr(futu_payload, 'put_oi_bucket_0_7', None)
             result['put_oi_bucket_8_30'] = getattr(futu_payload, 'put_oi_bucket_8_30', None)
             result['put_oi_bucket_31_90'] = getattr(futu_payload, 'put_oi_bucket_31_90', None)
+            result['delta_oi_1d'] = getattr(futu_payload, 'delta_oi_1d', None)
+            result['net_delta_oi_0_7'] = getattr(futu_payload, 'net_delta_oi_0_7', None)
+            result['net_delta_oi_8_30'] = getattr(futu_payload, 'net_delta_oi_8_30', None)
+            result['net_delta_oi_31_90'] = getattr(futu_payload, 'net_delta_oi_31_90', None)
+            result['call_delta_oi_0_7'] = getattr(futu_payload, 'call_delta_oi_0_7', None)
+            result['call_delta_oi_8_30'] = getattr(futu_payload, 'call_delta_oi_8_30', None)
+            result['call_delta_oi_31_90'] = getattr(futu_payload, 'call_delta_oi_31_90', None)
+            result['put_delta_oi_0_7'] = getattr(futu_payload, 'put_delta_oi_0_7', None)
+            result['put_delta_oi_8_30'] = getattr(futu_payload, 'put_delta_oi_8_30', None)
+            result['put_delta_oi_31_90'] = getattr(futu_payload, 'put_delta_oi_31_90', None)
+            result['net_delta3d_0_7'] = getattr(futu_payload, 'net_delta3d_0_7', None)
+            result['net_delta3d_8_30'] = getattr(futu_payload, 'net_delta3d_8_30', None)
+            result['net_delta3d_31_90'] = getattr(futu_payload, 'net_delta3d_31_90', None)
+            result['net_delta5d_0_7'] = getattr(futu_payload, 'net_delta5d_0_7', None)
+            result['net_delta5d_8_30'] = getattr(futu_payload, 'net_delta5d_8_30', None)
+            result['net_delta5d_31_90'] = getattr(futu_payload, 'net_delta5d_31_90', None)
             result['data_sources'] = list(dict.fromkeys([*(result.get('data_sources') or []), 'futu']))
             futu_failed_flag = False
         else:
@@ -3539,26 +3559,6 @@ async def refresh_holdings_by_coverage(
         if 'futu' in data_sources_list:
             today = beijing_today()
             ticker_upper = str(result['ticker']).upper()
-            total_oi_int = _as_int(result.get('total_oi'))
-            bucket_totals = _extract_bucket_totals(result)
-            delta_payload = _compute_bucket_delta_payload(
-                ticker=ticker_upper,
-                today=today,
-                bucket_totals=bucket_totals,
-                total_oi_value=total_oi_int,
-            )
-
-            for suffix in ("0_7", "8_30", "31_90"):
-                result[f"oi_bucket_{suffix}"] = bucket_totals[suffix]["net"]
-                result[f"call_oi_bucket_{suffix}"] = bucket_totals[suffix]["call"]
-                result[f"put_oi_bucket_{suffix}"] = bucket_totals[suffix]["put"]
-                result[f"net_delta_oi_{suffix}"] = delta_payload["by_bucket"][suffix]["net_1d"]
-                result[f"call_delta_oi_{suffix}"] = delta_payload["by_bucket"][suffix]["call_1d"]
-                result[f"put_delta_oi_{suffix}"] = delta_payload["by_bucket"][suffix]["put_1d"]
-                result[f"net_delta3d_{suffix}"] = delta_payload["by_bucket"][suffix]["net_3d"]
-                result[f"net_delta5d_{suffix}"] = delta_payload["by_bucket"][suffix]["net_5d"]
-            result["delta_oi_1d"] = delta_payload.get("total_oi_1d")
-
             existing_iv = db.query(IVData).filter(
                 IVData.symbol == ticker_upper,
                 IVData.date == today,

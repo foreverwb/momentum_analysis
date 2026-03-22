@@ -582,7 +582,8 @@ def calculate_positioning_score_from_iv(iv_info: Any) -> Tuple[float, Dict[str, 
     call_put_imbalance: List[float] = []
 
     for suffix in ('0_7', '8_30', '31_90'):
-        bucket_total = _extract_iv_field(iv_info, f'oi_bucket_{suffix}')
+        risk_bucket_total = _extract_iv_field(iv_info, f'risk_oi_bucket_{suffix}')
+        bucket_total = risk_bucket_total if risk_bucket_total is not None else _extract_iv_field(iv_info, f'oi_bucket_{suffix}')
         call_delta_1d = _extract_iv_field(iv_info, f'call_delta_oi_{suffix}')
         put_delta_1d = _extract_iv_field(iv_info, f'put_delta_oi_{suffix}')
         delta3d = _extract_iv_field(iv_info, f'net_delta3d_{suffix}')
@@ -629,6 +630,7 @@ def calculate_positioning_score_from_iv(iv_info: Any) -> Tuple[float, Dict[str, 
         details[f'call_delta_oi_{suffix}'] = call_delta_1d
         details[f'put_delta_oi_{suffix}'] = put_delta_1d
         details[f'oi_bucket_{suffix}'] = bucket_total
+        details[f'risk_oi_bucket_{suffix}'] = risk_bucket_total
 
     positioning_raw = sum(components) if components else 0.0
     score = 50.0 + positioning_raw * 380.0

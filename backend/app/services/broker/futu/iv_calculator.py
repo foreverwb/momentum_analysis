@@ -4,8 +4,9 @@ Futu IV term and OI/delta-OI calculations.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
+import json
 import re
 import sqlite3
 import threading
@@ -31,9 +32,13 @@ class IVTermResult:
     iv60: Optional[float] = None
     iv90: Optional[float] = None
     total_oi: Optional[int] = None
+    risk_total_oi: Optional[int] = None
     oi_bucket_0_7: Optional[int] = None
     oi_bucket_8_30: Optional[int] = None
     oi_bucket_31_90: Optional[int] = None
+    risk_oi_bucket_0_7: Optional[int] = None
+    risk_oi_bucket_8_30: Optional[int] = None
+    risk_oi_bucket_31_90: Optional[int] = None
     call_oi_bucket_0_7: Optional[int] = None
     call_oi_bucket_8_30: Optional[int] = None
     call_oi_bucket_31_90: Optional[int] = None
@@ -66,9 +71,14 @@ class IVTermResult:
     delta_oi_bucket_0_7_5d: Optional[int] = None
     delta_oi_bucket_8_30_5d: Optional[int] = None
     delta_oi_bucket_31_90_5d: Optional[int] = None
+    _snapshot_payload: Optional[Dict[str, Any]] = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        return {
+            key: value
+            for key, value in asdict(self).items()
+            if not key.startswith("_")
+        }
 
     def is_valid(self) -> bool:
         return any([self.iv7 is not None, self.iv30 is not None, self.iv60 is not None, self.iv90 is not None])
@@ -312,41 +322,34 @@ class FutuIVCalculator:
         iv60 = self._interpolate_iv(points, 60)
         iv90 = self._interpolate_iv(points, 90)
 
-        bucket_components = self._sum_open_interest_bucket_components(expirations, snapshot_map, today)
-        bucket_0_7 = bucket_components["0-7"]["total"]
-        bucket_8_30 = bucket_components["8-30"]["total"]
-        bucket_31_90 = bucket_components["31-90"]["total"]
-        call_bucket_0_7 = bucket_components["0-7"]["call"]
-        call_bucket_8_30 = bucket_components["8-30"]["call"]
-        call_bucket_31_90 = bucket_components["31-90"]["call"]
-        put_bucket_0_7 = bucket_components["0-7"]["put"]
-        put_bucket_8_30 = bucket_components["8-30"]["put"]
-        put_bucket_31_90 = bucket_components["31-90"]["put"]
-        bucket_values = [v for v in [bucket_0_7, bucket_8_30, bucket_31_90] if v is not None]
-        if bucket_values:
-            total_oi = sum(bucket_values)
-        elif fetch_meta.failed_requests == 0:
-            total_oi = self._sum_open_interest(snapshot_map)
-        else:
-            # Do not emit potentially biased OI when option-chain fetch is partial.
-            total_oi = None
-
-        return IVTermResult(
+        snapshot_payload = self._build_oi_snapshot_payload(
+            symbol=symbol,
+            expirations=expirations,
+            snapshot_map=snapshot_map,
+            today=today,
+        )
+        result = IVTermResult(
             iv7=iv7,
             iv30=iv30,
             iv60=iv60,
             iv90=iv90,
-            total_oi=total_oi,
-            oi_bucket_0_7=bucket_0_7,
-            oi_bucket_8_30=bucket_8_30,
-            oi_bucket_31_90=bucket_31_90,
-            call_oi_bucket_0_7=call_bucket_0_7,
-            call_oi_bucket_8_30=call_bucket_8_30,
-            call_oi_bucket_31_90=call_bucket_31_90,
-            put_oi_bucket_0_7=put_bucket_0_7,
-            put_oi_bucket_8_30=put_bucket_8_30,
-            put_oi_bucket_31_90=put_bucket_31_90,
+            total_oi=self._as_int(snapshot_payload.get("total_oi")),
+            risk_total_oi=self._as_int(snapshot_payload.get("risk_total_oi")),
+            oi_bucket_0_7=self._extract_snapshot_bucket_metric(snapshot_payload, "0_7", "net"),
+            oi_bucket_8_30=self._extract_snapshot_bucket_metric(snapshot_payload, "8_30", "net"),
+            oi_bucket_31_90=self._extract_snapshot_bucket_metric(snapshot_payload, "31_90", "net"),
+            risk_oi_bucket_0_7=self._extract_snapshot_bucket_metric(snapshot_payload, "0_7", "risk_net"),
+            risk_oi_bucket_8_30=self._extract_snapshot_bucket_metric(snapshot_payload, "8_30", "risk_net"),
+            risk_oi_bucket_31_90=self._extract_snapshot_bucket_metric(snapshot_payload, "31_90", "risk_net"),
+            call_oi_bucket_0_7=self._extract_snapshot_bucket_metric(snapshot_payload, "0_7", "call"),
+            call_oi_bucket_8_30=self._extract_snapshot_bucket_metric(snapshot_payload, "8_30", "call"),
+            call_oi_bucket_31_90=self._extract_snapshot_bucket_metric(snapshot_payload, "31_90", "call"),
+            put_oi_bucket_0_7=self._extract_snapshot_bucket_metric(snapshot_payload, "0_7", "put"),
+            put_oi_bucket_8_30=self._extract_snapshot_bucket_metric(snapshot_payload, "8_30", "put"),
+            put_oi_bucket_31_90=self._extract_snapshot_bucket_metric(snapshot_payload, "31_90", "put"),
         )
+        result._snapshot_payload = snapshot_payload
+        return result
 
     def _compute_bucket_delta_payload(
         self,
@@ -356,7 +359,9 @@ class FutuIVCalculator:
         cache: Dict[str, Dict[str, Any]],
     ) -> Dict[str, Any]:
         today_str = today.strftime("%Y-%m-%d")
-        current_snapshot = self._build_snapshot_from_result(result)
+        current_snapshot = self._normalize_snapshot_payload(getattr(result, "_snapshot_payload", None))
+        if current_snapshot is None:
+            current_snapshot = self._build_snapshot_from_result(result)
         previous_snapshot = self._find_latest_snapshot_before(
             symbol=symbol,
             before_date=today_str,
@@ -371,19 +376,18 @@ class FutuIVCalculator:
         )
 
         history_entries = self._get_symbol_entries(symbol=symbol, cache=cache)
-        total_oi_1d = self._delta(
-            current_snapshot.get("total_oi"),
-            (previous_snapshot or {}).get("total_oi"),
+        current_delta_summary = self._summarize_contract_delta(
+            current_snapshot=current_snapshot,
+            previous_snapshot=previous_snapshot,
         )
+        total_oi_1d = current_delta_summary.get("total_1d")
 
         by_bucket: Dict[str, Dict[str, Optional[int]]] = {}
         for suffix in self.BUCKET_SUFFIXES:
-            current_bucket = (current_snapshot.get("buckets") or {}).get(suffix, {})
-            prev_bucket = ((previous_snapshot or {}).get("buckets") or {}).get(suffix, {})
-
-            raw_net_1d = self._delta(current_bucket.get("net"), prev_bucket.get("net"))
-            raw_call_1d = self._delta(current_bucket.get("call"), prev_bucket.get("call"))
-            raw_put_1d = self._delta(current_bucket.get("put"), prev_bucket.get("put"))
+            summary_bucket = (current_delta_summary.get("by_bucket") or {}).get(suffix, {})
+            raw_net_1d = self._as_int(summary_bucket.get("net"))
+            raw_call_1d = self._as_int(summary_bucket.get("call"))
+            raw_put_1d = self._as_int(summary_bucket.get("put"))
 
             daily_net_series = self._build_daily_delta_series(
                 entries=history_entries,
@@ -425,15 +429,22 @@ class FutuIVCalculator:
             setattr(result, f"delta_oi_bucket_{suffix}_5d", bucket_payload.get("net_5d"))
 
     def _build_snapshot_from_result(self, result: IVTermResult) -> Dict[str, Any]:
+        internal_snapshot = self._normalize_snapshot_payload(getattr(result, "_snapshot_payload", None))
+        if internal_snapshot is not None:
+            return internal_snapshot
+
         snapshot = {
             "total_oi": self._as_int(result.total_oi),
+            "risk_total_oi": self._as_int(getattr(result, "risk_total_oi", None)),
             "buckets": {},
+            "contracts": {},
         }
 
         for suffix in self.BUCKET_SUFFIXES:
             net_value = self._as_int(getattr(result, f"oi_bucket_{suffix}", None))
             call_value = self._as_int(getattr(result, f"call_oi_bucket_{suffix}", None))
             put_value = self._as_int(getattr(result, f"put_oi_bucket_{suffix}", None))
+            risk_net_value = self._as_int(getattr(result, f"risk_oi_bucket_{suffix}", None))
 
             if net_value is None and call_value is not None and put_value is not None:
                 net_value = call_value + put_value
@@ -442,6 +453,7 @@ class FutuIVCalculator:
                 "net": net_value,
                 "call": call_value,
                 "put": put_value,
+                "risk_net": risk_net_value,
             }
 
         if snapshot["total_oi"] is None:
@@ -452,6 +464,14 @@ class FutuIVCalculator:
             valid_totals = [value for value in bucket_totals if value is not None]
             if valid_totals:
                 snapshot["total_oi"] = int(sum(valid_totals))
+        if snapshot["risk_total_oi"] is None:
+            risk_bucket_totals = [
+                (snapshot.get("buckets") or {}).get(suffix, {}).get("risk_net")
+                for suffix in self.BUCKET_SUFFIXES
+            ]
+            valid_risk_totals = [value for value in risk_bucket_totals if value is not None]
+            if valid_risk_totals:
+                snapshot["risk_total_oi"] = int(sum(valid_risk_totals))
         return snapshot
 
     def _build_daily_delta_series(
@@ -467,9 +487,15 @@ class FutuIVCalculator:
         for idx in range(1, len(entries)):
             prev_snapshot = entries[idx - 1][1]
             curr_snapshot = entries[idx][1]
-            prev_value = self._extract_bucket_side(prev_snapshot, suffix=suffix, side=side)
-            curr_value = self._extract_bucket_side(curr_snapshot, suffix=suffix, side=side)
-            delta_value = self._delta(curr_value, prev_value)
+            delta_summary = self._summarize_contract_delta(
+                current_snapshot=curr_snapshot,
+                previous_snapshot=prev_snapshot,
+            )
+            delta_value = self._extract_delta_summary_value(
+                delta_summary=delta_summary,
+                suffix=suffix,
+                side=side,
+            )
             if delta_value is not None:
                 deltas.append(delta_value)
         return deltas
@@ -541,6 +567,103 @@ class FutuIVCalculator:
             return self._as_int(snapshot.get(key))
         return None
 
+    def _summarize_contract_delta(
+        self,
+        current_snapshot: Optional[Dict[str, Any]],
+        previous_snapshot: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        empty_by_bucket = {
+            suffix: {"net": None, "call": None, "put": None}
+            for suffix in self.BUCKET_SUFFIXES
+        }
+        current_contracts = (
+            current_snapshot.get("contracts")
+            if isinstance(current_snapshot, dict) and isinstance(current_snapshot.get("contracts"), dict)
+            else {}
+        )
+        previous_contracts = (
+            previous_snapshot.get("contracts")
+            if isinstance(previous_snapshot, dict) and isinstance(previous_snapshot.get("contracts"), dict)
+            else {}
+        )
+        if not current_contracts or not previous_contracts:
+            return {
+                "total_1d": None,
+                "by_bucket": empty_by_bucket,
+            }
+
+        totals: Dict[str, Dict[str, float]] = {
+            suffix: {"net": 0.0, "call": 0.0, "put": 0.0}
+            for suffix in self.BUCKET_SUFFIXES
+        }
+        has_value: Dict[str, Dict[str, bool]] = {
+            suffix: {"net": False, "call": False, "put": False}
+            for suffix in self.BUCKET_SUFFIXES
+        }
+        total_1d = 0.0
+        has_total = False
+
+        for contract_code in set(current_contracts.keys()) | set(previous_contracts.keys()):
+            current_contract = current_contracts.get(contract_code)
+            previous_contract = previous_contracts.get(contract_code)
+
+            current_oi = self._as_int((current_contract or {}).get("oi"))
+            previous_oi = self._as_int((previous_contract or {}).get("oi"))
+            if current_oi is None and previous_oi is None:
+                continue
+
+            delta_oi = (current_oi or 0) - (previous_oi or 0)
+            if delta_oi == 0:
+                continue
+
+            risk_weight = self._as_float((current_contract or {}).get("risk_weight"))
+            if risk_weight is None:
+                risk_weight = self._as_float((previous_contract or {}).get("risk_weight"))
+            if risk_weight is None or risk_weight <= 0:
+                continue
+
+            contract_payload = current_contract if current_contract is not None else previous_contract
+            bucket = str((contract_payload or {}).get("bucket") or "").strip()
+            if bucket not in self.BUCKET_SUFFIXES:
+                continue
+            side = str((contract_payload or {}).get("side") or "").strip().lower()
+
+            contribution = float(delta_oi) * float(risk_weight)
+            totals[bucket]["net"] += contribution
+            has_value[bucket]["net"] = True
+            total_1d += contribution
+            has_total = True
+
+            if side in {"call", "put"}:
+                totals[bucket][side] += contribution
+                has_value[bucket][side] = True
+
+        by_bucket = {
+            suffix: {
+                side: int(round(totals[suffix][side])) if has_value[suffix][side] else None
+                for side in ("net", "call", "put")
+            }
+            for suffix in self.BUCKET_SUFFIXES
+        }
+        return {
+            "total_1d": int(round(total_1d)) if has_total else None,
+            "by_bucket": by_bucket,
+        }
+
+    @staticmethod
+    def _extract_delta_summary_value(
+        delta_summary: Dict[str, Any],
+        suffix: str,
+        side: str,
+    ) -> Optional[int]:
+        if side == "total":
+            value = delta_summary.get("total_1d") if isinstance(delta_summary, dict) else None
+            return int(value) if value is not None else None
+        by_bucket = delta_summary.get("by_bucket") if isinstance(delta_summary, dict) else {}
+        bucket_payload = by_bucket.get(suffix) if isinstance(by_bucket, dict) else {}
+        value = bucket_payload.get(side) if isinstance(bucket_payload, dict) else None
+        return int(value) if value is not None else None
+
     def _find_latest_snapshot_before(
         self,
         symbol: str,
@@ -607,13 +730,16 @@ class FutuIVCalculator:
         if isinstance(payload, (int, float)):
             return {
                 "total_oi": self._as_int(payload),
+                "risk_total_oi": None,
                 "buckets": {},
+                "contracts": {},
             }
 
         if not isinstance(payload, dict):
             return None
 
         total_oi = self._as_int(payload.get("total_oi"))
+        risk_total_oi = self._as_int(payload.get("risk_total_oi"))
         buckets_payload = payload.get("buckets") if isinstance(payload.get("buckets"), dict) else {}
 
         buckets: Dict[str, Dict[str, Optional[int]]] = {}
@@ -624,6 +750,7 @@ class FutuIVCalculator:
             net_value = self._as_int(raw_bucket_payload.get("net"))
             call_value = self._as_int(raw_bucket_payload.get("call"))
             put_value = self._as_int(raw_bucket_payload.get("put"))
+            risk_net_value = self._as_int(raw_bucket_payload.get("risk_net"))
 
             if net_value is None:
                 net_value = self._as_int(payload.get(f"oi_bucket_{suffix}"))
@@ -631,6 +758,8 @@ class FutuIVCalculator:
                 call_value = self._as_int(payload.get(f"call_oi_bucket_{suffix}"))
             if put_value is None:
                 put_value = self._as_int(payload.get(f"put_oi_bucket_{suffix}"))
+            if risk_net_value is None:
+                risk_net_value = self._as_int(payload.get(f"risk_oi_bucket_{suffix}"))
             if net_value is None and call_value is not None and put_value is not None:
                 net_value = call_value + put_value
 
@@ -638,6 +767,7 @@ class FutuIVCalculator:
                 "net": net_value,
                 "call": call_value,
                 "put": put_value,
+                "risk_net": risk_net_value,
             }
 
         if total_oi is None:
@@ -645,10 +775,38 @@ class FutuIVCalculator:
             valid_totals = [value for value in bucket_totals if value is not None]
             if valid_totals:
                 total_oi = int(sum(valid_totals))
+        if risk_total_oi is None:
+            risk_bucket_totals = [buckets[suffix].get("risk_net") for suffix in self.BUCKET_SUFFIXES]
+            valid_risk_totals = [value for value in risk_bucket_totals if value is not None]
+            if valid_risk_totals:
+                risk_total_oi = int(sum(valid_risk_totals))
+
+        raw_contracts = payload.get("contracts") if isinstance(payload.get("contracts"), dict) else {}
+        contracts: Dict[str, Dict[str, Any]] = {}
+        for contract_code, raw_contract in raw_contracts.items():
+            if not isinstance(raw_contract, dict):
+                continue
+            contract_oi = self._as_int(raw_contract.get("oi"))
+            if contract_oi is None:
+                continue
+            bucket = str(raw_contract.get("bucket") or "").strip()
+            if bucket not in self.BUCKET_SUFFIXES:
+                continue
+            side = str(raw_contract.get("side") or "").strip().lower()
+            if side not in {"call", "put"}:
+                side = None
+            contracts[str(contract_code)] = {
+                "oi": contract_oi,
+                "bucket": bucket,
+                "side": side,
+                "risk_weight": self._as_float(raw_contract.get("risk_weight")),
+            }
 
         return {
             "total_oi": total_oi,
+            "risk_total_oi": risk_total_oi,
             "buckets": buckets,
+            "contracts": contracts,
         }
 
     @staticmethod
@@ -657,6 +815,15 @@ class FutuIVCalculator:
             if value is None:
                 return None
             return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _as_float(value: Any) -> Optional[float]:
+        try:
+            if value is None:
+                return None
+            return float(value)
         except (TypeError, ValueError):
             return None
 
@@ -737,19 +904,40 @@ class FutuIVCalculator:
             bucket_components["31-90"]["total"],
         )
 
-    def _sum_open_interest_bucket_components(
+    def _build_oi_snapshot_payload(
         self,
+        symbol: str,
         expirations: Dict[str, List[OptionContract]],
         snapshot_map: Dict[str, Dict],
         today: Any,
-    ) -> Dict[str, Dict[str, Optional[int]]]:
+    ) -> Dict[str, Any]:
         bucket_keys = ("0-7", "8-30", "31-90")
-        buckets: Dict[str, Dict[str, int]] = {
-            bucket: {"total": 0, "call": 0, "put": 0} for bucket in bucket_keys
+        bucket_to_suffix = {
+            "0-7": "0_7",
+            "8-30": "8_30",
+            "31-90": "31_90",
         }
-        has_value: Dict[str, Dict[str, bool]] = {
-            bucket: {"total": False, "call": False, "put": False} for bucket in bucket_keys
+        raw_buckets: Dict[str, Dict[str, int]] = {
+            bucket: {"net": 0, "call": 0, "put": 0} for bucket in bucket_keys
         }
+        raw_has_value: Dict[str, Dict[str, bool]] = {
+            bucket: {"net": False, "call": False, "put": False} for bucket in bucket_keys
+        }
+        risk_buckets: Dict[str, Dict[str, float]] = {
+            bucket: {"net": 0.0, "call": 0.0, "put": 0.0} for bucket in bucket_keys
+        }
+        risk_has_value: Dict[str, Dict[str, bool]] = {
+            bucket: {"net": False, "call": False, "put": False} for bucket in bucket_keys
+        }
+        contracts_payload: Dict[str, Dict[str, Any]] = {}
+
+        underlying_price = None
+        current_price_resolver = getattr(self.options_fetcher, "get_current_price", None)
+        if symbol and callable(current_price_resolver):
+            try:
+                underlying_price = current_price_resolver(symbol)
+            except Exception as exc:
+                logger.warning("futu_get_underlying_price_failed", symbol=symbol, error=str(exc))
 
         for expiry_str, contracts in expirations.items():
             expiry_date = self.options_fetcher.parse_date(expiry_str)
@@ -778,21 +966,137 @@ class FutuIVCalculator:
                 if oi is None:
                     continue
                 oi_value = int(oi)
-                buckets[bucket]["total"] += oi_value
-                has_value[bucket]["total"] = True
+                raw_buckets[bucket]["net"] += oi_value
+                raw_has_value[bucket]["net"] = True
 
                 option_side = self._resolve_option_side(contract.option_type, contract.code)
                 if option_side in {"call", "put"}:
-                    buckets[bucket][option_side] += oi_value
-                    has_value[bucket][option_side] = True
+                    raw_buckets[bucket][option_side] += oi_value
+                    raw_has_value[bucket][option_side] = True
 
-        result: Dict[str, Dict[str, Optional[int]]] = {}
+                risk_weight = self._resolve_risk_weight(
+                    snapshot=snapshot,
+                    option_code=contract.code,
+                    underlying_price=underlying_price,
+                )
+                if risk_weight is not None:
+                    risk_value = float(oi_value) * float(risk_weight)
+                    risk_buckets[bucket]["net"] += risk_value
+                    risk_has_value[bucket]["net"] = True
+                    if option_side in {"call", "put"}:
+                        risk_buckets[bucket][option_side] += risk_value
+                        risk_has_value[bucket][option_side] = True
+
+                contracts_payload[contract.code] = {
+                    "oi": oi_value,
+                    "bucket": bucket_to_suffix[bucket],
+                    "side": option_side,
+                    "risk_weight": risk_weight,
+                }
+
+        buckets_payload: Dict[str, Dict[str, Optional[int]]] = {}
         for bucket in bucket_keys:
-            result[bucket] = {
-                side: buckets[bucket][side] if has_value[bucket][side] else None
-                for side in ("total", "call", "put")
+            suffix = bucket_to_suffix[bucket]
+            buckets_payload[suffix] = {
+                "net": raw_buckets[bucket]["net"] if raw_has_value[bucket]["net"] else None,
+                "call": raw_buckets[bucket]["call"] if raw_has_value[bucket]["call"] else None,
+                "put": raw_buckets[bucket]["put"] if raw_has_value[bucket]["put"] else None,
+                "risk_net": int(round(risk_buckets[bucket]["net"])) if risk_has_value[bucket]["net"] else None,
             }
-        return result
+        raw_bucket_totals = [buckets_payload[suffix].get("net") for suffix in self.BUCKET_SUFFIXES]
+        valid_raw_bucket_totals = [value for value in raw_bucket_totals if value is not None]
+        risk_bucket_totals = [buckets_payload[suffix].get("risk_net") for suffix in self.BUCKET_SUFFIXES]
+        valid_risk_bucket_totals = [value for value in risk_bucket_totals if value is not None]
+        return {
+            "total_oi": int(sum(valid_raw_bucket_totals)) if valid_raw_bucket_totals else None,
+            "risk_total_oi": int(sum(valid_risk_bucket_totals)) if valid_risk_bucket_totals else None,
+            "buckets": buckets_payload,
+            "contracts": contracts_payload,
+        }
+
+    def _sum_open_interest_bucket_components(
+        self,
+        expirations: Dict[str, List[OptionContract]],
+        snapshot_map: Dict[str, Dict],
+        today: Any,
+    ) -> Dict[str, Dict[str, Optional[int]]]:
+        snapshot_payload = self._build_oi_snapshot_payload(
+            symbol="",
+            expirations=expirations,
+            snapshot_map=snapshot_map,
+            today=today,
+        )
+        return {
+            "0-7": {
+                "total": self._extract_snapshot_bucket_metric(snapshot_payload, "0_7", "net"),
+                "call": self._extract_snapshot_bucket_metric(snapshot_payload, "0_7", "call"),
+                "put": self._extract_snapshot_bucket_metric(snapshot_payload, "0_7", "put"),
+            },
+            "8-30": {
+                "total": self._extract_snapshot_bucket_metric(snapshot_payload, "8_30", "net"),
+                "call": self._extract_snapshot_bucket_metric(snapshot_payload, "8_30", "call"),
+                "put": self._extract_snapshot_bucket_metric(snapshot_payload, "8_30", "put"),
+            },
+            "31-90": {
+                "total": self._extract_snapshot_bucket_metric(snapshot_payload, "31_90", "net"),
+                "call": self._extract_snapshot_bucket_metric(snapshot_payload, "31_90", "call"),
+                "put": self._extract_snapshot_bucket_metric(snapshot_payload, "31_90", "put"),
+            },
+        }
+
+    @staticmethod
+    def _extract_snapshot_bucket_metric(
+        snapshot_payload: Dict[str, Any],
+        suffix: str,
+        metric: str,
+    ) -> Optional[int]:
+        buckets = snapshot_payload.get("buckets") if isinstance(snapshot_payload, dict) else {}
+        bucket_payload = buckets.get(suffix) if isinstance(buckets, dict) else {}
+        value = bucket_payload.get(metric) if isinstance(bucket_payload, dict) else None
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _resolve_risk_weight(
+        self,
+        snapshot: Dict[str, Any],
+        option_code: str,
+        underlying_price: Optional[float],
+    ) -> Optional[float]:
+        price = self._as_float(underlying_price)
+        abs_delta = self._extract_abs_delta(snapshot)
+        multiplier = self._extract_option_multiplier(snapshot, option_code)
+        if price is None or price <= 0 or abs_delta is None or multiplier is None or multiplier <= 0:
+            return None
+        return float(price) * float(multiplier) * float(abs_delta)
+
+    def _extract_abs_delta(self, snapshot: Dict[str, Any]) -> Optional[float]:
+        delta = self.options_fetcher.get_snapshot_value(snapshot, ["option_delta", "delta"])
+        if delta is None:
+            return None
+        return abs(float(delta))
+
+    def _extract_option_multiplier(self, snapshot: Dict[str, Any], option_code: str) -> Optional[float]:
+        multiplier = self.options_fetcher.get_snapshot_value(
+            snapshot,
+            [
+                "contract_multiplier",
+                "option_contract_size",
+                "contract_size",
+                "lot_size",
+                "multiplier",
+            ],
+        )
+        if multiplier is not None and multiplier > 0:
+            return float(multiplier)
+
+        # Futu snapshots do not always expose contract size; US equity options are
+        # typically 100-share contracts, so keep a conservative fallback.
+        code_text = str(option_code or "").strip().upper()
+        if code_text.startswith("US."):
+            return 100.0
+        return 100.0
 
     @staticmethod
     def _resolve_option_side(option_type: Any, option_code: Optional[str] = None) -> Optional[str]:
@@ -928,6 +1232,14 @@ class FutuIVCalculator:
                         )
                         """
                     )
+                    columns = {
+                        str(row["name"])
+                        for row in conn.execute(f"PRAGMA table_info({self.CACHE_TABLE})").fetchall()
+                    }
+                    if "snapshot_json" not in columns:
+                        conn.execute(
+                            f"ALTER TABLE {self.CACHE_TABLE} ADD COLUMN snapshot_json TEXT"
+                        )
             except Exception as exc:
                 logger.warning(f"futu_init_oi_cache_table_failed db_file={self.oi_cache_db_file} error={exc}")
 
@@ -951,7 +1263,8 @@ class FutuIVCalculator:
                             put_oi_bucket_8_30,
                             oi_bucket_31_90,
                             call_oi_bucket_31_90,
-                            put_oi_bucket_31_90
+                            put_oi_bucket_31_90,
+                            snapshot_json
                         FROM {self.CACHE_TABLE}
                         ORDER BY symbol ASC, snapshot_date ASC
                         """
@@ -963,26 +1276,39 @@ class FutuIVCalculator:
                     if not isinstance(date_str, str):
                         continue
 
-                    cache.setdefault(symbol, {})[date_str] = {
-                        "total_oi": self._as_int(row["total_oi"]),
-                        "buckets": {
-                            "0_7": {
-                                "net": self._as_int(row["oi_bucket_0_7"]),
-                                "call": self._as_int(row["call_oi_bucket_0_7"]),
-                                "put": self._as_int(row["put_oi_bucket_0_7"]),
+                    snapshot_payload = None
+                    snapshot_json = row["snapshot_json"]
+                    if isinstance(snapshot_json, str) and snapshot_json.strip():
+                        try:
+                            snapshot_payload = json.loads(snapshot_json)
+                        except Exception:
+                            snapshot_payload = None
+                    if snapshot_payload is None:
+                        snapshot_payload = {
+                            "total_oi": self._as_int(row["total_oi"]),
+                            "buckets": {
+                                "0_7": {
+                                    "net": self._as_int(row["oi_bucket_0_7"]),
+                                    "call": self._as_int(row["call_oi_bucket_0_7"]),
+                                    "put": self._as_int(row["put_oi_bucket_0_7"]),
+                                },
+                                "8_30": {
+                                    "net": self._as_int(row["oi_bucket_8_30"]),
+                                    "call": self._as_int(row["call_oi_bucket_8_30"]),
+                                    "put": self._as_int(row["put_oi_bucket_8_30"]),
+                                },
+                                "31_90": {
+                                    "net": self._as_int(row["oi_bucket_31_90"]),
+                                    "call": self._as_int(row["call_oi_bucket_31_90"]),
+                                    "put": self._as_int(row["put_oi_bucket_31_90"]),
+                                },
                             },
-                            "8_30": {
-                                "net": self._as_int(row["oi_bucket_8_30"]),
-                                "call": self._as_int(row["call_oi_bucket_8_30"]),
-                                "put": self._as_int(row["put_oi_bucket_8_30"]),
-                            },
-                            "31_90": {
-                                "net": self._as_int(row["oi_bucket_31_90"]),
-                                "call": self._as_int(row["call_oi_bucket_31_90"]),
-                                "put": self._as_int(row["put_oi_bucket_31_90"]),
-                            },
-                        },
-                    }
+                            "contracts": {},
+                        }
+                    normalized_snapshot = self._normalize_snapshot_payload(snapshot_payload)
+                    if normalized_snapshot is None:
+                        continue
+                    cache.setdefault(symbol, {})[date_str] = normalized_snapshot
                 return cache
             except Exception as exc:
                 logger.warning(f"futu_load_oi_cache_failed db_file={self.oi_cache_db_file} error={exc}")
@@ -1021,6 +1347,7 @@ class FutuIVCalculator:
                             self._as_int(bucket_31_90.get("net")),
                             self._as_int(bucket_31_90.get("call")),
                             self._as_int(bucket_31_90.get("put")),
+                            json.dumps(snapshot, ensure_ascii=True, separators=(",", ":")),
                         )
                     )
 
@@ -1044,8 +1371,9 @@ class FutuIVCalculator:
                                     put_oi_bucket_8_30,
                                     oi_bucket_31_90,
                                     call_oi_bucket_31_90,
-                                    put_oi_bucket_31_90
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    put_oi_bucket_31_90,
+                                    snapshot_json
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 ON CONFLICT(symbol, snapshot_date) DO UPDATE SET
                                     total_oi = excluded.total_oi,
                                     oi_bucket_0_7 = excluded.oi_bucket_0_7,
@@ -1057,6 +1385,7 @@ class FutuIVCalculator:
                                     oi_bucket_31_90 = excluded.oi_bucket_31_90,
                                     call_oi_bucket_31_90 = excluded.call_oi_bucket_31_90,
                                     put_oi_bucket_31_90 = excluded.put_oi_bucket_31_90,
+                                    snapshot_json = excluded.snapshot_json,
                                     updated_at = CURRENT_TIMESTAMP
                                 """,
                                 rows,
