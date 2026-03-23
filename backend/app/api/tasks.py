@@ -477,15 +477,10 @@ async def add_task_etfs(
     if not requested_etfs:
         raise HTTPException(status_code=400, detail="请至少选择一个 ETF")
 
-    merged_etfs = _dedupe_symbols(_normalize_symbols(task.etfs) + requested_etfs)
-    _, validated_etfs = _validate_task_etfs(
-        task_type=task.type,
-        sector=task.sector,
-        etfs=merged_etfs,
-        db=db,
-    )
-
-    task.etfs = validated_etfs
+    # 仅校验本次新增的 ETF，保留任务里已有的历史配置。
+    # 这样即使旧任务包含与当前板块映射不一致的遗留 ETF，也不会阻塞新增合法标的。
+    existing_etfs = _dedupe_symbols(_normalize_symbols(task.etfs))
+    task.etfs = _dedupe_symbols(existing_etfs + requested_etfs)
     task.updated_at = datetime.utcnow()
 
     db.commit()

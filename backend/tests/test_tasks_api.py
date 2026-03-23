@@ -104,6 +104,35 @@ async def test_drilldown_task_rejects_other_sector_industry_etf(override_db):
 
 
 @pytest.mark.asyncio
+async def test_add_task_etfs_preserves_legacy_mismatched_holdings(override_db, test_db):
+    igv = test_db.query(ETF).filter(ETF.symbol == "IGV").first()
+    assert igv is not None
+    igv.parent_sector = "XLF"
+
+    test_db.add_all([
+        ETF(symbol="SMH", name="Semiconductors", type="industry", parent_sector="XLF", rank=4, score=76),
+        ETF(symbol="XTL", name="Telecom", type="industry", parent_sector="XLK", rank=5, score=70),
+        ETF(symbol="XSD", name="Semiconductor Equal Weight", type="industry", parent_sector="XLK", rank=6, score=68),
+        Task(title="Legacy Drilldown", type="drilldown", base_index="SPY", sector="XLK", etfs=["SOXX", "SMH", "IGV"]),
+    ])
+    test_db.commit()
+
+    legacy_task = test_db.query(Task).filter(Task.title == "Legacy Drilldown").first()
+    assert legacy_task is not None
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(f"/api/tasks/{legacy_task.id}/etfs", json={"etfs": ["XTL", "XSD"]})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["sector"] == "XLK"
+    assert payload["etfs"] == ["SOXX", "SMH", "IGV", "XTL", "XSD"]
+
+
+@pytest.mark.asyncio
 async def test_create_rotation_task_rejects_industry_etf(override_db):
     async with AsyncClient(
         transport=ASGITransport(app=app),
