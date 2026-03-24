@@ -126,7 +126,15 @@ async def test_enqueue_holdings_refresh_job_api_accepts_and_completes(
     calls = []
 
     async def fake_refresh_holdings(symbol, request, db):
-        calls.append((symbol, request.coverage_type, request.coverage_value, request.refresh_source))
+        calls.append(
+            (
+                symbol,
+                request.coverage_type,
+                request.coverage_value,
+                request.refresh_source,
+                request.exclude_symbols,
+            )
+        )
         return {
             "symbol": symbol,
             "coverage": (
@@ -150,6 +158,7 @@ async def test_enqueue_holdings_refresh_job_api_accepts_and_completes(
                     {"symbol": "SOXX", "coverage_type": "all", "coverage_value": 0},
                 ],
                 "refresh_source": "ibkr",
+                "exclude_symbols": ["UI"],
             },
         )
 
@@ -161,6 +170,9 @@ async def test_enqueue_holdings_refresh_job_api_accepts_and_completes(
 
     completed_job = await _wait_for_job_completion(refresh_job_manager, job_id)
 
-    assert calls == [("XLK", "top", 20, "ibkr"), ("SOXX", "all", 0, "ibkr")]
+    assert calls == [
+        ("XLK", "top", 20, "ibkr", ["UI"]),
+        ("SOXX", "all", 0, "ibkr", ["UI"]),
+    ]
     assert completed_job["status"] == "completed"
     assert completed_job["result"]["summary_status"] == "success"

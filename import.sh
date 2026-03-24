@@ -13,17 +13,18 @@ DEFAULT_API_BASE="${MOMENTUM_API_BASE_URL:-http://127.0.0.1:8000}"
 finviz_list=()
 
 mc_list=(
-  "${DEFAULT_DOWNLOADS_DIR}/MC_w_80_3_23-03_06_40_N49.json"
+  "${DEFAULT_DOWNLOADS_DIR}/MC_w_80_1_24-03_08_38_N49.json"
 )
 
 # Holdings import target passed to `finviz/mc -s`.
 # Leave empty to infer from file name.
 # Example: target="XLK,IGV,SOXX,SMH"
-target="XLC,XLE,XLF,XLK,XLV,XLY,SOXX,SMH,IGV,XSD,XTL"
+# target="XLC,XLE,XLF,XLK,XLV,XLY,SOXX,SMH,IGV,XSD,XTL"
+target="XTL"
 
 # Known stock symbols that may be missing provider data.
-# If an import reports missing coverage symbols and all of them are listed here,
-# the affected ETF will be skipped from `Actualiser holdings`.
+# These symbols will be passed to `Actualiser holdings --exclude-symbols`
+# so missing fresh imports for them won't block holdings refresh.
 # Example: exclude_symbols="UI"
 exclude_symbols="UI"
 
@@ -208,8 +209,7 @@ track_excluded_holdings_targets_from_output() {
       IFS="$old_ifs"
 
       if [[ "$should_exclude" -eq 1 ]]; then
-        append_unique_excluded_holdings_target "$etf"
-        warn "skip holdings refresh target due to exclude_symbols: $etf <- $missing_csv"
+        info "allow missing coverage symbols during holdings refresh due to exclude_symbols: $etf <- $missing_csv"
       fi
     fi
   done <<< "$output"
@@ -476,6 +476,7 @@ submit_actualiser_jobs() {
   local etfs_csv holdings_csv
   local filtered_holdings_symbols=()
   local symbol skip_symbol excluded_target
+  local holdings_cmd_extra=()
 
   if [[ -z "$SOURCE_VALUE" ]]; then
     info "source is empty, skip Actualiser"
@@ -536,8 +537,12 @@ submit_actualiser_jobs() {
     return 0
   fi
 
+  if [[ -n "$exclude_symbols" ]]; then
+    holdings_cmd_extra+=("--exclude-symbols" "$exclude_symbols")
+  fi
+
   info "submit Actualiser holdings, source=$SOURCE_VALUE, w=$W_VALUE, etfs=$holdings_csv"
-  if output="$(run_cli_capture "Actualiser" "holdings" "-s" "$holdings_csv" "-w" "$W_VALUE" "--source" "$SOURCE_VALUE" "--api-base" "$API_BASE")"; then
+  if output="$(run_cli_capture "Actualiser" "holdings" "-s" "$holdings_csv" "-w" "$W_VALUE" "--source" "$SOURCE_VALUE" "--api-base" "$API_BASE" "${holdings_cmd_extra[@]}")"; then
     printf '%s\n' "$output"
   else
     printf '%s\n' "$output" >&2

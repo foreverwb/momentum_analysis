@@ -476,6 +476,25 @@ class HoldingsCoverageRequest(BaseModel):
     concurrent: Optional[bool] = None
     progress_token: Optional[str] = None
     related_etf_symbols: Optional[List[str]] = None
+    exclude_symbols: Optional[List[str]] = None
+
+
+def _normalize_symbol_list(values: Any) -> List[str]:
+    normalized: List[str] = []
+    seen: set[str] = set()
+    if not isinstance(values, list):
+        return normalized
+
+    for value in values:
+        text = str(value or "").strip().upper()
+        if not text:
+            continue
+        canonical = _canonical_symbol_key(text)
+        if not canonical or canonical in seen:
+            continue
+        seen.add(canonical)
+        normalized.append(canonical)
+    return normalized
 
 
 def _default_etf_score_result() -> Dict[str, Dict[str, Any]]:
@@ -620,6 +639,175 @@ def _compute_snapshot_deltas(
     return {"delta3d": delta3d, "delta5d": delta5d}
 
 
+def _load_price_history_frame(
+    db: Session,
+    symbol: str,
+    *,
+    min_rows: int = 1,
+    source: str = "ibkr",
+) -> Optional[pd.DataFrame]:
+    rows = db.query(PriceHistory).filter(
+        PriceHistory.symbol == symbol.upper(),
+        PriceHistory.source == source,
+    ).order_by(PriceHistory.date.asc()).all()
+    if len(rows) < min_rows:
+        return None
+    return pd.DataFrame(
+        [
+            {
+                "date": row.date,
+                "open": row.open,
+                "high": row.high,
+                "low": row.low,
+                "close": row.close,
+                "volume": row.volume,
+            }
+            for row in rows
+        ]
+    )
+
+
+def _build_rel_mom_dimension(relmom_result: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(relmom_result, dict) or relmom_result.get("error"):
+        return None
+
+    rel_mom_raw = relmom_result.get("RelMom")
+    if not isinstance(rel_mom_raw, (int, float)):
+        return None
+
+    rel_mom = float(rel_mom_raw)
+    rel_mom_score = (rel_mom + 0.1) / 0.25 * 100
+    rel_mom_score = min(100.0, max(0.0, rel_mom_score))
+
+    strength = "NEUTRAL"
+    description = "中性,与大盘同步"
+    if rel_mom > 0.05:
+        strength = "STRONG"
+        description = "强势，显著跑赢大盘"
+    elif rel_mom > 0.02:
+        strength = "MODERATE_STRONG"
+        description = "较强,略微跑赢大盘"
+    elif rel_mom > -0.02:
+        strength = "NEUTRAL"
+        description = "中性,与大盘同步"
+    elif rel_mom > -0.05:
+        strength = "MODERATE_WEAK"
+        description = "较弱,略微跑输大盘"
+    else:
+        strength = "WEAK"
+        description = "弱势,显著跑输大盘"
+
+    return {
+        "score": round(rel_mom_score, 2),
+        "data": {
+            "RS": relmom_result.get("RS"),
+            "RS_5D": relmom_result.get("RS_5D"),
+            "RS_20D": relmom_result.get("RS_20D"),
+            "RS_63D": relmom_result.get("RS_63D"),
+            "RelMom": rel_mom,
+            "strength": strength,
+            "description": description,
+        },
+    }
+
+
+def _build_trend_quality_dimension(price_df: Optional[pd.DataFrame]) -> Optional[Dict[str, Any]]:
+    from app.services.calculators.technical import calculate_sma, calculate_sma_slope, calculate_max_drawdown
+
+    if price_df is None or price_df.empty or "close" not in price_df.columns or len(price_df) < 50:
+        return None
+
+    prices = pd.to_numeric(price_df["close"], errors="coerce").dropna().reset_index(drop=True)
+    if len(prices) < 50:
+        return None
+
+    sma20 = calculate_sma(prices, 20)
+    sma50 = calculate_sma(prices, 50)
+
+    current_price = float(prices.iloc[-1])
+    current_sma20 = float(sma20.iloc[-1])
+    current_sma50 = float(sma50.iloc[-1])
+    price_above_sma50 = current_price > current_sma50
+    sma20_above_sma50 = current_sma20 > current_sma50
+    sma20_slope = float(calculate_sma_slope(sma20, period=5))
+    max_dd = float(calculate_max_drawdown(prices, 20))
+
+    trend_score = 0.0
+    if price_above_sma50:
+        trend_score += 25.0
+    if sma20_above_sma50:
+        trend_score += 25.0
+    if sma20_slope > 0:
+        trend_score += 25.0
+    if max_dd > -0.10:
+        trend_score += 25.0
+
+    return {
+        "score": round(trend_score, 2),
+        "data": {
+            "price": round(current_price, 2),
+            "sma20": round(current_sma20, 2),
+            "sma50": round(current_sma50, 2),
+            "price_above_sma50": price_above_sma50,
+            "sma20_above_sma50": sma20_above_sma50,
+            "sma20_slope": round(sma20_slope, 4),
+            "max_drawdown_20d": round(max_dd, 4),
+        },
+    }
+
+
+def _backfill_etf_price_dimensions_from_db(
+    db: Session,
+    symbol: str,
+    score_result: Dict[str, Dict[str, Any]],
+    data_sources: Dict[str, bool],
+    *,
+    benchmark: str = "SPY",
+) -> None:
+    needs_rel_mom = score_result["rel_mom"].get("data") is None
+    needs_trend = score_result["trend_quality"].get("data") is None
+    if not needs_rel_mom and not needs_trend:
+        return
+
+    price_df = _load_price_history_frame(db, symbol, min_rows=50, source="ibkr")
+    if price_df is None:
+        return
+
+    data_sources["ibkr_price"] = True
+
+    if needs_trend:
+        trend_result = _build_trend_quality_dimension(price_df)
+        if trend_result is not None:
+            score_result["trend_quality"] = _normalize_etf_dimension(
+                score_result["trend_quality"],
+                trend_result,
+            )
+            data_sources["ibkr_trend"] = True
+
+    if needs_rel_mom:
+        benchmark_df = _load_price_history_frame(db, benchmark, min_rows=64, source="ibkr")
+        if benchmark_df is None:
+            return
+        try:
+            from app.services.calculators.momentum import MomentumCalculator
+
+            relmom_result = MomentumCalculator.calculate_relative_momentum(
+                price_df[["date", "close"]],
+                benchmark_df[["date", "close"]],
+            )
+        except Exception as exc:
+            logger.warning("etf_relmom_backfill_failed symbol=%s benchmark=%s error=%s", symbol, benchmark, str(exc))
+            return
+
+        rel_mom_dimension = _build_rel_mom_dimension(relmom_result)
+        if rel_mom_dimension is not None:
+            score_result["rel_mom"] = _normalize_etf_dimension(
+                score_result["rel_mom"],
+                rel_mom_dimension,
+            )
+            data_sources["ibkr_relmom"] = True
+
+
 def _recalculate_etf_score_from_db(
     etf: ETF,
     db: Session,
@@ -666,6 +854,8 @@ def _recalculate_etf_score_from_db(
         for key in data_sources:
             if key in base_data_sources:
                 data_sources[key] = bool(base_data_sources[key])
+
+    _backfill_etf_price_dimensions_from_db(db, etf.symbol, score_result, data_sources)
 
     holdings = _get_latest_etf_holdings(db, etf.symbol)
     if holdings:
@@ -1867,7 +2057,7 @@ async def refresh_etf_data(
     else:
         warnings.append("Futu 未连接，使用默认期权评分")
     
-    score_should_recalculate = refresh_source == "all" or (
+    score_should_recalculate = refresh_source in {"all", "ibkr"} or (
         refresh_source == "futu"
         and (skip_futu_refresh or data_sources["futu_iv"])
     )
@@ -2360,6 +2550,12 @@ async def refresh_holdings_by_coverage(
         return f"{', '.join(symbols[:max_items])} 等{len(symbols)}只"
 
     coverage_symbols = list(dict.fromkeys(h.ticker.upper() for h in filtered_holdings if h.ticker))
+    excluded_symbol_keys = set(_normalize_symbol_list(request.exclude_symbols))
+    excluded_coverage_symbols = [
+        symbol_name
+        for symbol_name in coverage_symbols
+        if _canonical_symbol_key(symbol_name) in excluded_symbol_keys
+    ]
     coverage_key_to_symbol: Dict[str, str] = {}
     for symbol_name in coverage_symbols:
         symbol_key = _canonical_symbol_key(symbol_name)
@@ -2412,8 +2608,16 @@ async def refresh_holdings_by_coverage(
                 fresh_imports.add((resolved_symbol, source_name))
                 fresh_imports_by_symbol.setdefault(resolved_symbol, set()).add(source_name)
 
-        missing_finviz = [s for s in coverage_symbols if (s, "finviz") not in fresh_imports]
-        missing_mc = [s for s in coverage_symbols if (s, "marketchameleon") not in fresh_imports]
+        missing_finviz = [
+            s for s in coverage_symbols
+            if (s, "finviz") not in fresh_imports
+            and _canonical_symbol_key(s) not in excluded_symbol_keys
+        ]
+        missing_mc = [
+            s for s in coverage_symbols
+            if (s, "marketchameleon") not in fresh_imports
+            and _canonical_symbol_key(s) not in excluded_symbol_keys
+        ]
         coverage_fresh_imports = fresh_imports_by_symbol
 
         if require_scoring_imports and (missing_finviz or missing_mc):
@@ -2438,11 +2642,12 @@ async def refresh_holdings_by_coverage(
 
         if require_scoring_imports:
             logger.info(
-                "refresh_holdings_import_guard_passed symbol=%s coverage=%s boundary_bjt=%s symbols=%s",
+                "refresh_holdings_import_guard_passed symbol=%s coverage=%s boundary_bjt=%s symbols=%s excluded_symbols=%s",
                 symbol.upper(),
                 coverage_label,
                 boundary_bjt,
                 len(coverage_symbols),
+                len(excluded_coverage_symbols),
             )
             if progress_token:
                 _patch_holdings_refresh_progress(
@@ -2453,12 +2658,13 @@ async def refresh_holdings_by_coverage(
                 )
         else:
             logger.info(
-                "refresh_holdings_import_guard_skipped symbol=%s coverage=%s refresh_source=%s fresh_finviz=%s fresh_mc=%s",
+                "refresh_holdings_import_guard_skipped symbol=%s coverage=%s refresh_source=%s fresh_finviz=%s fresh_mc=%s excluded_symbols=%s",
                 symbol.upper(),
                 coverage_label,
                 refresh_source,
                 len([s for s in coverage_symbols if (s, "finviz") in fresh_imports]),
                 len([s for s in coverage_symbols if (s, "marketchameleon") in fresh_imports]),
+                len(excluded_coverage_symbols),
             )
             if progress_token:
                 _patch_holdings_refresh_progress(

@@ -195,8 +195,8 @@ cli:
 
 | 命令 | 说明 | 示例 |
 | --- | --- | --- |
-| `Actualiser etfs` | 后台串行刷新多个 ETF；`--source` 支持 `all` / `ibkr` / `futu`，默认 `all`；省略 `-s` 时默认刷新全部 ETF | `Actualiser etfs -s "XLK,XLF,SOXX"`<br>`Actualiser etfs -s "XLK,SOXX" --source ibkr`<br>`Actualiser etfs -s "XLK,SOXX" --source futu`<br>`Actualiser etfs --source futu` |
-| `Actualiser holdings` | 后台串行刷新多个 ETF holdings；支持 `t-20` / `85` / `all`；`--source` 支持 `all` / `ibkr` / `futu`，默认 `all` | `Actualiser holdings -s "XLK,SOXX" -w t-20`<br>`Actualiser holdings -s "XLK,SOXX" -w t-20 --source ibkr`<br>`Actualiser holdings -s "XLK,SOXX" -w t-20 --source futu` |
+| `Actualiser etfs` | 后台串行刷新多个 ETF；`--source` 支持 `all` / `ibkr` / `futu`，默认 `all`；省略 `-s` 时默认刷新全部 ETF；当 `--source` 为 `ibkr` / `futu` 时，只提交已有 holdings 数据的 ETF | `Actualiser etfs -s "XLK,XLF,SOXX"`<br>`Actualiser etfs -s "XLK,SOXX" --source ibkr`<br>`Actualiser etfs -s "XLK,SOXX" --source futu`<br>`Actualiser etfs --source futu` |
+| `Actualiser holdings` | 后台串行刷新多个 ETF holdings；支持 `t-20` / `85` / `all`；`--source` 支持 `all` / `ibkr` / `futu`，默认 `all`；可选 `--exclude-symbols "UI,BRK.B"` 放宽指定 ticker 的最新导入校验 | `Actualiser holdings -s "XLK,SOXX" -w t-20`<br>`Actualiser holdings -s "XLK,SOXX" -w t-20 --source ibkr`<br>`Actualiser holdings -s "XLK,SOXX" -w t-20 --source futu`<br>`Actualiser holdings -s "XTL" -w 80 --source futu --exclude-symbols "UI"` |
 | `Actualiser status` | 查询单个后台刷新任务状态 | `Actualiser status 12` |
 | `Actualiser list` | 查看最近的后台刷新任务 | `Actualiser list --status running` |
 
@@ -209,9 +209,11 @@ cli:
 ### Actualiser 评分触发规则
 
 - `Actualiser etfs --source ibkr`
+  - 只处理已有 holdings 数据的 ETF。
   - 只刷新 IBKR 提供的价格、RelMom、TrendQuality 数据。
   - 不触发 ETF 评分重算；命令完成后仍返回当前已落库的 ETF 分数视图。
 - `Actualiser etfs --source futu`
+  - 只处理已有 holdings 数据的 ETF。
   - 只有“这次成功拿到可用的 Futu 期权数据”或“冷却窗口内已有可复用的 Futu 期权数据”时，才触发 ETF 评分重算。
   - 如果没有可用于评分的期权数据，本次只刷新数据状态，不重算 ETF 评分。
 - `Actualiser etfs --source all`
@@ -224,6 +226,7 @@ cli:
 - `Actualiser holdings --source futu`
   - 只有当前 coverage 内至少有一个 ticker 具备“可用于评分的 Futu 期权数据”时，才会打开整条评分链路。
   - 这里的“可用于评分”包括两种情况：本次成功抓取到 Futu 期权数据，或该 ticker 在冷却窗口内已有可复用的 Futu 数据。
+  - `--exclude-symbols` 只会放宽这些 ticker 的最新 Finviz / MarketChameleon 导入校验，不会替它们补出缺失的导入数据。
   - 如果当前 coverage 完全拿不到可用期权数据，本次只刷新期权数据状态，不触发任何评分计算。
 - `Actualiser holdings --source all`
   - 保持全量刷新行为；在 stock 评分完成后继续汇总重算 ETF 评分。

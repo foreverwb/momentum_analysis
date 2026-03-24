@@ -27,6 +27,7 @@ class RefreshHoldingsJobRequest(BaseModel):
     items: List[RefreshHoldingsJobItem] = Field(..., min_length=1, description="需要串行刷新的 holdings 列表")
     source: str = Field("cli", description="触发来源")
     refresh_source: Literal["all", "ibkr", "futu"] = Field("all", description="刷新数据源")
+    exclude_symbols: List[str] = Field(default_factory=list, description="允许缺少最新导入数据的 ticker 列表")
 
 
 @router.post("/etfs", status_code=status.HTTP_202_ACCEPTED)
@@ -55,6 +56,7 @@ async def enqueue_holdings_refresh_job(request: RefreshHoldingsJobRequest) -> di
             [item.model_dump() for item in request.items],
             source=request.source,
             refresh_source=request.refresh_source,
+            exclude_symbols=request.exclude_symbols,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

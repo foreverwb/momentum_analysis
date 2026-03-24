@@ -478,17 +478,30 @@ def _canonical_symbol_key(symbol: str) -> str:
 
 
 def parse_etf_symbols(raw_etfs: str) -> list:
+    return _parse_symbol_csv(raw_etfs, empty_message='ETF 列表为空，请使用 -s "XLK,XLC,XLV" 形式输入')
+
+
+def _parse_symbol_csv(raw_value: str, *, empty_message: str) -> list:
     symbols = []
     seen = set()
-    for token in str(raw_etfs or "").split(','):
+    for token in str(raw_value or "").split(','):
         symbol = token.strip().upper()
         if not symbol or symbol in seen:
             continue
         seen.add(symbol)
         symbols.append(symbol)
     if not symbols:
-        raise ValueError("ETF 列表为空，请使用 -s \"XLK,XLC,XLV\" 形式输入")
+        raise ValueError(empty_message)
     return symbols
+
+
+def parse_optional_exclude_symbols(raw_symbols: str | None) -> list[str]:
+    if not str(raw_symbols or "").strip():
+        return []
+    return _parse_symbol_csv(
+        raw_symbols,
+        empty_message='exclude_symbols 为空，请使用 --exclude-symbols "UI,BRK.B" 形式输入',
+    )
 
 
 def parse_mc_coverage(raw_coverage: str) -> tuple:
@@ -663,7 +676,7 @@ def _poll_refresh_job_until_terminal(
             return job
 
 
-def _fetch_all_etf_symbols(api_base: str, *, timeout: int) -> list[str]:
+def _fetch_etf_catalog(api_base: str, *, timeout: int) -> list[dict]:
     response = _http_json_request(
         "GET",
         f"{api_base}/api/etfs",
@@ -672,12 +685,15 @@ def _fetch_all_etf_symbols(api_base: str, *, timeout: int) -> list[str]:
     items = response if isinstance(response, list) else response.get("items") if isinstance(response, dict) else None
     if not isinstance(items, list):
         raise RuntimeError("无法从后端获取 ETF 列表")
+    return [item for item in items if isinstance(item, dict)]
 
+
+def _extract_etf_symbols_from_catalog(items: list[dict]) -> list[str]:
     symbols = parse_etf_symbols(
         ",".join(
             str(item.get("symbol") or "").strip()
             for item in items
-            if isinstance(item, dict) and str(item.get("symbol") or "").strip()
+            if str(item.get("symbol") or "").strip()
         )
     )
     if not symbols:
@@ -685,13 +701,63 @@ def _fetch_all_etf_symbols(api_base: str, *, timeout: int) -> list[str]:
     return symbols
 
 
+def _split_symbols_by_holdings(symbols: list[str], items: list[dict]) -> tuple[list[str], list[str]]:
+    holdings_count_by_symbol = {}
+    for item in items:
+        symbol = _normalize_symbol(item.get("symbol"))
+        if not symbol:
+            continue
+        try:
+            holdings_count = int(item.get("holdingsCount") or 0)
+        except (TypeError, ValueError):
+            holdings_count = 0
+        holdings_count_by_symbol[symbol] = max(0, holdings_count)
+
+    refreshable = []
+    skipped = []
+    for symbol in symbols:
+        holdings_count = holdings_count_by_symbol.get(symbol)
+        if holdings_count is None or holdings_count > 0:
+            refreshable.append(symbol)
+        else:
+            skipped.append(symbol)
+
+    return refreshable, skipped
+
+
+def _fetch_all_etf_symbols(api_base: str, *, timeout: int) -> list[str]:
+    items = _fetch_etf_catalog(api_base, timeout=timeout)
+
+    return _extract_etf_symbols_from_catalog(items)
+
+
 def cmd_refresh_etfs(args):
     api_base = _normalize_api_base_url(args.api_base)
+    require_holdings = args.source in {"ibkr", "futu"}
+
     if args.symbols:
         symbols = parse_etf_symbols(args.symbols)
+        if require_holdings:
+            etf_catalog = _fetch_etf_catalog(api_base, timeout=args.timeout)
+            symbols, skipped_symbols = _split_symbols_by_holdings(symbols, etf_catalog)
+            if skipped_symbols:
+                print(f"已跳过无 holdings 数据的 ETF: {','.join(skipped_symbols)}")
     else:
-        symbols = _fetch_all_etf_symbols(api_base, timeout=args.timeout)
-        print(f"未提供 ETF 列表，已自动加载全部 ETF: {len(symbols)} 个")
+        etf_catalog = _fetch_etf_catalog(api_base, timeout=args.timeout)
+        all_symbols = _extract_etf_symbols_from_catalog(etf_catalog)
+        if require_holdings:
+            symbols, skipped_symbols = _split_symbols_by_holdings(all_symbols, etf_catalog)
+            print(f"未提供 ETF 列表，已自动加载有 holdings 数据的 ETF: {len(symbols)} 个")
+            if skipped_symbols:
+                print(f"已跳过无 holdings 数据的 ETF: {','.join(skipped_symbols)}")
+        else:
+            symbols = all_symbols
+            print(f"未提供 ETF 列表，已自动加载全部 ETF: {len(symbols)} 个")
+
+    if not symbols:
+        print("没有具备 holdings 数据的 ETF，跳过提交任务")
+        return
+
     response = _http_json_request(
         "POST",
         f"{api_base}/api/refresh-jobs/etfs",
@@ -711,6 +777,7 @@ def cmd_refresh_etfs(args):
 
 def cmd_refresh_holdings(args):
     symbols = parse_etf_symbols(args.symbols)
+    exclude_symbols = parse_optional_exclude_symbols(getattr(args, "exclude_symbols", None))
     coverage_type, coverage_value, coverage_label = parse_refresh_holdings_coverage(args.coverage)
     api_base = _normalize_api_base_url(args.api_base)
     response = _http_json_request(
@@ -728,6 +795,7 @@ def cmd_refresh_holdings(args):
             ],
             "source": "cli",
             "refresh_source": args.source,
+            "exclude_symbols": exclude_symbols,
         },
         timeout=args.timeout,
     )
@@ -2107,6 +2175,10 @@ def build_parser():
     refresh_holdings_parser.add_argument(
         '--source', choices=['all', 'ibkr', 'futu'], default='all',
         help='刷新数据源，默认 all'
+    )
+    refresh_holdings_parser.add_argument(
+        '--exclude-symbols',
+        help='可选，逗号分隔；这些 ticker 缺少最新导入数据时不阻塞 holdings 刷新，例如 "UI,BRK.B"',
     )
     refresh_holdings_parser.add_argument(
         '--api-base', default=DEFAULT_API_BASE_URL,

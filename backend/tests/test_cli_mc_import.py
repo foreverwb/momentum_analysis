@@ -285,13 +285,15 @@ def test_parse_cli_args_accepts_refresh_source_choices() -> None:
 
 
 def test_cmd_refresh_etfs_posts_selected_source(monkeypatch, capsys) -> None:
-    captured = {}
+    captured = {"calls": []}
 
     def fake_http_json_request(method: str, url: str, payload=None, timeout: int = 10):
-        captured["method"] = method
-        captured["url"] = url
-        captured["payload"] = payload
-        captured["timeout"] = timeout
+        captured["calls"].append((method, url, payload, timeout))
+        if method == "GET":
+            return [
+                {"symbol": "XLK", "holdingsCount": 10},
+                {"symbol": "XLF", "holdingsCount": 0},
+            ]
         return {
             "job": {
                 "id": 21,
@@ -317,15 +319,96 @@ def test_cmd_refresh_etfs_posts_selected_source(monkeypatch, capsys) -> None:
     )
     args.func(args)
 
-    assert captured["method"] == "POST"
-    assert captured["url"] == "http://127.0.0.1:8000/api/refresh-jobs/etfs"
-    assert captured["payload"] == {
-        "symbols": ["XLK", "XLF"],
+    assert captured["calls"][0] == ("GET", "http://127.0.0.1:8000/api/etfs", None, 10)
+    assert captured["calls"][1][0] == "POST"
+    assert captured["calls"][1][1] == "http://127.0.0.1:8000/api/refresh-jobs/etfs"
+    assert captured["calls"][1][2] == {
+        "symbols": ["XLK"],
         "source": "cli",
         "refresh_source": "ibkr",
     }
-    assert captured["timeout"] == 10
-    assert "Job ID: 21" in capsys.readouterr().out
+    assert captured["calls"][1][3] == 10
+    stdout = capsys.readouterr().out
+    assert "已跳过无 holdings 数据的 ETF: XLF" in stdout
+    assert "Job ID: 21" in stdout
+
+
+def test_cmd_refresh_etfs_keeps_unknown_symbols_when_filtering_holdings(monkeypatch, capsys) -> None:
+    captured = {"calls": []}
+
+    def fake_http_json_request(method: str, url: str, payload=None, timeout: int = 10):
+        captured["calls"].append((method, url, payload, timeout))
+        if method == "GET":
+            return [
+                {"symbol": "XLK", "holdingsCount": 10},
+                {"symbol": "XLF", "holdingsCount": 0},
+            ]
+        return {
+            "job": {
+                "id": 31,
+                "status": "pending",
+                "queue_position": 1,
+                "message": "任务已进入队列",
+            }
+        }
+
+    monkeypatch.setattr(cli, "_http_json_request", fake_http_json_request)
+
+    args = cli.parse_cli_args(
+        [
+            "Actualiser",
+            "etfs",
+            "-s",
+            "XLK,XLF,FAKE",
+            "--source",
+            "futu",
+            "--api-base",
+            "http://127.0.0.1:8000",
+        ]
+    )
+    args.func(args)
+
+    assert captured["calls"][1][2] == {
+        "symbols": ["XLK", "FAKE"],
+        "source": "cli",
+        "refresh_source": "futu",
+    }
+    stdout = capsys.readouterr().out
+    assert "已跳过无 holdings 数据的 ETF: XLF" in stdout
+    assert "Job ID: 31" in stdout
+
+
+def test_cmd_refresh_etfs_skips_submit_when_no_symbols_have_holdings(monkeypatch, capsys) -> None:
+    captured = {"calls": []}
+
+    def fake_http_json_request(method: str, url: str, payload=None, timeout: int = 10):
+        captured["calls"].append((method, url, payload, timeout))
+        return [
+            {"symbol": "XLF", "holdingsCount": 0},
+        ]
+
+    monkeypatch.setattr(cli, "_http_json_request", fake_http_json_request)
+
+    args = cli.parse_cli_args(
+        [
+            "Actualiser",
+            "etfs",
+            "-s",
+            "XLF",
+            "--source",
+            "ibkr",
+            "--api-base",
+            "http://127.0.0.1:8000",
+        ]
+    )
+    args.func(args)
+
+    assert captured["calls"] == [
+        ("GET", "http://127.0.0.1:8000/api/etfs", None, 10),
+    ]
+    stdout = capsys.readouterr().out
+    assert "已跳过无 holdings 数据的 ETF: XLF" in stdout
+    assert "没有具备 holdings 数据的 ETF，跳过提交任务" in stdout
 
 
 def test_cmd_refresh_etfs_fetches_all_symbols_when_omitted(monkeypatch, capsys) -> None:
@@ -335,9 +418,9 @@ def test_cmd_refresh_etfs_fetches_all_symbols_when_omitted(monkeypatch, capsys) 
         captured["calls"].append((method, url, payload, timeout))
         if method == "GET":
             return [
-                {"symbol": "XLK"},
-                {"symbol": "XLF"},
-                {"symbol": "SOXX"},
+                {"symbol": "XLK", "holdingsCount": 8},
+                {"symbol": "XLF", "holdingsCount": 0},
+                {"symbol": "SOXX", "holdingsCount": 12},
             ]
         return {
             "job": {
@@ -366,13 +449,59 @@ def test_cmd_refresh_etfs_fetches_all_symbols_when_omitted(monkeypatch, capsys) 
     assert captured["calls"][1][0] == "POST"
     assert captured["calls"][1][1] == "http://127.0.0.1:8000/api/refresh-jobs/etfs"
     assert captured["calls"][1][2] == {
-        "symbols": ["XLK", "XLF", "SOXX"],
+        "symbols": ["XLK", "SOXX"],
         "source": "cli",
         "refresh_source": "futu",
     }
     stdout = capsys.readouterr().out
-    assert "未提供 ETF 列表，已自动加载全部 ETF: 3 个" in stdout
+    assert "未提供 ETF 列表，已自动加载有 holdings 数据的 ETF: 2 个" in stdout
+    assert "已跳过无 holdings 数据的 ETF: XLF" in stdout
     assert "Job ID: 22" in stdout
+
+
+def test_cmd_refresh_etfs_fetches_all_symbols_for_all_source(monkeypatch, capsys) -> None:
+    captured = {"calls": []}
+
+    def fake_http_json_request(method: str, url: str, payload=None, timeout: int = 10):
+        captured["calls"].append((method, url, payload, timeout))
+        if method == "GET":
+            return [
+                {"symbol": "XLK", "holdingsCount": 8},
+                {"symbol": "XLF", "holdingsCount": 0},
+                {"symbol": "SOXX", "holdingsCount": 12},
+            ]
+        return {
+            "job": {
+                "id": 32,
+                "status": "pending",
+                "queue_position": 1,
+                "message": "任务已进入队列",
+            }
+        }
+
+    monkeypatch.setattr(cli, "_http_json_request", fake_http_json_request)
+
+    args = cli.parse_cli_args(
+        [
+            "Actualiser",
+            "etfs",
+            "--source",
+            "all",
+            "--api-base",
+            "http://127.0.0.1:8000",
+        ]
+    )
+    args.func(args)
+
+    assert captured["calls"][1][2] == {
+        "symbols": ["XLK", "XLF", "SOXX"],
+        "source": "cli",
+        "refresh_source": "all",
+    }
+    stdout = capsys.readouterr().out
+    assert "未提供 ETF 列表，已自动加载全部 ETF: 3 个" in stdout
+    assert "已跳过无 holdings 数据的 ETF" not in stdout
+    assert "Job ID: 32" in stdout
 
 
 def test_cmd_refresh_holdings_posts_background_job(monkeypatch, capsys) -> None:
@@ -428,12 +557,66 @@ def test_cmd_refresh_holdings_posts_background_job(monkeypatch, capsys) -> None:
         ],
         "source": "cli",
         "refresh_source": "all",
+        "exclude_symbols": [],
     }
     assert captured["timeout"] == 10
 
     stdout = capsys.readouterr().out
     assert "Job ID: 12" in stdout
     assert "查询状态" in stdout
+
+
+def test_cmd_refresh_holdings_posts_exclude_symbols(monkeypatch, capsys) -> None:
+    captured = {}
+
+    def fake_http_json_request(method: str, url: str, payload=None, timeout: int = 10):
+        captured["method"] = method
+        captured["url"] = url
+        captured["payload"] = payload
+        captured["timeout"] = timeout
+        return {
+            "job": {
+                "id": 19,
+                "status": "pending",
+                "queue_position": 1,
+                "message": "任务已进入队列",
+            }
+        }
+
+    monkeypatch.setattr(cli, "_http_json_request", fake_http_json_request)
+    monkeypatch.setattr(cli, "_poll_refresh_job_until_terminal", lambda *args, **kwargs: None)
+
+    args = cli.parse_cli_args(
+        [
+            "Actualiser",
+            "holdings",
+            "-s",
+            "XTL",
+            "--source",
+            "futu",
+            "--exclude-symbols",
+            "UI,BRK.B",
+            "--api-base",
+            "http://127.0.0.1:8000",
+        ]
+    )
+    args.func(args)
+
+    assert captured["payload"] == {
+        "items": [
+            {
+                "symbol": "XTL",
+                "coverage_type": "top",
+                "coverage_value": 20,
+                "related_etf_symbols": [],
+            },
+        ],
+        "source": "cli",
+        "refresh_source": "futu",
+        "exclude_symbols": ["UI", "BRK.B"],
+    }
+    stdout = capsys.readouterr().out
+    assert "Job ID: 19" in stdout
 
 
 def test_cmd_refresh_holdings_prints_immediate_failure_details(monkeypatch, capsys) -> None:

@@ -121,6 +121,7 @@ class RefreshJobManager:
         items: List[Dict[str, Any]],
         source: str = "cli",
         refresh_source: str = "all",
+        exclude_symbols: Optional[List[Any]] = None,
     ) -> Dict[str, Any]:
         normalized_items: List[Dict[str, Any]] = []
         for item in items:
@@ -156,6 +157,7 @@ class RefreshJobManager:
             payload={
                 "items": normalized_items,
                 "refresh_source": str(refresh_source or "all").strip().lower() or "all",
+                "exclude_symbols": _dedupe_symbols(exclude_symbols or []),
             },
             progress_total=len(normalized_items),
         )
@@ -306,6 +308,7 @@ class RefreshJobManager:
 
         items = (job.payload or {}).get("items") or []
         refresh_source = str((job.payload or {}).get("refresh_source") or "all").strip().lower() or "all"
+        exclude_symbols = _dedupe_symbols((job.payload or {}).get("exclude_symbols") or [])
         results: List[Dict[str, Any]] = []
         failures = 0
 
@@ -327,6 +330,7 @@ class RefreshJobManager:
                     coverage_value=coverage_value,
                     related_etf_symbols=item.get("related_etf_symbols") or [],
                     refresh_source=refresh_source,
+                    exclude_symbols=exclude_symbols,
                 )
                 result = await refresh_holdings_by_coverage(symbol, request, db)
             except Exception as exc:
