@@ -47,6 +47,7 @@ import sys
 import os
 import json
 import re
+import socket
 import time
 from urllib import error as urllib_error
 from urllib import request as urllib_request
@@ -562,8 +563,9 @@ def _http_json_request(method: str, url: str, payload=None, timeout: int = 10):
         headers["Content-Type"] = "application/json"
 
     req = urllib_request.Request(url=url, data=body, method=method.upper(), headers=headers)
+    request_timeout = max(1, int(timeout))
     try:
-        with urllib_request.urlopen(req, timeout=max(1, int(timeout))) as response:
+        with urllib_request.urlopen(req, timeout=request_timeout) as response:
             raw = response.read().decode("utf-8")
             return json.loads(raw) if raw else {}
     except urllib_error.HTTPError as exc:
@@ -577,7 +579,17 @@ def _http_json_request(method: str, url: str, payload=None, timeout: int = 10):
             except Exception:
                 pass
         raise RuntimeError(f"API 请求失败 ({exc.code}): {detail or exc.reason}") from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise RuntimeError(
+            f"API 请求超时（{request_timeout} 秒）: {url}。"
+            "如后端当前繁忙，可增大 --timeout；提交 Actualiser etfs 时也可显式传 -s 避免先拉 ETF 目录。"
+        ) from exc
     except urllib_error.URLError as exc:
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            raise RuntimeError(
+                f"API 请求超时（{request_timeout} 秒）: {url}。"
+                "如后端当前繁忙，可增大 --timeout；提交 Actualiser etfs 时也可显式传 -s 避免先拉 ETF 目录。"
+            ) from exc
         raise RuntimeError(
             "无法连接后端 API，请先启动 FastAPI 服务，例如 `cd backend && .venv/bin/python -m uvicorn app.main:app --port 8000`"
         ) from exc
@@ -1347,10 +1359,21 @@ def cmd_import_finviz(args):
 
                 etf_record = db.query(ETF).filter(ETF.symbol == plan["etf_symbol"]).first()
                 if etf_record:
-                    existing_ranges = getattr(etf_record, 'coverage_ranges', None) or []
-                    if coverage_label not in existing_ranges:
-                        existing_ranges.append(coverage_label)
-                        etf_record.coverage_ranges = existing_ranges
+                    raw_ranges = getattr(etf_record, 'coverage_ranges', None) or []
+                    if isinstance(raw_ranges, str):
+                        try:
+                            parsed_ranges = json.loads(raw_ranges)
+                            raw_ranges = parsed_ranges if isinstance(parsed_ranges, list) else []
+                        except Exception:
+                            raw_ranges = []
+                    existing_ranges = [
+                        str(item).strip().lower()
+                        for item in raw_ranges
+                        if isinstance(item, str) and str(item).strip()
+                    ]
+                    next_ranges = [coverage_label, *[item for item in existing_ranges if item != coverage_label]]
+                    if next_ranges != existing_ranges:
+                        etf_record.coverage_ranges = next_ranges
                         etf_record.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
                 results.append({
@@ -1584,10 +1607,21 @@ def cmd_import_mc(args):
 
                 etf_record = db.query(ETF).filter(ETF.symbol == plan["etf_symbol"]).first()
                 if etf_record:
-                    existing_ranges = getattr(etf_record, 'coverage_ranges', None) or []
-                    if coverage_label not in existing_ranges:
-                        existing_ranges.append(coverage_label)
-                        etf_record.coverage_ranges = existing_ranges
+                    raw_ranges = getattr(etf_record, 'coverage_ranges', None) or []
+                    if isinstance(raw_ranges, str):
+                        try:
+                            parsed_ranges = json.loads(raw_ranges)
+                            raw_ranges = parsed_ranges if isinstance(parsed_ranges, list) else []
+                        except Exception:
+                            raw_ranges = []
+                    existing_ranges = [
+                        str(item).strip().lower()
+                        for item in raw_ranges
+                        if isinstance(item, str) and str(item).strip()
+                    ]
+                    next_ranges = [coverage_label, *[item for item in existing_ranges if item != coverage_label]]
+                    if next_ranges != existing_ranges:
+                        etf_record.coverage_ranges = next_ranges
                         etf_record.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
                 results.append({
@@ -2244,8 +2278,12 @@ def main():
 
     if args.command in {"uploads", "update", "init", "list-etfs", "list-holdings", "finviz", "mc"}:
         _ensure_db_dependencies()
-    
-    args.func(args)
+
+    try:
+        args.func(args)
+    except RuntimeError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == '__main__':

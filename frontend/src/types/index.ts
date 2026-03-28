@@ -407,6 +407,7 @@ export interface ETF {
   // Holdings data
   holdings?: Holding[];
   coverageRanges?: string[];
+  preferredCoverage?: string;
   sourceUpdatedAt?: Record<string, string | null>;
   
   // Metadata

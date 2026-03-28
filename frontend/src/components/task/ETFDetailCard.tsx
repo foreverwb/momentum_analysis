@@ -45,7 +45,9 @@ interface ETFDetailCardProps {
     dataStatus: DataStatus[];
   };
   coverageRanges?: string[];
+  preferredCoverage?: string;
   onRefreshHoldings: (coverageId: string, expectedSymbolsCount?: number, progressToken?: string) => Promise<unknown>;
+  onPreferredCoverageChange?: (coverageId: string) => void;
   onImportHoldings?: (coverageId?: string) => void;
   onViewStockDetail?: (ticker: string) => void;
   refreshResult?: RefreshResult;
@@ -341,7 +343,9 @@ const copyTextToClipboard = async (text: string): Promise<void> => {
 export function ETFDetailCard({
   etf,
   coverageRanges = [],
+  preferredCoverage,
   onRefreshHoldings,
+  onPreferredCoverageChange,
   onImportHoldings,
   onViewStockDetail,
   refreshResult,
@@ -428,6 +432,19 @@ export function ETFDetailCard({
       setActiveCoverage(availableCoverageOptions[0].id);
     }
   }, [activeCoverage, availableCoverageOptions]);
+
+  useEffect(() => {
+    const normalizedPreferredCoverage = preferredCoverage?.trim().toLowerCase();
+    if (!normalizedPreferredCoverage) {
+      return;
+    }
+    if (!availableCoverageOptions.some((option) => option.id === normalizedPreferredCoverage)) {
+      return;
+    }
+    if (normalizedPreferredCoverage !== activeCoverage) {
+      setActiveCoverage(normalizedPreferredCoverage as CoverageOption['id']);
+    }
+  }, [activeCoverage, availableCoverageOptions, preferredCoverage]);
 
   useEffect(() => {
     setCoverageCopyState('idle');
@@ -848,7 +865,10 @@ export function ETFDetailCard({
                 return (
                   <button
                     key={option.id}
-                    onClick={() => setActiveCoverage(option.id)}
+                    onClick={() => {
+                      setActiveCoverage(option.id);
+                      onPreferredCoverageChange?.(option.id);
+                    }}
                     className={getCoverageTabStyle(option, isActive)}
                   >
                     <span

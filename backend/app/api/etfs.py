@@ -468,6 +468,55 @@ def _format_coverage_label(coverage_type: str, coverage_value: int) -> str:
     return f"{coverage_kind}{coverage_value}"
 
 
+def _normalize_coverage_label(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return None
+    if normalized == "all" or normalized in COVERAGE_RANGE_PRIORITY:
+        return normalized
+    return None
+
+
+def _parse_persisted_coverage_ranges(raw_value: Any) -> List[str]:
+    raw_items: List[Any] = []
+    if isinstance(raw_value, list):
+        raw_items = raw_value
+    elif isinstance(raw_value, str):
+        try:
+            parsed = json.loads(raw_value)
+            if isinstance(parsed, list):
+                raw_items = parsed
+            else:
+                raw_items = [raw_value]
+        except Exception:
+            raw_items = [raw_value]
+
+    normalized_ranges: List[str] = []
+    seen = set()
+    for item in raw_items:
+        normalized = _normalize_coverage_label(item if isinstance(item, str) else None)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            normalized_ranges.append(normalized)
+    return normalized_ranges
+
+
+def _promote_etf_coverage_range(etf: Optional[ETF], coverage_label: Optional[str]) -> Optional[str]:
+    if etf is None:
+        return None
+    normalized = _normalize_coverage_label(coverage_label)
+    if not normalized:
+        return None
+
+    existing_ranges = _parse_persisted_coverage_ranges(getattr(etf, "coverage_ranges", None))
+    ordered_ranges = [normalized, *[item for item in existing_ranges if item != normalized]]
+    if ordered_ranges != existing_ranges:
+        etf.coverage_ranges = ordered_ranges
+    return normalized
+
+
 class HoldingsCoverageRequest(BaseModel):
     coverage_type: str
     coverage_value: int
@@ -962,31 +1011,17 @@ def format_etf_response(etf: ETF, include_holdings: bool = False, db: Session = 
     """格式化 ETF 响应数据"""
 
     # coverageRanges = 持久化导入范围 + 持仓动态推导范围（去重并按优先级排序）
-    coverage_ranges: List[str] = []
     coverage_seen = set()
+    persisted_coverage_ranges = _parse_persisted_coverage_ranges(getattr(etf, 'coverage_ranges', None))
+    preferred_coverage = persisted_coverage_ranges[0] if persisted_coverage_ranges else None
 
     def add_coverage(value: Optional[str]):
-        if not value:
-            return
-        normalized = str(value).strip().lower()
-        if normalized in COVERAGE_RANGE_PRIORITY and normalized not in coverage_seen:
+        normalized = _normalize_coverage_label(value)
+        if normalized and normalized not in coverage_seen:
             coverage_seen.add(normalized)
-            coverage_ranges.append(normalized)
 
-    persisted_ranges = getattr(etf, 'coverage_ranges', None)
-    if isinstance(persisted_ranges, list):
-        for item in persisted_ranges:
-            add_coverage(item if isinstance(item, str) else None)
-    elif isinstance(persisted_ranges, str):
-        parsed_ranges: List[str] = []
-        try:
-            parsed = json.loads(persisted_ranges)
-            if isinstance(parsed, list):
-                parsed_ranges = [str(item) for item in parsed if isinstance(item, str)]
-        except Exception:
-            parsed_ranges = []
-        for item in parsed_ranges:
-            add_coverage(item)
+    for item in persisted_coverage_ranges:
+        add_coverage(item)
 
     # 从持仓数据动态计算 coverageRanges
     if etf.holdings:
@@ -1029,6 +1064,7 @@ def format_etf_response(etf: ETF, include_holdings: bool = False, db: Session = 
         "completeness": etf.completeness or 0.0,
         "holdingsCount": etf.holdings_count or 0,
         "coverageRanges": ordered_coverage_ranges,
+        "preferredCoverage": preferred_coverage,
         "sourceUpdatedAt": _build_etf_source_updated_at(etf.symbol, db),
         # 兼容旧字段(lastUpdated)并提供统一字段(updatedAt)
         "updatedAt": utc_isoformat(etf.updated_at),
@@ -2507,6 +2543,7 @@ async def refresh_holdings_by_coverage(
     filtered_holdings = _filter_holdings_by_coverage(all_holdings, coverage_type, coverage_value)
 
     coverage_label = _format_coverage_label(coverage_type, coverage_value)
+    _promote_etf_coverage_range(etf, coverage_label)
     progress_token = _normalize_progress_token(request.progress_token)
     if request.progress_token and not progress_token:
         raise HTTPException(status_code=400, detail="Invalid progress_token")
@@ -2799,6 +2836,7 @@ async def refresh_holdings_by_coverage(
                 },
             )
         total_weight = sum(h.weight for h in filtered_holdings)
+        db.commit()
         return {
             "status": "snapshot",
             "symbol": symbol.upper(),

@@ -9,18 +9,16 @@ DEFAULT_W="80"
 DEFAULT_API_BASE="${MOMENTUM_API_BASE_URL:-http://127.0.0.1:8000}"
 
 # Keep these lists empty by default.
-# Add files only when you want to import the corresponding provider data.
+# Add file names only when you want to import the corresponding provider data.
+# Path resolution is handled by resolve_provider_file().
 finviz_list=()
 
-mc_list=(
-  "${DEFAULT_DOWNLOADS_DIR}/MC_w_80_1_24-03_08_38_N49.json"
-)
+mc_list=()
 
 # Holdings import target passed to `finviz/mc -s`.
 # Leave empty to infer from file name.
 # Example: target="XLK,IGV,SOXX,SMH"
-# target="XLC,XLE,XLF,XLK,XLV,XLY,SOXX,SMH,IGV,XSD,XTL"
-target="XTL"
+target="XLC,XLE,XLF,XLK,XLV,XLY,SOXX,SMH,IGV,XSD,XTL"
 
 # Known stock symbols that may be missing provider data.
 # These symbols will be passed to `Actualiser holdings --exclude-symbols`
@@ -514,16 +512,18 @@ submit_actualiser_jobs() {
   fi
 
   local etf_cmd=("Actualiser" "etfs" "--source" "$SOURCE_VALUE" "--api-base" "$API_BASE")
-  if [[ "$REFRESH_ALL_ETFS" -eq 0 ]]; then
-    if [[ -z "$etfs_csv" ]]; then
-      warn "no etf symbols inferred, skip Actualiser etfs"
-    else
-      etf_cmd+=("-s" "$etfs_csv")
-    fi
+  if [[ -n "$etfs_csv" ]]; then
+    etf_cmd+=("-s" "$etfs_csv")
+  elif [[ "$REFRESH_ALL_ETFS" -eq 0 ]]; then
+    warn "no etf symbols inferred, skip Actualiser etfs"
   fi
 
   if [[ "$REFRESH_ALL_ETFS" -eq 1 || -n "$etfs_csv" ]]; then
-    info "submit Actualiser etfs, source=$SOURCE_VALUE"
+    if [[ -n "$etfs_csv" ]]; then
+      info "submit Actualiser etfs, source=$SOURCE_VALUE, etfs=$etfs_csv"
+    else
+      info "submit Actualiser etfs, source=$SOURCE_VALUE"
+    fi
     if output="$(run_cli_capture "${etf_cmd[@]}")"; then
       printf '%s\n' "$output"
     else

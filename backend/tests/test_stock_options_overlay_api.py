@@ -99,3 +99,65 @@ async def test_stock_options_overlay_computes_bucket_deltas_from_iv_history() ->
         assert positioning["0-7"]["delta5d"] == 170.0
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_stock_options_overlay_prefers_latest_iv_totals_over_stale_stock_metrics() -> None:
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+    )
+    testing_session = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base.metadata.create_all(bind=engine)
+    db = testing_session()
+
+    try:
+        db.add(
+            Stock(
+                symbol="NVDA",
+                name="NVIDIA",
+                sector="XLK",
+                industry="Technology",
+                metrics={
+                    "call_oi_0_7": 409256.0,
+                    "put_oi_0_7": 401014.0,
+                    "oi_bucket_0_7": 810270.0,
+                },
+                scores={"options": 72},
+                changes={"delta3d": None, "delta5d": None},
+            )
+        )
+
+        db.add(
+            IVData(
+                symbol="NVDA",
+                date=date(2026, 3, 23),
+                call_oi_bucket_0_7=409256,
+                put_oi_bucket_0_7=401014,
+                oi_bucket_0_7=810270,
+                source="futu",
+            )
+        )
+        db.add(
+            IVData(
+                symbol="NVDA",
+                date=date(2026, 3, 24),
+                call_oi_bucket_0_7=531040,
+                put_oi_bucket_0_7=601694,
+                oi_bucket_0_7=1132734,
+                source="futu",
+            )
+        )
+        db.commit()
+
+        payload = await get_stock_options_overlay("NVDA", db)
+        positioning = {
+            row["bucket"]: row
+            for row in payload["positioning"]
+        }
+
+        assert positioning["0-7"]["callOI"] == 121784.0
+        assert positioning["0-7"]["putOI"] == 200680.0
+        assert positioning["0-7"]["netOI"] == 322464.0
+    finally:
+        db.close()

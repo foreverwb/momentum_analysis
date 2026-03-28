@@ -1305,20 +1305,22 @@ async def get_stock_options_overlay(
 
         computed: Dict[str, Dict[str, Any]] = {}
         for bucket, suffix in bucket_suffixes:
+            # Stock.metrics may lag the freshest IVData row by one refresh cycle.
+            # Use the latest IV snapshot as the current-source-of-truth for bucket totals.
             current_call_total = _as_float(
+                getattr(latest_iv_record, f"call_oi_bucket_{suffix}", None),
                 metrics.get(f"call_oi_{suffix}"),
                 metrics.get(f"call_oi_bucket_{suffix}"),
-                getattr(latest_iv_record, f"call_oi_bucket_{suffix}", None),
             )
             current_put_total = _as_float(
+                getattr(latest_iv_record, f"put_oi_bucket_{suffix}", None),
                 metrics.get(f"put_oi_{suffix}"),
                 metrics.get(f"put_oi_bucket_{suffix}"),
-                getattr(latest_iv_record, f"put_oi_bucket_{suffix}", None),
             )
             current_net_total = _as_float(
+                getattr(latest_iv_record, f"oi_bucket_{suffix}", None),
                 metrics.get(f"oi_bucket_{suffix}"),
                 metrics.get(f"net_oi_{suffix}"),
-                getattr(latest_iv_record, f"oi_bucket_{suffix}", None),
             )
             if current_net_total is None and current_call_total is not None and current_put_total is not None:
                 current_net_total = current_call_total + current_put_total
@@ -1396,23 +1398,26 @@ async def get_stock_options_overlay(
     for bucket, suffix in bucket_suffixes:
         history_row = iv_history_positioning.get(bucket) or {}
         call_oi = _as_float(
-            metrics.get(f"call_delta_oi_{suffix}"),
             history_row.get("callOI"),
+            getattr(latest_iv_record, f"call_delta_oi_{suffix}", None),
+            metrics.get(f"call_delta_oi_{suffix}"),
             metrics.get(f"call_oi_{suffix}"),
             metrics.get(f"call_oi_bucket_{suffix}"),
             mc_data.get(f"call_delta_oi_{suffix}"),
         )
         put_oi = _as_float(
-            metrics.get(f"put_delta_oi_{suffix}"),
             history_row.get("putOI"),
+            getattr(latest_iv_record, f"put_delta_oi_{suffix}", None),
+            metrics.get(f"put_delta_oi_{suffix}"),
             metrics.get(f"put_oi_{suffix}"),
             metrics.get(f"put_oi_bucket_{suffix}"),
             mc_data.get(f"put_delta_oi_{suffix}"),
         )
         net_oi = _as_float(
+            history_row.get("netOI"),
+            getattr(latest_iv_record, f"net_delta_oi_{suffix}", None),
             metrics.get(f"net_delta_oi_{suffix}"),
             metrics.get(f"delta_oi_{suffix}"),
-            history_row.get("netOI"),
             metrics.get(f"net_oi_{suffix}"),
             metrics.get(f"oi_bucket_{suffix}"),
             mc_data.get(f"net_delta_oi_{suffix}"),
@@ -1422,18 +1427,18 @@ async def get_stock_options_overlay(
         if net_oi is None and call_oi is not None and put_oi is not None:
             net_oi = call_oi - put_oi
         delta3d = _as_float(
+            history_row.get("delta3d"),
             metrics.get(f"delta3d_{suffix}"),
             metrics.get(f"delta_3d_{suffix}"),
             metrics.get(f"net_delta3d_{suffix}"),
-            history_row.get("delta3d"),
             mc_data.get(f"delta3d_{suffix}"),
             mc_data.get(f"delta_3d_{suffix}"),
         )
         delta5d = _as_float(
+            history_row.get("delta5d"),
             metrics.get(f"delta5d_{suffix}"),
             metrics.get(f"delta_5d_{suffix}"),
             metrics.get(f"net_delta5d_{suffix}"),
-            history_row.get("delta5d"),
             mc_data.get(f"delta5d_{suffix}"),
             mc_data.get(f"delta_5d_{suffix}"),
         )

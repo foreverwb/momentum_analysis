@@ -29,6 +29,10 @@ interface RelativeTrendChartProps {
   symbolRoleMap?: Record<string, TrendSymbolRole>;
   isLoading?: boolean;
   loadingText?: string;
+  onRefresh?: () => void | Promise<void>;
+  refreshDisabled?: boolean;
+  refreshLabel?: string;
+  emptyStateText?: string;
 }
 
 const DEFAULT_COLORS = ['#22c55e', '#3b82f6', '#8b5cf6', '#94a3b8', '#64748b', '#f59e0b'];
@@ -112,6 +116,10 @@ export function RelativeTrendChart({
   symbolRoleMap,
   isLoading = false,
   loadingText,
+  onRefresh,
+  refreshDisabled = false,
+  refreshLabel = '刷新',
+  emptyStateText,
 }: RelativeTrendChartProps) {
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const [hiddenSymbols, setHiddenSymbols] = useState<Record<string, boolean>>({});
@@ -464,6 +472,29 @@ export function RelativeTrendChart({
               ))}
             </div>
           )}
+          {onRefresh && (
+            <button
+              type="button"
+              onClick={() => void onRefresh()}
+              disabled={refreshDisabled || isLoading}
+              className="inline-flex h-9 w-9 items-center justify-center rounded-[var(--radius-sm)] border border-[var(--border-light)] bg-[var(--bg-primary)] text-[var(--text-muted)] transition-colors hover:bg-[var(--bg-tertiary)] hover:text-[var(--text-secondary)] disabled:cursor-not-allowed disabled:opacity-50"
+              title={refreshLabel}
+              aria-label={refreshLabel}
+            >
+              <svg
+                className={`h-4 w-4 ${isLoading ? 'animate-spin' : ''}`}
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+                <path d="M21 3v6h-6" />
+              </svg>
+            </button>
+          )}
         </div>
       </div>
 
@@ -490,7 +521,7 @@ export function RelativeTrendChart({
         )}
         {!hasData && !isLoading ? (
           <div className="absolute inset-0 flex items-center justify-center text-sm text-[var(--text-muted)]">
-            {!hasUnderlyingData ? '暂无可用走势数据' : '当前已隐藏全部曲线，请点击下方图例显示'}
+            {!hasUnderlyingData ? (emptyStateText || '暂无可用走势数据') : '当前已隐藏全部曲线，请点击下方图例显示'}
           </div>
         ) : (
           <svg width="100%" height="100%" viewBox={`0 0 ${chartWidth} ${chartHeight}`} preserveAspectRatio="xMidYMid meet">

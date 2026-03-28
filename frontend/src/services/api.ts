@@ -1430,6 +1430,7 @@ function normalizeETF(raw: unknown): ETF {
     holdingsCount: toNumber(source.holdingsCount) ?? 0,
     holdings,
     coverageRanges: toStringArray(source.coverageRanges),
+    preferredCoverage: toStringValue(source.preferredCoverage) ?? undefined,
     sourceUpdatedAt: Object.keys(sourceUpdatedAt).length > 0 ? sourceUpdatedAt : undefined,
     lastUpdated: toStringValue(source.lastUpdated) ?? toStringValue(source.updatedAt) ?? toStringValue(source.updated_at),
   };
@@ -2197,9 +2198,15 @@ function normalizeOptionsOverlayData(raw: unknown, fallbackSymbol: string): Opti
     if (!isRecord(value)) return null;
     const bucket = toStringValue(value.bucket ?? value.term ?? value.range ?? value.label);
     if (!bucket) return null;
-    const callOI = toMaybeNumber(value.callOI ?? value.call_oi);
-    const putOI = toMaybeNumber(value.putOI ?? value.put_oi);
-    const netOI = toMaybeNumber(value.netOI ?? value.net_oi) ?? (
+    const callOI = toMaybeNumber(
+      value.callOI ?? value.call_oi ?? value.call_delta_1d ?? value.callDelta1d ?? value.call_delta_oi
+    );
+    const putOI = toMaybeNumber(
+      value.putOI ?? value.put_oi ?? value.put_delta_1d ?? value.putDelta1d ?? value.put_delta_oi
+    );
+    const netOI = toMaybeNumber(
+      value.netOI ?? value.net_oi ?? value.net_delta_1d ?? value.netDelta1d ?? value.net_delta_oi
+    ) ?? (
       callOI != null && putOI != null ? callOI - putOI : null
     );
     const delta3d = toMaybeNumber(value.delta3d ?? value.delta_3d);

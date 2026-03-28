@@ -18,6 +18,7 @@ from datetime import datetime, date
 from enum import Enum
 import asyncio
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -1240,12 +1241,23 @@ class DataOrchestrator:
             try:
                 etf = db.query(ETF).filter(ETF.symbol == etf_symbol.upper()).first()
                 if etf:
-                    existing_ranges = getattr(etf, 'coverage_ranges', None) or []
-                    if coverage not in existing_ranges:
-                        existing_ranges.append(coverage)
-                        etf.coverage_ranges = existing_ranges
+                    raw_ranges = getattr(etf, 'coverage_ranges', None) or []
+                    if isinstance(raw_ranges, str):
+                        try:
+                            parsed_ranges = json.loads(raw_ranges)
+                            raw_ranges = parsed_ranges if isinstance(parsed_ranges, list) else []
+                        except Exception:
+                            raw_ranges = []
+                    existing_ranges = [
+                        str(item).strip().lower()
+                        for item in raw_ranges
+                        if isinstance(item, str) and str(item).strip()
+                    ]
+                    next_ranges = [coverage, *[item for item in existing_ranges if item != coverage]]
+                    if next_ranges != existing_ranges:
+                        etf.coverage_ranges = next_ranges
                         db.commit()
-                        logger.info(f"已更新 {etf_symbol} 的 coverage_ranges: {existing_ranges}")
+                        logger.info(f"已更新 {etf_symbol} 的 coverage_ranges: {next_ranges}")
             except Exception as e:
                 logger.warning(f"更新 coverage_ranges 失败 (可能数据库列不存在): {e}")
                 db.rollback()

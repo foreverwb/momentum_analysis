@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { RelativeTrendChart, type RelativeTrendSeries } from '../chart';
 import { ETFDetailCard } from './ETFDetailCard';
@@ -58,14 +58,17 @@ const TREND_METRIC_OPTIONS = [
 ];
 const TREND_METRICS: Array<'relative' | 'sma20' | 'return20d' | 'score'> = ['relative', 'sma20', 'return20d', 'score'];
 const TASK_TREND_CACHE_TTL_MS = 60 * 1000;
-const taskTrendCache = new Map<string, {
+const TASK_TREND_STORAGE_KEY = 'task-detail-trend-cache-v1';
+type TaskTrendCacheEntry = {
   cachedAt: number;
   dates: string[];
   series: RelativeTrendSeries[];
   priceSeries: RelativeTrendSeries[];
   sma20Series: RelativeTrendSeries[];
-}>();
+};
+const taskTrendCache = new Map<string, TaskTrendCacheEntry>();
 const taskTrendInFlight = new Map<string, Promise<void>>();
+let taskTrendStorageBoundaryMs: number | null = null;
 
 const toTaskTrendCacheKey = (
   taskId: number,
@@ -115,13 +118,112 @@ const hasRequiredSymbolsData = (
   });
 };
 
-const hasRenderableTrendCache = (cacheEntry?: {
-  dates: string[];
-  series: RelativeTrendSeries[];
-} | null): boolean => {
+const hasRenderableTrendCache = (cacheEntry?: Pick<TaskTrendCacheEntry, 'dates' | 'series'> | null): boolean => {
   if (!cacheEntry) return false;
   if (!Array.isArray(cacheEntry.dates) || cacheEntry.dates.length <= 1) return false;
   return cacheEntry.series.some((item) => hasValidSeriesValues(item.values));
+};
+
+const sanitizeStoredTrendValues = (rawValues: unknown): Array<number | null> => {
+  if (!Array.isArray(rawValues)) return [];
+  return rawValues.map((value) => (typeof value === 'number' && Number.isFinite(value) ? value : null));
+};
+
+const sanitizeStoredTrendSeries = (rawSeries: unknown): RelativeTrendSeries[] => {
+  if (!Array.isArray(rawSeries)) return [];
+  return rawSeries.reduce<RelativeTrendSeries[]>((acc, item) => {
+    if (typeof item !== 'object' || item === null) return acc;
+    const record = item as Record<string, unknown>;
+    const symbol = typeof record.symbol === 'string' ? record.symbol.trim().toUpperCase() : '';
+    if (!symbol) return acc;
+    const color = typeof record.color === 'string' && record.color.trim() ? record.color.trim() : undefined;
+    acc.push({
+      symbol,
+      values: sanitizeStoredTrendValues(record.values),
+      ...(color ? { color } : {}),
+    });
+    return acc;
+  }, []);
+};
+
+const normalizeTaskTrendCacheEntry = (rawEntry: unknown): TaskTrendCacheEntry | null => {
+  if (typeof rawEntry !== 'object' || rawEntry === null) return null;
+  const record = rawEntry as Record<string, unknown>;
+  const cachedAt = typeof record.cachedAt === 'number' ? record.cachedAt : Number.NaN;
+  if (!Number.isFinite(cachedAt)) return null;
+  const dates = Array.isArray(record.dates)
+    ? record.dates.filter((item): item is string => typeof item === 'string')
+    : [];
+  return {
+    cachedAt,
+    dates,
+    series: sanitizeStoredTrendSeries(record.series),
+    priceSeries: sanitizeStoredTrendSeries(record.priceSeries),
+    sma20Series: sanitizeStoredTrendSeries(record.sma20Series),
+  };
+};
+
+const pruneTaskTrendCache = (boundaryMs: number): void => {
+  taskTrendCache.forEach((entry, cacheKey) => {
+    if (!Number.isFinite(entry.cachedAt) || entry.cachedAt < boundaryMs) {
+      taskTrendCache.delete(cacheKey);
+    }
+  });
+};
+
+const persistTaskTrendCache = (boundaryMs: number = getBeijingCutoffBoundaryMs(Date.now())): void => {
+  pruneTaskTrendCache(boundaryMs);
+  if (typeof window === 'undefined') {
+    return;
+  }
+  try {
+    const payload: Record<string, TaskTrendCacheEntry> = {};
+    taskTrendCache.forEach((entry, cacheKey) => {
+      if (!Number.isFinite(entry.cachedAt) || entry.cachedAt < boundaryMs) {
+        return;
+      }
+      payload[cacheKey] = entry;
+    });
+    localStorage.setItem(TASK_TREND_STORAGE_KEY, JSON.stringify(payload));
+  } catch {
+    // ignore storage errors
+  }
+};
+
+const loadPersistedTaskTrendCache = (boundaryMs: number = getBeijingCutoffBoundaryMs(Date.now())): void => {
+  pruneTaskTrendCache(boundaryMs);
+  if (typeof window === 'undefined' || taskTrendStorageBoundaryMs === boundaryMs) {
+    return;
+  }
+  taskTrendStorageBoundaryMs = boundaryMs;
+  let shouldPersist = false;
+  try {
+    const raw = localStorage.getItem(TASK_TREND_STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== 'object' || parsed === null) {
+      shouldPersist = true;
+      return;
+    }
+    Object.entries(parsed as Record<string, unknown>).forEach(([cacheKey, rawEntry]) => {
+      if (typeof cacheKey !== 'string' || !cacheKey.trim()) {
+        shouldPersist = true;
+        return;
+      }
+      const normalizedEntry = normalizeTaskTrendCacheEntry(rawEntry);
+      if (!normalizedEntry || normalizedEntry.cachedAt < boundaryMs) {
+        shouldPersist = true;
+        return;
+      }
+      taskTrendCache.set(cacheKey, normalizedEntry);
+    });
+  } catch {
+    shouldPersist = true;
+  } finally {
+    if (shouldPersist) {
+      persistTaskTrendCache(boundaryMs);
+    }
+  }
 };
 
 const isTaskTrendCacheFresh = (
@@ -294,6 +396,43 @@ const IMPORT_SYMBOL_KEYS = [
 ] as const;
 const COVERAGE_PATTERN = /^(top|weight)(\d+)$/i;
 const ALL_COVERAGE_ID = 'all';
+const PREFERRED_COVERAGE_STORAGE_PREFIX = 'task-detail-preferred-coverage-v1';
+
+const normalizeCoverageId = (value: unknown): string | undefined => {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return undefined;
+  if (normalized === ALL_COVERAGE_ID || COVERAGE_PATTERN.test(normalized)) {
+    return normalized;
+  }
+  return undefined;
+};
+
+const getPreferredCoverageStorageKey = (taskId: number): string =>
+  `${PREFERRED_COVERAGE_STORAGE_PREFIX}:${taskId}`;
+
+const loadStoredPreferredCoverage = (taskId: number): string | undefined => {
+  if (typeof window === 'undefined') return undefined;
+  try {
+    return normalizeCoverageId(localStorage.getItem(getPreferredCoverageStorageKey(taskId)));
+  } catch {
+    return undefined;
+  }
+};
+
+const saveStoredPreferredCoverage = (taskId: number, coverage?: string) => {
+  if (typeof window === 'undefined') return;
+  try {
+    const normalized = normalizeCoverageId(coverage);
+    if (!normalized) {
+      localStorage.removeItem(getPreferredCoverageStorageKey(taskId));
+      return;
+    }
+    localStorage.setItem(getPreferredCoverageStorageKey(taskId), normalized);
+  } catch {
+    // ignore storage errors
+  }
+};
 
 const extractImportRows = (payload: unknown): unknown[] | null => {
   if (Array.isArray(payload)) return payload;
@@ -522,8 +661,35 @@ interface ETFDetailData {
     count?: number;
   }>;
   coverageRanges: string[];
+  preferredCoverage?: string;
   sourceUpdatedAt?: Partial<Record<SourceKey, string | null>>;
 }
+
+const pickPreferredCoverageFromDetails = (
+  details: Array<{ preferredCoverage?: string }>
+): string | undefined => {
+  const ranked = new Map<string, { count: number; firstIndex: number }>();
+  details.forEach((detail, index) => {
+    const normalized = normalizeCoverageId(detail.preferredCoverage);
+    if (!normalized) return;
+    const current = ranked.get(normalized);
+    if (current) {
+      current.count += 1;
+      return;
+    }
+    ranked.set(normalized, { count: 1, firstIndex: index });
+  });
+
+  return Array.from(ranked.entries())
+    .sort((left, right) => {
+      const [, leftMeta] = left;
+      const [, rightMeta] = right;
+      if (rightMeta.count !== leftMeta.count) {
+        return rightMeta.count - leftMeta.count;
+      }
+      return leftMeta.firstIndex - rightMeta.firstIndex;
+    })[0]?.[0];
+};
 
 const pickLatestIsoTimestamp = (values: Array<string | null | undefined>): string | undefined => {
   let latestTs = Number.NEGATIVE_INFINITY;
@@ -636,6 +802,9 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
   const [etfModalOpen, setETFModalOpen] = useState(false);
   const [selectedETF, setSelectedETF] = useState<string>('');
   const [selectedCoverage, setSelectedCoverage] = useState<string | undefined>();
+  const [preferredCoverage, setPreferredCoverage] = useState<string | undefined>(
+    () => loadStoredPreferredCoverage(task.id)
+  );
   const [coverageRangesByETF, setCoverageRangesByETF] = useState<Record<string, string[]>>({});
   const [resolvedEtfs, setResolvedEtfs] = useState<string[]>(
     () => resolveMonitoredEtfs(task.etfs, task.type, task.sector)
@@ -649,6 +818,13 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
   const taskBaseIndicesKey = useMemo(() => getSymbolsKey(taskBaseIndices), [taskBaseIndices]);
   const primaryBaseIndex = taskBaseIndices[0] || 'SPY';
 
+  const applyPreferredCoverage = (coverageId?: string) => {
+    const normalized = normalizeCoverageId(coverageId);
+    if (normalized) {
+      setPreferredCoverage(normalized);
+    }
+  };
+
   // API 数据状态
   const [etfDetails, setEtfDetails] = useState<ETFDetailData[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -658,6 +834,7 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
   const [trendPriceSeries, setTrendPriceSeries] = useState<RelativeTrendSeries[]>([]);
   const [trendSma20Series, setTrendSma20Series] = useState<RelativeTrendSeries[]>([]);
   const [isTrendLoading, setIsTrendLoading] = useState(false);
+  const [isTrendCacheHydrated, setIsTrendCacheHydrated] = useState(() => typeof window === 'undefined');
   const [trendError, setTrendError] = useState<string | null>(null);
 
   // WebSocket 刷新全部状态
@@ -677,6 +854,7 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
     () => loadStoredSourceUpdatedAt(task.id)
   );
   const [clockNowMs, setClockNowMs] = useState<number>(() => Date.now());
+  const resetBoundaryMs = useMemo(() => getBeijingCutoffBoundaryMs(clockNowMs), [clockNowMs]);
   const trendCacheScopeKey = useMemo(
     () =>
       toTaskTrendScopeKey({
@@ -687,6 +865,32 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
       }),
     [resolvedEtfsKey, taskBaseIndicesKey, task.sector, lastRefreshAllAt, task.updatedAt]
   );
+  const selectedTrendCacheKey = useMemo(
+    () =>
+      task.id
+        ? toTaskTrendCacheKey(task.id, trendPeriod, trendMetric, trendLabelTimezone, trendCacheScopeKey)
+        : '',
+    [task.id, trendPeriod, trendMetric, trendLabelTimezone, trendCacheScopeKey]
+  );
+  const trendRefreshSequenceRef = useRef(0);
+  const activeTrendCacheKeyRef = useRef(selectedTrendCacheKey);
+  const clearTrendData = useCallback(() => {
+    setTrendDates([]);
+    setTrendSeries([]);
+    setTrendPriceSeries([]);
+    setTrendSma20Series([]);
+  }, []);
+  const applyTrendCacheEntry = useCallback((cacheEntry?: TaskTrendCacheEntry | null): boolean => {
+    if (!cacheEntry) {
+      clearTrendData();
+      return false;
+    }
+    setTrendDates(cacheEntry.dates);
+    setTrendSeries(cacheEntry.series);
+    setTrendPriceSeries(cacheEntry.priceSeries);
+    setTrendSma20Series(cacheEntry.sma20Series);
+    return true;
+  }, [clearTrendData]);
   const createFallbackETFDetail = (symbol: string, totalCount: number): ETFDetailData => ({
     symbol,
     name: getETFName(symbol),
@@ -706,6 +910,7 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
       { source: '期权数据', status: 'missing', updatedAt: null },
     ],
     coverageRanges: [],
+    preferredCoverage: undefined,
     sourceUpdatedAt: {},
   });
 
@@ -756,6 +961,7 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
               holdings: etf.holdings || [],
               dataStatus: generateDataStatus(etf),
               coverageRanges: etf.coverageRanges || [],
+              preferredCoverage: etf.preferredCoverage,
               sourceUpdatedAt: etf.sourceUpdatedAt || {},
             };
           }
@@ -769,6 +975,10 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
       
       const results = await Promise.all(etfDataPromises);
       const sortedResults = applySortedEtfDetails(results, { orderHint: symbols, cacheKey });
+      const backendPreferredCoverage = pickPreferredCoverageFromDetails(sortedResults);
+      if (backendPreferredCoverage) {
+        setPreferredCoverage((prev) => normalizeCoverageId(prev) ?? backendPreferredCoverage);
+      }
       setSelectedETF((prev) => prev || sortedResults[0]?.symbol || '');
     } catch (e) {
       if (!silent) {
@@ -797,12 +1007,24 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
   }, [task.id]);
 
   useEffect(() => {
+    setPreferredCoverage(loadStoredPreferredCoverage(task.id));
+  }, [task.id]);
+
+  useEffect(() => {
     setLastRefreshAllAt(task.updatedAt ?? null);
   }, [task.id, task.updatedAt]);
 
   useEffect(() => {
+    activeTrendCacheKeyRef.current = selectedTrendCacheKey;
+  }, [selectedTrendCacheKey]);
+
+  useEffect(() => {
     saveStoredSourceUpdatedAt(task.id, sourceUpdatedAtMap);
   }, [task.id, sourceUpdatedAtMap]);
+
+  useEffect(() => {
+    saveStoredPreferredCoverage(task.id, preferredCoverage);
+  }, [task.id, preferredCoverage]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -891,14 +1113,16 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
     });
   }, [etfDetails]);
 
-  useEffect(() => {
+  const handleTrendRefresh = useCallback(async () => {
     if (!task.id) {
       return;
     }
-    let cancelled = false;
+
+    const refreshSequence = trendRefreshSequenceRef.current + 1;
+    trendRefreshSequenceRef.current = refreshSequence;
+    const requestSelectionKey = selectedTrendCacheKey;
     const periodValue = trendPeriod === '5d' ? 5 : trendPeriod === '20d' ? 20 : 63;
     const baseSymbols = taskBaseIndices.map((symbol) => symbol.toUpperCase());
-    const baseSymbol = baseSymbols[0];
     const sectorSymbol = task.sector?.toUpperCase();
     const marketSymbols = Array.from(
       new Set(
@@ -916,26 +1140,6 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
     if (sectorSymbol) {
       reservedColors[sectorSymbol] = '#8b5cf6';
     }
-    const setTrendFromCache = (metric: 'relative' | 'sma20' | 'return20d' | 'score'): boolean => {
-      const cacheKey = toTaskTrendCacheKey(task.id, trendPeriod, metric, trendLabelTimezone, trendCacheScopeKey);
-      const cached = taskTrendCache.get(cacheKey);
-      if (!cached) return false;
-      setTrendDates(cached.dates);
-      setTrendSeries(cached.series);
-      setTrendPriceSeries(cached.priceSeries);
-      setTrendSma20Series(cached.sma20Series);
-      return true;
-    };
-    const selectedCacheKey = toTaskTrendCacheKey(task.id, trendPeriod, trendMetric, trendLabelTimezone, trendCacheScopeKey);
-    const selectedCached = taskTrendCache.get(selectedCacheKey);
-    if (selectedCached) {
-      setTrendDates(selectedCached.dates);
-      setTrendSeries(selectedCached.series);
-      setTrendPriceSeries(selectedCached.priceSeries);
-      setTrendSma20Series(selectedCached.sma20Series);
-      setTrendError(null);
-    }
-
     const metricsToFetch = TREND_METRICS.filter((metric) => {
       const cacheKey = toTaskTrendCacheKey(task.id, trendPeriod, metric, trendLabelTimezone, trendCacheScopeKey);
       const cached = taskTrendCache.get(cacheKey);
@@ -947,183 +1151,186 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
     });
 
     setTrendError(null);
+    setIsTrendLoading(true);
 
-    const loadTrendData = async () => {
-      try {
-        let dailySynced = false;
-        if (marketSymbols.length > 0) {
-          try {
-            dailySynced = await api.ensureDailyPriceSync(marketSymbols);
-          } catch (dailySyncError) {
-            console.warn('Daily price sync check failed:', dailySyncError);
-          }
-          if (cancelled) return;
+    try {
+      let dailySynced = false;
+      if (marketSymbols.length > 0) {
+        try {
+          dailySynced = await api.ensureDailyPriceSync(marketSymbols);
+        } catch (dailySyncError) {
+          console.warn('Daily price sync check failed:', dailySyncError);
         }
+      }
 
-        const metricsToLoad = dailySynced ? TREND_METRICS : metricsToFetch;
-        if (metricsToLoad.length === 0) {
-          setTrendError(null);
-          setIsTrendLoading(false);
-          return;
-        }
-
-        setIsTrendLoading(true);
-        let warmupPromise: Promise<unknown> | null = null;
-        const ensureWarmup = (): Promise<unknown> => {
-          if (warmupPromise) {
-            return warmupPromise;
-          }
-          warmupPromise = api.syncPriceDataForSymbols(marketSymbols).catch((syncError) => {
-            console.warn('Market trend data warmup failed:', syncError);
-            return null;
-          });
+      const metricsToLoad = dailySynced ? TREND_METRICS : metricsToFetch;
+      let warmupPromise: Promise<unknown> | null = null;
+      const ensureWarmup = (): Promise<unknown> => {
+        if (warmupPromise) {
           return warmupPromise;
-        };
+        }
+        warmupPromise = api.syncPriceDataForSymbols(marketSymbols).catch((syncError) => {
+          console.warn('Market trend data warmup failed:', syncError);
+          return null;
+        });
+        return warmupPromise;
+      };
 
-        const withSeriesColors = (
-          seriesItems: Array<{ symbol: string; values: Array<number | null> }> | undefined
-        ): RelativeTrendSeries[] => {
-          let paletteIndex = 0;
-          const usedColors = new Set(Object.values(reservedColors));
-          return (seriesItems || []).map((item) => {
-            const key = item.symbol?.toUpperCase?.() ?? '';
-            if (reservedColors[key]) {
-              return {
-                symbol: item.symbol,
-                values: item.values,
-                color: reservedColors[key],
-              };
-            }
-            let attempts = 0;
-            while (
-              usedColors.has(TREND_COLORS[paletteIndex % TREND_COLORS.length]) &&
-              attempts < TREND_COLORS.length
-            ) {
-              paletteIndex += 1;
-              attempts += 1;
-            }
-            const color = TREND_COLORS[paletteIndex % TREND_COLORS.length];
-            usedColors.add(color);
-            paletteIndex += 1;
+      const withSeriesColors = (
+        seriesItems: Array<{ symbol: string; values: Array<number | null> }> | undefined
+      ): RelativeTrendSeries[] => {
+        let paletteIndex = 0;
+        const usedColors = new Set(Object.values(reservedColors));
+        return (seriesItems || []).map((item) => {
+          const key = item.symbol?.toUpperCase?.() ?? '';
+          if (reservedColors[key]) {
             return {
               symbol: item.symbol,
               values: item.values,
-              color,
+              color: reservedColors[key],
             };
+          }
+          let attempts = 0;
+          while (
+            usedColors.has(TREND_COLORS[paletteIndex % TREND_COLORS.length]) &&
+            attempts < TREND_COLORS.length
+          ) {
+            paletteIndex += 1;
+            attempts += 1;
+          }
+          const color = TREND_COLORS[paletteIndex % TREND_COLORS.length];
+          usedColors.add(color);
+          paletteIndex += 1;
+          return {
+            symbol: item.symbol,
+            values: item.values,
+            color,
+          };
+        });
+      };
+
+      const fetchMetricTrend = async (metric: 'relative' | 'sma20' | 'return20d' | 'score') => {
+        const cacheKey = toTaskTrendCacheKey(task.id, trendPeriod, metric, trendLabelTimezone, trendCacheScopeKey);
+        const cacheEntry = taskTrendCache.get(cacheKey);
+        if (cacheEntry && !dailySynced) {
+          const shouldReuseCache =
+            isTaskTrendCacheFresh(cacheEntry) &&
+            (metric !== trendMetric || hasRenderableTrendCache(cacheEntry));
+          if (shouldReuseCache) {
+            return;
+          }
+        }
+
+        const inFlight = taskTrendInFlight.get(cacheKey);
+        if (inFlight) {
+          await inFlight;
+          if (!dailySynced && taskTrendCache.has(cacheKey)) {
+            return;
+          }
+        }
+
+        const requestPromise = (async () => {
+          let resp = await api.getTaskTrendComparison(task.id, periodValue, metric, trendLabelTimezone);
+          if (
+            metric !== 'score' &&
+            marketSymbols.length > 0 &&
+            !hasRequiredSymbolsData(resp.price_series || resp.series, marketSymbols)
+          ) {
+            await ensureWarmup();
+            resp = await api.getTaskTrendComparison(task.id, periodValue, metric, trendLabelTimezone);
+          }
+          const baseSeriesRaw =
+            metric === 'sma20' && Array.isArray(resp.deviation_series)
+              ? resp.deviation_series
+              : resp.series;
+          const seriesWithColors = withSeriesColors(baseSeriesRaw);
+          const priceSeriesWithColors =
+            metric === 'sma20' ? withSeriesColors(resp.price_series) : [];
+          const sma20SeriesWithColors =
+            metric === 'sma20' ? withSeriesColors(resp.sma20_series) : [];
+          taskTrendCache.set(cacheKey, {
+            cachedAt: Date.now(),
+            dates: resp.dates || [],
+            series: seriesWithColors,
+            priceSeries: priceSeriesWithColors,
+            sma20Series: sma20SeriesWithColors,
           });
-        };
+          persistTaskTrendCache();
+        })();
 
-        const fetchMetricTrend = async (metric: 'relative' | 'sma20' | 'return20d' | 'score') => {
-          const cacheKey = toTaskTrendCacheKey(task.id, trendPeriod, metric, trendLabelTimezone, trendCacheScopeKey);
-          const cacheEntry = taskTrendCache.get(cacheKey);
-          if (cacheEntry && !dailySynced) {
-            const shouldReuseCache =
-              isTaskTrendCacheFresh(cacheEntry) &&
-              (metric !== trendMetric || hasRenderableTrendCache(cacheEntry));
-            if (shouldReuseCache) {
-              return;
-            }
+        taskTrendInFlight.set(cacheKey, requestPromise);
+        try {
+          await requestPromise;
+        } finally {
+          if (taskTrendInFlight.get(cacheKey) === requestPromise) {
+            taskTrendInFlight.delete(cacheKey);
           }
-
-          const inFlight = taskTrendInFlight.get(cacheKey);
-          if (inFlight) {
-            await inFlight;
-            if (!dailySynced && taskTrendCache.has(cacheKey)) {
-              return;
-            }
-          }
-
-          const requestPromise = (async () => {
-            let resp = await api.getTaskTrendComparison(task.id, periodValue, metric, trendLabelTimezone);
-            if (
-              metric !== 'score' &&
-              marketSymbols.length > 0 &&
-              !hasRequiredSymbolsData(resp.price_series || resp.series, marketSymbols)
-            ) {
-              await ensureWarmup();
-              resp = await api.getTaskTrendComparison(task.id, periodValue, metric, trendLabelTimezone);
-            }
-            const baseSeriesRaw =
-              metric === 'sma20' && Array.isArray(resp.deviation_series)
-                ? resp.deviation_series
-                : resp.series;
-            const seriesWithColors = withSeriesColors(baseSeriesRaw);
-            const priceSeriesWithColors =
-              metric === 'sma20' ? withSeriesColors(resp.price_series) : [];
-            const sma20SeriesWithColors =
-              metric === 'sma20' ? withSeriesColors(resp.sma20_series) : [];
-            taskTrendCache.set(cacheKey, {
-              cachedAt: Date.now(),
-              dates: resp.dates || [],
-              series: seriesWithColors,
-              priceSeries: priceSeriesWithColors,
-              sma20Series: sma20SeriesWithColors,
-            });
-          })();
-
-          taskTrendInFlight.set(cacheKey, requestPromise);
-          try {
-            await requestPromise;
-          } finally {
-            if (taskTrendInFlight.get(cacheKey) === requestPromise) {
-              taskTrendInFlight.delete(cacheKey);
-            }
-          }
-        };
-
-        const results = await Promise.allSettled(metricsToLoad.map((metric) => fetchMetricTrend(metric)));
-        if (cancelled) return;
-
-        const hasSelectedMetricCache = setTrendFromCache(trendMetric);
-        if (!hasSelectedMetricCache) {
-          setTrendDates([]);
-          setTrendSeries([]);
-          setTrendPriceSeries([]);
-          setTrendSma20Series([]);
         }
+      };
 
-        const failedResults = results.filter(
-          (result): result is PromiseRejectedResult => result.status === 'rejected'
-        );
-        if (!hasSelectedMetricCache && failedResults.length > 0) {
-          const firstReason = failedResults[0].reason;
-          setTrendError(firstReason instanceof Error ? firstReason.message : '走势数据加载失败');
-        } else {
-          setTrendError(null);
-        }
-      } catch (e) {
-        if (cancelled) return;
-        if (!selectedCached) {
-          setTrendDates([]);
-          setTrendSeries([]);
-          setTrendPriceSeries([]);
-          setTrendSma20Series([]);
-        }
-        setTrendError(e instanceof Error ? e.message : '走势数据加载失败');
-      } finally {
-        if (cancelled) return;
+      const results = await Promise.allSettled(metricsToLoad.map((metric) => fetchMetricTrend(metric)));
+      if (trendRefreshSequenceRef.current !== refreshSequence) {
+        return;
+      }
+      if (activeTrendCacheKeyRef.current !== requestSelectionKey) {
+        return;
+      }
+
+      const hasSelectedMetricCache = applyTrendCacheEntry(taskTrendCache.get(requestSelectionKey));
+      const failedResults = results.filter(
+        (result): result is PromiseRejectedResult => result.status === 'rejected'
+      );
+      if (!hasSelectedMetricCache && failedResults.length > 0) {
+        const firstReason = failedResults[0].reason;
+        setTrendError(firstReason instanceof Error ? firstReason.message : '走势数据加载失败');
+      } else {
+        setTrendError(null);
+      }
+    } catch (e) {
+      if (trendRefreshSequenceRef.current !== refreshSequence) {
+        return;
+      }
+      if (activeTrendCacheKeyRef.current !== requestSelectionKey) {
+        return;
+      }
+      if (!taskTrendCache.get(requestSelectionKey)) {
+        clearTrendData();
+      }
+      setTrendError(e instanceof Error ? e.message : '走势数据加载失败');
+    } finally {
+      if (trendRefreshSequenceRef.current === refreshSequence) {
         setIsTrendLoading(false);
       }
-    };
-
-    void loadTrendData();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [task.id, resolvedEtfsKey, taskBaseIndicesKey, task.sector, trendPeriod, trendMetric, trendLabelTimezone, trendCacheScopeKey]);
+    }
+  }, [
+    applyTrendCacheEntry,
+    clearTrendData,
+    resolvedEtfs,
+    selectedTrendCacheKey,
+    task.id,
+    task.sector,
+    taskBaseIndices,
+    trendCacheScopeKey,
+    trendLabelTimezone,
+    trendMetric,
+    trendPeriod,
+  ]);
 
   useEffect(() => {
-    if (!task.id) return;
-    const cacheKey = toTaskTrendCacheKey(task.id, trendPeriod, trendMetric, trendLabelTimezone, trendCacheScopeKey);
-    const cached = taskTrendCache.get(cacheKey);
-    if (!cached) return;
-    setTrendDates(cached.dates);
-    setTrendSeries(cached.series);
-    setTrendPriceSeries(cached.priceSeries);
-    setTrendSma20Series(cached.sma20Series);
+    loadPersistedTaskTrendCache(resetBoundaryMs);
+    setIsTrendCacheHydrated(true);
+  }, [resetBoundaryMs]);
+
+  useEffect(() => {
+    if (!task.id) {
+      clearTrendData();
+      setTrendError(null);
+      return;
+    }
+    const cached = taskTrendCache.get(selectedTrendCacheKey);
+    applyTrendCacheEntry(cached);
     setTrendError(null);
-  }, [task.id, trendPeriod, trendMetric, trendLabelTimezone, trendCacheScopeKey]);
+  }, [applyTrendCacheEntry, clearTrendData, selectedTrendCacheKey, task.id]);
 
   useEffect(() => {
     if (!resolvedEtfs.length) {
@@ -1232,7 +1439,6 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
     return task.updatedAt || task.createdAt;
   }, [lastRefreshAllAt, etfDetails, task.updatedAt, task.createdAt]);
   const latestUpdatedAtLabel = useMemo(() => formatUpdateDate(latestUpdatedAt), [latestUpdatedAt]);
-  const resetBoundaryMs = useMemo(() => getBeijingCutoffBoundaryMs(clockNowMs), [clockNowMs]);
   const effectiveSourceUpdatedAtMap = useMemo(
     () => ({
       ...sourceUpdatedAtMap,
@@ -1310,6 +1516,10 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
     }
     return (value: number) => `${value.toFixed(1)}%`;
   }, [trendMetric]);
+  const selectedTrendCacheEntry = task.id ? taskTrendCache.get(selectedTrendCacheKey) : undefined;
+  const trendEmptyStateText = (selectedTrendCacheEntry || !isTrendCacheHydrated)
+    ? undefined
+    : '点击右上角刷新获取走势数据';
 
   const markSourcesUpdated = (sources: SourceKey[], updatedAt?: string) => {
     if (!sources.length) return;
@@ -1427,6 +1637,7 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
     expectedSymbolsCount?: number,
     progressToken?: string
   ) => {
+    applyPreferredCoverage(coverageId);
     const parsedCoverage = parseCoverageSelection(coverageId);
     const normalizedSymbol = symbol.trim().toUpperCase();
     const targetEtfDetail = etfDetails.find((etfDetail) => etfDetail.symbol === normalizedSymbol);
@@ -1480,6 +1691,7 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
       );
 
       console.log('Holdings refresh response:', response);
+      applyPreferredCoverage(coverageId);
 
       const responseRecord = response as unknown as Record<string, unknown>;
       const updatedAtRaw = responseRecord['updated_at'];
@@ -1727,7 +1939,9 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
 
   const handleOpenHoldingsModal = (symbol: string, coverageId?: string) => {
     setSelectedETF(symbol);
-    setSelectedCoverage(coverageId);
+    const normalizedCoverage = normalizeCoverageId(coverageId);
+    setSelectedCoverage(normalizedCoverage);
+    applyPreferredCoverage(normalizedCoverage);
     setHoldingsModalOpen(true);
   };
 
@@ -1888,10 +2102,13 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
           valueFormatter={trendValueFormatter}
           baseSymbol={primaryBaseIndex}
           symbolRoleMap={trendSymbolRoleMap}
+          isLoading={isTrendLoading || !isTrendCacheHydrated}
+          loadingText={isTrendLoading ? '正在刷新走势数据...' : '正在加载走势数据...'}
+          onRefresh={handleTrendRefresh}
+          refreshDisabled={!task.id || !resolvedEtfs.length}
+          refreshLabel="刷新走势数据"
+          emptyStateText={trendEmptyStateText}
         />
-        {isTrendLoading && (
-          <div className="text-xs text-[var(--text-muted)] mt-2">走势数据加载中...</div>
-        )}
       </div>
 
       {/* ETF Cards Section */}
@@ -1911,7 +2128,9 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
                 key={etf.symbol}
                 etf={etf}
                 coverageRanges={mergedRanges}
+                preferredCoverage={preferredCoverage ?? etf.preferredCoverage}
                 refreshResult={latestRefreshResults[etf.symbol]}
+                onPreferredCoverageChange={applyPreferredCoverage}
                 onRefreshHoldings={(coverageId: string, expectedSymbolsCount?: number, progressToken?: string) =>
                   handleRefreshHoldings(etf.symbol, coverageId, expectedSymbolsCount, progressToken)
                 }
@@ -1939,7 +2158,7 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
           setSelectedCoverage(undefined);
         }}
         etfSymbol={selectedETF}
-        selectedCoverage={selectedCoverage}
+        selectedCoverage={selectedCoverage ?? preferredCoverage}
         onImport={async (data) => {
           console.log('Import holdings:', selectedETF, data);
           if (selectedETF && data.jsonData) {
@@ -1979,6 +2198,7 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
                 );
               }
               const importedSymbols = new Set(matchResult.symbols);
+              applyPreferredCoverage(data.coverage);
 
               const importedAt = new Date().toISOString();
               
@@ -2048,6 +2268,7 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
                         ...etfDetail,
                         holdings: nextHoldings,
                         coverageRanges: Array.from(existingRanges),
+                        preferredCoverage: normalizeCoverageId(data.coverage),
                       };
                     }),
                     task.type,
