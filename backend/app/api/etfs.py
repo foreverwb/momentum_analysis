@@ -1814,12 +1814,14 @@ async def refresh_etf_data(
                 ibkr_rows = len(price_df)
                 ibkr_new_rows = 0
                 last_date = price_df['date'].iloc[-1]
+                last_row_date = last_date.date() if hasattr(last_date, 'date') else last_date
                 last_date_str = (
                     last_date.strftime('%Y-%m-%d')
                     if hasattr(last_date, 'strftime')
                     else str(last_date)
                 )
                 last_close = price_df['close'].iloc[-1]
+                refreshed_at = utc_now_naive()
                 
                 # 保存价格数据到数据库
                 for _, row in price_df.iterrows():
@@ -1829,6 +1831,19 @@ async def refresh_etf_data(
                             PriceHistory.symbol == etf.symbol,
                             PriceHistory.date == row_date
                         ).first()
+                        if existing:
+                            if row_date == last_row_date:
+                                # Reuse the existing latest bar but refresh its timestamp so
+                                # task/source status reflects a successful intraday pull even
+                                # when IBKR returns the same latest trading day.
+                                existing.open = float(row['open'])
+                                existing.high = float(row['high'])
+                                existing.low = float(row['low'])
+                                existing.close = float(row['close'])
+                                existing.volume = int(row['volume'])
+                                existing.source = 'ibkr'
+                                existing.created_at = refreshed_at
+                            continue
                         if not existing:
                             price_record = PriceHistory(
                                 symbol=etf.symbol,
@@ -1838,7 +1853,8 @@ async def refresh_etf_data(
                                 low=float(row['low']),
                                 close=float(row['close']),
                                 volume=int(row['volume']),
-                                source='ibkr'
+                                source='ibkr',
+                                created_at=refreshed_at,
                             )
                             db.add(price_record)
                             ibkr_new_rows += 1

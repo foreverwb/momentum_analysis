@@ -3,6 +3,7 @@ from datetime import date, datetime, timedelta
 import pandas as pd
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import func
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -10,6 +11,7 @@ from app.api.etfs import (
     ETF_REFRESH_COOLDOWN_MINUTES,
     HOLDINGS_REFRESH_COOLDOWN_MINUTES,
     HoldingsCoverageRequest,
+    format_etf_response,
     refresh_etf_data,
     refresh_holdings_by_coverage,
 )
@@ -446,6 +448,55 @@ async def test_refresh_etf_data_ibkr_source_persists_price_dimensions(monkeypatc
     assert refreshed_snapshot is not None
     assert refreshed_snapshot.score_breakdown["rel_mom"]["data"]["RelMom"] == pytest.approx(0.08)
     assert refreshed_snapshot.score_breakdown["trend_quality"]["data"] is not None
+
+
+@pytest.mark.asyncio
+async def test_refresh_etf_data_ibkr_source_refreshes_latest_bar_timestamp(monkeypatch, db_session):
+    etf = ETF(
+        symbol="XLK",
+        name="Technology",
+        type="sector",
+        score=0.0,
+        rank=1,
+        completeness=0.0,
+    )
+    db_session.add(etf)
+    db_session.commit()
+
+    price_frame = _price_frame_with_step("XLK", periods=100, base=120.0, step=1.5)
+    stale_created_at = datetime.utcnow() - timedelta(days=2)
+    _persist_price_frame(
+        db_session,
+        "XLK",
+        price_frame,
+        created_at=stale_created_at,
+    )
+    db_session.commit()
+
+    orchestrator = _ETFRefreshOrchestrator(
+        relmom_result={
+            "RS": 1.15,
+            "RS_5D": 0.02,
+            "RS_20D": 0.04,
+            "RS_63D": 0.10,
+            "RelMom": 0.08,
+        },
+        price_frame=price_frame,
+    )
+    monkeypatch.setattr("app.services.orchestrator.get_orchestrator", lambda: orchestrator)
+
+    result = await refresh_etf_data("XLK", refresh_source="ibkr", db=db_session)
+
+    latest_created_at = db_session.query(func.max(PriceHistory.created_at)).filter(
+        PriceHistory.symbol == "XLK",
+        PriceHistory.source == "ibkr",
+    ).scalar()
+    payload = format_etf_response(etf, include_holdings=False, db=db_session)
+
+    assert result["status"] == "success"
+    assert latest_created_at is not None
+    assert latest_created_at > stale_created_at
+    assert payload["sourceUpdatedAt"]["ibkr"] is not None
 
 
 @pytest.mark.asyncio

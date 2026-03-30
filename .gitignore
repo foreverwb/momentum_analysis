@@ -221,4 +221,4 @@ __marimo__/
 /backend/momentum_radar.db-shm
 /backend/momentum_radar.db-wal
 
-.import.sh
+import.sh
