@@ -20,7 +20,7 @@ import math
 from sqlalchemy import and_, func
 from sqlalchemy.orm import Session
 
-from app.models import ETF, ETFHolding, IVData, MarketRegimeSnapshot, PriceHistory, get_db
+from app.models import ETF, ETFHolding, IVData, MarketRegimeSnapshot, PriceHistory, RegimeStateHistory, get_db
 from app.core.time_utils import beijing_today, get_beijing_cutoff_boundary, utc_now_iso
 
 try:
@@ -60,6 +60,15 @@ class RegimeIndicators(BaseModel):
     near_sma50: Optional[bool] = None
 
 
+class HysteresisInfo(BaseModel):
+    """Regime 滞后保护信息"""
+    raw_status: str = Field(..., description="原始计算状态")
+    effective_status: str = Field(..., description="滞后处理后的实际状态")
+    regime_locked: bool = Field(False, description="是否处于冷却期")
+    pending_switch_to: Optional[str] = Field(None, description="待切换目标状态")
+    confirmation_progress: str = Field("0/3", description="确认进度 (当前/需要)")
+
+
 class RegimeResponse(BaseModel):
     """Regime Gate 响应模型"""
     status: str = Field(..., description="状态码: A/B/C/UNKNOWN")
@@ -68,6 +77,7 @@ class RegimeResponse(BaseModel):
     qqq: Optional[SPYData] = None
     vix: Optional[float] = None
     indicators: Optional[RegimeIndicators] = None
+    hysteresis: Optional[HysteresisInfo] = None
     error: Optional[str] = None
 
 
@@ -763,6 +773,68 @@ async def get_market_regime(
             db.add(snapshot)
 
         db.commit()
+
+        # ---- Hysteresis 滞后保护 ----
+        try:
+            from app.services.calculators.regime_gate import RegimeGateCalculator
+
+            # 读取最近一条历史记录
+            latest_state = db.query(RegimeStateHistory).order_by(
+                RegimeStateHistory.record_date.desc()
+            ).first()
+
+            if latest_state and latest_state.record_date == today:
+                # 当天已有记录，直接使用
+                hysteresis_info = {
+                    "raw_status": latest_state.raw_status,
+                    "effective_status": latest_state.effective_status,
+                    "regime_locked": latest_state.days_since_switch < RegimeGateCalculator.COOLDOWN_AFTER_SWITCH,
+                    "pending_switch_to": latest_state.pending_switch_to,
+                    "confirmation_progress": f"{latest_state.confirmation_progress}/{RegimeGateCalculator.CONFIRMATION_DAYS}",
+                }
+            else:
+                prev_effective = latest_state.effective_status if latest_state else 'B'
+                prev_progress = latest_state.confirmation_progress if latest_state else 0
+                prev_days_since = (latest_state.days_since_switch + 1) if latest_state else 999
+                prev_pending = latest_state.pending_switch_to if latest_state else None
+
+                # 如果 pending 方向变了，重置进度
+                raw_status = normalized_result.get("status", "UNKNOWN")
+                if raw_status in ('A', 'B', 'C') and prev_pending and raw_status != prev_pending:
+                    prev_progress = 0
+
+                calc = RegimeGateCalculator(ibkr=orchestrator.ibkr)
+                hyst = calc.calculate_regime_with_hysteresis(
+                    previous_effective_status=prev_effective,
+                    confirmation_progress=prev_progress,
+                    days_since_last_switch=prev_days_since,
+                )
+
+                new_days_since = 0 if hyst['switched'] else prev_days_since
+
+                state_record = RegimeStateHistory(
+                    record_date=today,
+                    raw_status=hyst['raw_status'],
+                    effective_status=hyst['effective_status'],
+                    consecutive_days=1,
+                    days_since_switch=new_days_since,
+                    pending_switch_to=hyst['pending_switch_to'],
+                    confirmation_progress=hyst['confirmation_progress'],
+                )
+                db.add(state_record)
+                db.commit()
+
+                hysteresis_info = {
+                    "raw_status": hyst['raw_status'],
+                    "effective_status": hyst['effective_status'],
+                    "regime_locked": hyst['regime_locked'],
+                    "pending_switch_to": hyst['pending_switch_to'],
+                    "confirmation_progress": f"{hyst['confirmation_progress']}/{RegimeGateCalculator.CONFIRMATION_DAYS}",
+                }
+
+            normalized_result["hysteresis"] = hysteresis_info
+        except Exception as hyst_exc:
+            logger.warning(f"Hysteresis 处理失败，不影响主流程: {hyst_exc}")
 
         return normalized_result
 

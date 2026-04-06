@@ -11,7 +11,9 @@ Regime Gate 计算器
 - SPY 收盘价相对 20DMA / 50DMA
 - SMA20 斜率 或 20日收益率
 - (可选) 市场广度
-- VIX 仅用于参考展示，不参与档位切换
+- VIX > 30: 强制降档到 B (NEUTRAL)
+- VIX 25-30: 不影响状态码，fire_power 标记"VIX偏高"
+- VIX < 25: 不影响判断
 
 数据源: IBKR
 """
@@ -39,7 +41,8 @@ class RegimeData:
     price_above_sma50: bool
     sma20_above_sma50: bool
     near_sma50: bool
-    
+    vix_override: Optional[str] = None  # 'extreme' | 'elevated' | None
+
     def to_dict(self) -> Dict:
         return asdict(self)
 
@@ -106,7 +109,12 @@ class RegimeGateCalculator:
         'vix_low': 15,      # VIX 低于此值为低波动
         'vix_high': 25,     # VIX 高于此值为高波动
         'return_20d_bad': 0.0,  # 20日收益率低于此值为负
+        'vix_extreme': 30,      # VIX > 30 强制降档到 B
     }
+
+    # 滞后保护参数
+    CONFIRMATION_DAYS = 3       # 状态变化需连续确认天数
+    COOLDOWN_AFTER_SWITCH = 5   # 切换后冷却交易日数
     
     def __init__(self, ibkr):
         """
@@ -245,7 +253,16 @@ class RegimeGateCalculator:
             )
             
             # ============ 判断 Regime ============
-            
+
+            # VIX 检查
+            vix_extreme = safe_vix is not None and safe_vix > self.THRESHOLDS['vix_extreme']
+            vix_elevated = safe_vix is not None and safe_vix > self.THRESHOLDS['vix_high']
+
+            if vix_extreme:
+                data.vix_override = 'extreme'
+            elif vix_elevated:
+                data.vix_override = 'elevated'
+
             # C档（Risk-Off）条件: 价格跌破50DMA且20日收益为负
             price_below_50 = safe_price is not None and safe_sma50 is not None and safe_price < safe_sma50
             slope_positive = safe_sma20_slope is not None and safe_sma20_slope > 0
@@ -260,13 +277,17 @@ class RegimeGateCalculator:
                 regime = 'RISK_OFF'
                 fire_power = '低火力/空仓'
                 status = 'C'
+            elif vix_extreme:
+                regime = 'NEUTRAL'
+                fire_power = '半火力（VIX极端）'
+                status = 'B'
             elif near_50dma:
                 regime = 'NEUTRAL'
                 fire_power = '半火力'
                 status = 'B'
             elif risk_on:
                 regime = 'RISK_ON'
-                fire_power = '满火力'
+                fire_power = '满火力（VIX偏高）' if vix_elevated else '满火力'
                 status = 'A'
             else:
                 regime = 'NEUTRAL'
@@ -292,6 +313,102 @@ class RegimeGateCalculator:
                 'error': str(e)
             }
     
+    def calculate_regime_with_hysteresis(
+        self,
+        previous_effective_status: str = 'B',
+        confirmation_progress: int = 0,
+        days_since_last_switch: int = 999,
+    ) -> Dict:
+        """
+        带滞后保护的 Regime 计算。
+
+        防止 SPY 在 50DMA 附近震荡时状态反复切换。
+
+        Args:
+            previous_effective_status: 上一次生效状态 ('A', 'B', 'C')
+            confirmation_progress: 当前确认进度（连续几天 raw 与 effective 不同）
+            days_since_last_switch: 距上次切换的交易日数
+
+        Returns:
+            dict: {
+                'raw_status': str,
+                'effective_status': str,
+                'switched': bool,
+                'pending_switch_to': str | None,
+                'confirmation_progress': int,
+                'regime_locked': bool,
+                'data': dict,
+            }
+        """
+        raw_result = self.calculate_regime()
+        raw_status = raw_result.get('status', 'UNKNOWN')
+
+        # UNKNOWN / ERROR 等异常状态不触发切换逻辑，直接保持旧状态
+        if raw_status not in ('A', 'B', 'C'):
+            return {
+                'raw_status': raw_status,
+                'effective_status': previous_effective_status,
+                'switched': False,
+                'pending_switch_to': None,
+                'confirmation_progress': 0,
+                'regime_locked': False,
+                'data': raw_result.get('data'),
+            }
+
+        # 冷却期：切换后 COOLDOWN_AFTER_SWITCH 天内锁定
+        if days_since_last_switch < self.COOLDOWN_AFTER_SWITCH:
+            return {
+                'raw_status': raw_status,
+                'effective_status': previous_effective_status,
+                'switched': False,
+                'pending_switch_to': raw_status if raw_status != previous_effective_status else None,
+                'confirmation_progress': 0,
+                'regime_locked': True,
+                'data': raw_result.get('data'),
+            }
+
+        # raw 与当前 effective 相同 → 重置确认进度
+        if raw_status == previous_effective_status:
+            return {
+                'raw_status': raw_status,
+                'effective_status': previous_effective_status,
+                'switched': False,
+                'pending_switch_to': None,
+                'confirmation_progress': 0,
+                'regime_locked': False,
+                'data': raw_result.get('data'),
+            }
+
+        # raw 不同 → 累加确认进度
+        new_progress = confirmation_progress + 1
+
+        if new_progress >= self.CONFIRMATION_DAYS:
+            # 达到确认天数，执行切换
+            logger.info(
+                f"Regime 切换确认完成: {previous_effective_status} → {raw_status} "
+                f"(连续 {new_progress} 天)"
+            )
+            return {
+                'raw_status': raw_status,
+                'effective_status': raw_status,
+                'switched': True,
+                'pending_switch_to': None,
+                'confirmation_progress': new_progress,
+                'regime_locked': False,
+                'data': raw_result.get('data'),
+            }
+
+        # 未达到确认天数，保持旧状态
+        return {
+            'raw_status': raw_status,
+            'effective_status': previous_effective_status,
+            'switched': False,
+            'pending_switch_to': raw_status,
+            'confirmation_progress': new_progress,
+            'regime_locked': False,
+            'data': raw_result.get('data'),
+        }
+
     def get_regime_summary(self) -> Dict:
         """
         获取 Regime 摘要（用于前端显示）

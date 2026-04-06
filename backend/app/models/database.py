@@ -323,6 +323,25 @@ class BrokerStatus(Base):
     config = Column(JSON)  # 存储连接配置
 
 
+class RegimeStateHistory(Base):
+    """Regime 状态变更历史"""
+    __tablename__ = 'regime_state_history'
+
+    id = Column(Integer, primary_key=True)
+    record_date = Column(Date, nullable=False, index=True)
+    raw_status = Column(String(1), nullable=False)       # 原始计算结果 A/B/C
+    effective_status = Column(String(1), nullable=False)  # 滞后处理后的实际状态
+    consecutive_days = Column(Integer, default=1)
+    days_since_switch = Column(Integer, default=999)
+    pending_switch_to = Column(String(1), nullable=True)
+    confirmation_progress = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint('record_date', name='uix_regime_state_date'),
+    )
+
+
 class HoldingsUploadLog(Base):
     """Holdings 上传记录表"""
     __tablename__ = 'holdings_upload_logs'
@@ -340,6 +359,22 @@ class HoldingsUploadLog(Base):
     
     __table_args__ = (
         UniqueConstraint('etf_symbol', 'data_date', name='uix_upload_etf_date'),
+    )
+
+
+class RankBufferRecord(Base):
+    """排名缓冲状态持久化记录"""
+    __tablename__ = 'rank_buffer_records'
+
+    id = Column(Integer, primary_key=True)
+    buffer_type = Column(String(20), nullable=False, index=True)  # 'sector' / 'industry' / 'stock'
+    task_id = Column(Integer, ForeignKey('tasks.id'), nullable=True)
+    state_json = Column(Text, nullable=False)
+    config_json = Column(Text, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint('buffer_type', 'task_id', name='uix_rank_buffer_type_task'),
     )
 
 
