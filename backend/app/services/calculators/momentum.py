@@ -45,9 +45,19 @@ class MomentumCalculator:
         )
         merged["RS"] = cls._clean_series(merged["RS"])
 
-        merged["RS_5D_change"] = cls._clean_series(merged["RS"].pct_change(5))
-        merged["RS_20D_change"] = cls._clean_series(merged["RS"].pct_change(20))
-        merged["RS_63D_change"] = cls._clean_series(merged["RS"].pct_change(63))
+        SKIP = 5  # 跳过最近 1 周
+        rs = merged["RS"]
+
+        # 20D 和 63D 跳过最近 1 周
+        merged["RS_20D_change"] = cls._clean_series(
+            (rs.shift(SKIP) - rs.shift(SKIP + 20)) / rs.shift(SKIP + 20)
+        )
+        merged["RS_63D_change"] = cls._clean_series(
+            (rs.shift(SKIP) - rs.shift(SKIP + 63)) / rs.shift(SKIP + 63)
+        )
+
+        # 5D 加速项不跳过（捕捉近期加速信号）
+        merged["RS_5D_change"] = cls._clean_series(rs.pct_change(5))
 
         return merged
 
@@ -67,9 +77,9 @@ class MomentumCalculator:
             result[col] = cls._clean_series(result[col])
 
         result["RelMom"] = (
-            result["RS_5D_change"] * 0.20
-            + result["RS_20D_change"] * 0.45
-            + result["RS_63D_change"] * 0.35
+            result["RS_5D_change"] * 0.20    # 近期加速确认（不跳过最近1周）
+            + result["RS_20D_change"] * 0.45  # 主要动量信号（跳过最近1周）
+            + result["RS_63D_change"] * 0.35  # 长期趋势锚（跳过最近1周）
         )
         result["RelMom"] = cls._clean_series(result["RelMom"])
         return result

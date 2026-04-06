@@ -426,6 +426,22 @@ def calculate_breadth_metrics(parsed_data: List[Dict]) -> Dict:
     
     avg_rsi = sum(rsi_values) / len(rsi_values) if rsi_values else 50.0
     
+    # 等权 vs 市值权重收益对比
+    returns = [d.get('perf_month') for d in parsed_data if d.get('perf_month') is not None]
+    market_caps = [d.get('market_cap') for d in parsed_data if d.get('market_cap') is not None and d.get('perf_month') is not None]
+
+    if returns and len(returns) >= 3:
+        ew_return = sum(returns) / len(returns)
+        if market_caps and len(market_caps) == len(returns) and sum(market_caps) > 0:
+            total_cap = sum(market_caps)
+            matched_returns = [d.get('perf_month') for d in parsed_data if d.get('perf_month') is not None and d.get('market_cap') is not None]
+            mw_return = sum(r * c for r, c in zip(matched_returns, market_caps)) / total_cap
+        else:
+            mw_return = ew_return
+        ew_vs_mw_spread = ew_return - mw_return
+    else:
+        ew_vs_mw_spread = 0.0
+
     return {
         'pct_above_sma20': above_sma20 / total,
         'pct_above_sma50': above_sma50 / total,
@@ -433,7 +449,8 @@ def calculate_breadth_metrics(parsed_data: List[Dict]) -> Dict:
         'pct_near_52w_high': near_52w_high / total,
         'pct_near_52w_low': near_52w_low / total,
         'avg_rsi': avg_rsi,
-        'total_count': total
+        'total_count': total,
+        'ew_vs_mw_spread': ew_vs_mw_spread,
     }
 
 

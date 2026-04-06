@@ -43,7 +43,28 @@ def test_calculate_relative_strength_columns_and_values() -> None:
     assert "RS_20D_change" in rs_df.columns
     assert "RS_63D_change" in rs_df.columns
     assert rs_df["RS"].iloc[-1] == pytest.approx(2.0)
-    assert rs_df["RS_5D_change"].iloc[-1] == pytest.approx(0.0)
+    # 5D 不跳过，线性等比增长 → pct_change(5) ≈ 0
+    assert rs_df["RS_5D_change"].iloc[-1] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_skip_week_rs_20d_ignores_recent_crash() -> None:
+    """最近5天RS暴跌，但跳过后20D变化仍为正。"""
+    n = 80
+    # 前75天 RS 稳步上升 (1.0→1.5)，最后5天暴跌到 1.0
+    sector_prices = np.concatenate([np.linspace(100, 150, n - 5), np.linspace(100, 100, 5)])
+    benchmark_prices = np.full(n, 100.0)
+
+    sector_df = _make_price_df("XLK", sector_prices)
+    benchmark_df = _make_price_df("SPY", benchmark_prices)
+
+    rs_df = MomentumCalculator.calculate_relative_strength(sector_df, benchmark_df)
+    assert rs_df is not None
+
+    last = rs_df.iloc[-1]
+    # RS_5D_change 反映近期暴跌 → 负值
+    assert last["RS_5D_change"] < 0
+    # RS_20D_change 跳过最近5天 → 仍为正（之前20天在上升）
+    assert last["RS_20D_change"] > 0
 
 
 def test_calculate_rel_mom_weighted_formula() -> None:

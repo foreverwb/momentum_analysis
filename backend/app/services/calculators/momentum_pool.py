@@ -21,11 +21,90 @@ from .technical import (
 )
 
 
+STOCK_THRESHOLDS = {
+    'price_above_sma20': True,
+    'sma20_above_sma50': True,
+    'min_avg_dollar_volume': 500_000,
+    'min_market_cap': 1_000_000_000,
+}
+
+
+def check_stock_thresholds(
+    analysis,
+    finviz_data: Optional[Dict[str, Any]] = None,
+    price_df: Optional[pd.DataFrame] = None,
+) -> Dict[str, Any]:
+    """
+    检查个股硬性门槛。
+
+    Args:
+        analysis: TechnicalAnalysisResult，需包含 price / sma20 / sma50 属性。
+        finviz_data: Finviz 解析数据，需包含 market_cap 字段（单位：美元）。
+        price_df: 价格 DataFrame，需包含 close / volume 列。
+
+    Returns:
+        {'all_pass': bool, 'details': {门槛名: 'PASS'|'FAIL'|'NO_DATA'}}
+        NO_DATA 不算 FAIL。
+    """
+    results: Dict[str, str] = {}
+    all_pass = True
+
+    # 1. P > SMA20
+    if analysis.sma20 is not None:
+        p_above_20 = analysis.price > analysis.sma20
+        results['price_above_sma20'] = 'PASS' if p_above_20 else 'FAIL'
+        if not p_above_20:
+            all_pass = False
+    else:
+        results['price_above_sma20'] = 'NO_DATA'
+
+    # 2. SMA20 > SMA50
+    if analysis.sma20 is not None and analysis.sma50 is not None:
+        sma20_gt_50 = analysis.sma20 > analysis.sma50
+        results['sma20_above_sma50'] = 'PASS' if sma20_gt_50 else 'FAIL'
+        if not sma20_gt_50:
+            all_pass = False
+    else:
+        results['sma20_above_sma50'] = 'NO_DATA'
+
+    # 3. 日均成交额 > $500K（20日平均）
+    if price_df is not None and 'volume' in price_df.columns and 'close' in price_df.columns:
+        recent = price_df.tail(20)
+        avg_dollar_vol = (recent['close'] * recent['volume']).mean()
+        vol_pass = avg_dollar_vol >= STOCK_THRESHOLDS['min_avg_dollar_volume']
+        results['min_dollar_volume'] = 'PASS' if vol_pass else 'FAIL'
+        if not vol_pass:
+            all_pass = False
+    else:
+        results['min_dollar_volume'] = 'NO_DATA'
+
+    # 4. 市值 > $1B
+    if finviz_data and finviz_data.get('market_cap') is not None:
+        try:
+            cap = float(finviz_data['market_cap'])
+            cap_pass = cap >= STOCK_THRESHOLDS['min_market_cap']
+            results['min_market_cap'] = 'PASS' if cap_pass else 'FAIL'
+            if not cap_pass:
+                all_pass = False
+        except (TypeError, ValueError):
+            results['min_market_cap'] = 'NO_DATA'
+    else:
+        results['min_market_cap'] = 'NO_DATA'
+
+    return {'all_pass': all_pass, 'details': results}
+
+
 @dataclass
 class MomentumPoolResult:
     total_score: float
     scores: Dict[str, float]
     metrics: Dict[str, Any]
+    thresholds_pass: bool = True
+    thresholds: Dict[str, str] = None
+
+    def __post_init__(self):
+        if self.thresholds is None:
+            self.thresholds = {}
 
 
 def _round(value: Optional[float], digits: int = 2) -> Optional[float]:
@@ -203,6 +282,8 @@ def calculate_momentum_pool_result(
     if analysis is None:
         return None
 
+    thresholds = check_stock_thresholds(analysis, finviz_data, price_df)
+
     prices = price_df['close']
     highs = price_df['high']
     lows = price_df['low']
@@ -340,7 +421,9 @@ def calculate_momentum_pool_result(
     return MomentumPoolResult(
         total_score=total_score,
         scores=scores,
-        metrics=metrics
+        metrics=metrics,
+        thresholds_pass=thresholds['all_pass'],
+        thresholds=thresholds['details'],
     )
 
 
@@ -406,6 +489,8 @@ def batch_calculate_momentum_pool(
                 'quality_adj': result.scores.get('quality_adj', 1.0),
                 'scores': result.scores,
                 'metrics': result.metrics,
+                'thresholds_pass': result.thresholds_pass,
+                'thresholds': result.thresholds,
             })
         output.sort(key=lambda x: x['total_score'], reverse=True)
         return output
@@ -435,6 +520,8 @@ def batch_calculate_momentum_pool(
             'quality_adj': quality_adj,
             'scores': {**norm_scores, 'quality_adj': quality_adj},
             'metrics': result.metrics,
+            'thresholds_pass': result.thresholds_pass,
+            'thresholds': result.thresholds,
         })
 
     # Step 5: 按 total_score 降序排列

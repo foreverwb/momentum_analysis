@@ -171,7 +171,7 @@ class RegimeGateCalculator:
                 'error': str         # 错误信息（如有）
             }
         """
-        from .technical import calculate_sma, calculate_sma_slope, calculate_returns
+        from .technical import calculate_sma, calculate_sma_slope_pct, calculate_returns
         
         logger.info("开始计算市场环境 (Regime Gate)...")
         
@@ -208,7 +208,7 @@ class RegimeGateCalculator:
             dist_to_sma50 = (current_price - current_sma50) / current_sma50 if current_sma50 else math.nan
             
             # 计算斜率和收益率
-            sma20_slope = calculate_sma_slope(sma20, period=5)
+            sma20_slope = calculate_sma_slope_pct(sma20, period=5)
             return_20d = calculate_returns(prices, 20)
             
             # 获取 VIX

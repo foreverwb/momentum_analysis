@@ -163,15 +163,16 @@ class ETFScoreCalculator:
     DEFAULT_WINSORIZE_LIMITS = (0.05, 0.95)
 
     BREADTH_RAW_WEIGHTS = {
-        'pct_above_sma50': 0.50,
-        'pct_above_sma20': 0.30,
-        'pct_near_52w_high': 0.20,
+        'pct_above_sma50': 0.35,
+        'pct_above_sma20': 0.25,
+        'pct_near_52w_high': 0.15,
+        'ew_vs_mw_spread': 0.25,
     }
 
     THRESHOLDS = {
         'price_above_sma50': True,
         'rs_20d_positive': True,
-        'breadth_min': 0.50,
+        'breadth_min': 0.40,
     }
 
     def __init__(
@@ -284,7 +285,7 @@ class ETFScoreCalculator:
             return {'score': 0.0, 'raw_score': None, 'data': None}
 
     def calculate_trend_quality_score(self, symbol: str) -> Dict[str, Any]:
-        from .technical import calculate_sma, calculate_sma_slope, calculate_max_drawdown
+        from .technical import calculate_sma, calculate_sma_slope_pct, calculate_max_drawdown
 
         try:
             if self.ibkr is None:
@@ -303,7 +304,7 @@ class ETFScoreCalculator:
             current_sma50 = float(sma50.iloc[-1])
             price_above_sma50 = current_price > current_sma50
             sma20_above_sma50 = current_sma20 > current_sma50
-            sma20_slope = float(calculate_sma_slope(sma20, period=5))
+            sma20_slope = float(calculate_sma_slope_pct(sma20, period=5))
             max_dd = float(calculate_max_drawdown(prices, 20))
 
             score = 0.0
@@ -368,10 +369,15 @@ class ETFScoreCalculator:
             pct_above_20 = _safe_float(breadth.get('pct_above_sma20')) or 0.0
             pct_near_52w_high = _safe_float(breadth.get('pct_near_52w_high')) or 0.0
 
+            ew_vs_mw = _safe_float(breadth.get('ew_vs_mw_spread')) or 0.0
+            # 映射到 0-1：spread=+5% → 1.0, 0% → 0.5, -5% → 0.0
+            ew_vs_mw_score = max(0.0, min(1.0, 0.5 + ew_vs_mw * 10))
+
             breadth_raw = (
                 self.BREADTH_RAW_WEIGHTS['pct_above_sma50'] * pct_above_50 +
                 self.BREADTH_RAW_WEIGHTS['pct_above_sma20'] * pct_above_20 +
-                self.BREADTH_RAW_WEIGHTS['pct_near_52w_high'] * pct_near_52w_high
+                self.BREADTH_RAW_WEIGHTS['pct_near_52w_high'] * pct_near_52w_high +
+                self.BREADTH_RAW_WEIGHTS['ew_vs_mw_spread'] * ew_vs_mw_score
             ) * 100.0
             breadth_raw = round(_clip(breadth_raw, 0.0, 100.0), 2)
 
@@ -384,6 +390,8 @@ class ETFScoreCalculator:
                     'pct_above_sma200': round(_safe_float(breadth.get('pct_above_sma200')) or 0.0, 4),
                     'pct_near_52w_high': round(pct_near_52w_high, 4),
                     'pct_near_52w_low': round(_safe_float(breadth.get('pct_near_52w_low')) or 0.0, 4),
+                    'ew_vs_mw_spread': round(ew_vs_mw, 4),
+                    'ew_vs_mw_score': round(ew_vs_mw_score, 4),
                     'total_count': breadth.get('total_count', 0),
                     'breadth_raw': breadth_raw,
                     'breadth_raw_weights': dict(self.BREADTH_RAW_WEIGHTS),
@@ -573,10 +581,10 @@ class ETFScoreCalculator:
 
         pct_above_50 = _safe_float(breadth_payload.get('pct_above_sma50'))
         if pct_above_50 is None:
-            results['breadth_above_50'] = 'NO_DATA'
+            results['breadth_above_40'] = 'NO_DATA'
         else:
             breadth_pass = pct_above_50 >= self.THRESHOLDS['breadth_min']
-            results['breadth_above_50'] = 'PASS' if breadth_pass else 'FAIL'
+            results['breadth_above_40'] = 'PASS' if breadth_pass else 'FAIL'
             if not breadth_pass:
                 all_pass = False
 
