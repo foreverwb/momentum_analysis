@@ -233,15 +233,18 @@ def calculate_momentum_pool_result(
     atr_pct = calculate_atr_percent(highs, lows, prices)
     deviation_pct = calculate_deviation_from_ma(current_price, analysis.sma20)
 
-    # Momentum score (0-100)
-    momentum_score = 0.0
-    momentum_score += 25 if return_5d > 0 else 0
-    momentum_score += 25 if return_20d > 0 else 0
-    momentum_score += 25 if return_63d > 0 else 0
-    if rs_diff_20d is None:
-        momentum_score += 12.5
-    else:
-        momentum_score += 25 if rs_diff_20d > 0 else 0
+    # Price momentum: continuous raw values (not binary 0/25)
+    abs_mom = 0.60 * (return_20d_ex3d or 0) + 0.40 * (return_63d or 0)
+    rel_strength = rs_diff_20d or 0
+    prox_high = distance_ratio or 0  # 1.0 = at high, lower = further away
+
+    momentum_raw = {
+        'abs_mom': abs_mom,
+        'rel_strength': rel_strength,
+        'prox_high': prox_high,
+    }
+    # Combine into a single price_mom score (raw, will be normalized in batch)
+    price_mom_score = abs_mom * 100  # scale to roughly 0-100 range for standalone use
 
     # Trend score (0-100)
     alignment_score = _score_alignment(analysis.ma_alignment)
@@ -269,16 +272,25 @@ def calculate_momentum_pool_result(
 
     options_score = _score_options(heat_score, ivr)
 
-    base_score = 0.65 * ((momentum_score + trend_score) / 2.0) + 0.15 * volume_score + 0.20 * options_score
-    penalty_factor = 1.0
-    if quality_score < 40:
-        penalty_factor = 0.85
-    elif quality_score < 60:
-        penalty_factor = 0.90
-    elif quality_score < 70:
-        penalty_factor = 0.95
+    # Weighted composite: PriceMom=0.40, TrendStr=0.25, VolScore=0.15, OptionsOv=0.20
+    base_score = (
+        0.40 * price_mom_score
+        + 0.25 * trend_score
+        + 0.15 * volume_score
+        + 0.20 * options_score
+    )
 
-    total_score = round(base_score * penalty_factor, 2)
+    # Quality adjustment: multiplicative penalty stacking
+    quality_adj = 1.0
+    if atr_pct is not None and atr_pct > 0.03:
+        quality_adj *= 0.70
+    if analysis.max_drawdown_20d is not None and analysis.max_drawdown_20d < -0.15:
+        quality_adj *= 0.60
+    if deviation_pct is not None and deviation_pct > 0.10:
+        quality_adj *= 0.80
+    quality_adj = max(quality_adj, 0.40)
+
+    total_score = round(base_score * quality_adj, 2)
 
     metrics: Dict[str, Any] = {
         'return20d': _safe_pct(return_20d, 1),
@@ -309,15 +321,19 @@ def calculate_momentum_pool_result(
         ),
         'sma20Slope': _round(analysis.sma20_slope, 4),
         'rsi': _round(analysis.rsi, 2),
-        'beta': _round(finviz_data.get('beta') if finviz_data else None, 2)
+        'beta': _round(finviz_data.get('beta') if finviz_data else None, 2),
+        'absMom': _round(abs_mom, 4),
+        'relStrength': _round(rel_strength, 4),
+        'proxHigh': _round(prox_high, 4),
+        'qualityAdj': _round(quality_adj, 2),
     }
 
     scores = {
-        'momentum': round(momentum_score, 2),
+        'price_mom': round(price_mom_score, 2),
         'trend': round(trend_score, 2),
         'volume': round(volume_score, 2),
-        'quality': round(quality_score, 2),
-        'options': round(options_score, 2)
+        'options': round(options_score, 2),
+        'quality_adj': round(quality_adj, 2),
     }
 
     return MomentumPoolResult(
