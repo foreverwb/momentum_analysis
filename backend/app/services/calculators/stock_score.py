@@ -1,5 +1,11 @@
 """
-个股评分计算器
+⚠️ DEPRECATED: 评分逻辑已迁移到 momentum_pool.py
+本模块仅保留 _calculate_technical_from_finviz 作为 Finviz 数据适配器。
+请使用 momentum_pool.batch_calculate_momentum_pool 进行个股评分。
+
+---
+
+个股评分计算器（旧版）
 针对 ETF 持仓个股的多维度评分系统
 
 评分维度:

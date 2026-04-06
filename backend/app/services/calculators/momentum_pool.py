@@ -6,10 +6,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple
 
 import pandas as pd
 
+from .etf_score import rank_percentile_normalize
 from .technical import (
     analyze_technical,
     calculate_returns,
@@ -341,3 +342,101 @@ def calculate_momentum_pool_result(
         scores=scores,
         metrics=metrics
     )
+
+
+# ---------------------------------------------------------------------------
+# 批量横截面标准化入口
+# ---------------------------------------------------------------------------
+
+_DIMENSION_KEYS = ('price_mom', 'trend', 'volume', 'options')
+_WEIGHTS = {'price_mom': 0.40, 'trend': 0.25, 'volume': 0.15, 'options': 0.20}
+
+
+def batch_calculate_momentum_pool(
+    stock_data_map: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    批量计算动能股池评分，带横截面标准化。
+
+    对每只股票先调用 calculate_momentum_pool_result 获取原始分，
+    再用 rank_percentile_normalize 做横截面归一化后加权合成 total_score。
+
+    Args:
+        stock_data_map: {symbol: {'price_df': df, 'sector_df': df,
+                         'finviz_data': {}, 'mc_data': {}, 'iv_data': {}}}
+
+    Returns:
+        按 total_score 降序排列的结果列表，每项包含：
+        {
+            'symbol': str,
+            'total_score': float,           # 标准化后加权合成 × quality_adj
+            'raw_scores': Dict[str, float],  # 标准化前的原始分
+            'norm_scores': Dict[str, float], # 标准化后的 0-100 分
+            'quality_adj': float,            # 质量调整系数
+            'scores': Dict[str, float],      # 兼容旧结构
+            'metrics': Dict[str, Any],       # 兼容旧结构
+        }
+    """
+    # Step 1: 对每只股票调用单股计算，收集结果
+    raw_results: Dict[str, MomentumPoolResult] = {}
+    for sym, data in stock_data_map.items():
+        result = calculate_momentum_pool_result(
+            price_df=data.get('price_df'),
+            sector_df=data.get('sector_df'),
+            finviz_data=data.get('finviz_data'),
+            mc_data=data.get('mc_data'),
+            iv_data=data.get('iv_data'),
+        )
+        if result is not None:
+            raw_results[sym] = result
+
+    if not raw_results:
+        return []
+
+    # Step 2: 样本数 < 3 时退化为单股评分模式
+    if len(raw_results) < 3:
+        output = []
+        for sym, result in raw_results.items():
+            raw_scores = {d: result.scores.get(d, 0.0) for d in _DIMENSION_KEYS}
+            output.append({
+                'symbol': sym,
+                'total_score': result.total_score,
+                'raw_scores': raw_scores,
+                'norm_scores': raw_scores.copy(),
+                'quality_adj': result.scores.get('quality_adj', 1.0),
+                'scores': result.scores,
+                'metrics': result.metrics,
+            })
+        output.sort(key=lambda x: x['total_score'], reverse=True)
+        return output
+
+    # Step 3: 横截面标准化
+    norm_maps: Dict[str, Dict[str, Optional[float]]] = {}
+    for dim in _DIMENSION_KEYS:
+        raw_map = {sym: res.scores.get(dim) for sym, res in raw_results.items()}
+        norm_maps[dim] = rank_percentile_normalize(raw_map, winsorize_limits=(0.05, 0.95))
+
+    # Step 4: 加权合成 total_score
+    output: List[Dict[str, Any]] = []
+    for sym, result in raw_results.items():
+        quality_adj = result.scores.get('quality_adj', 1.0)
+
+        norm_scores = {d: (norm_maps[d].get(sym) or 50.0) for d in _DIMENSION_KEYS}
+        raw_scores = {d: result.scores.get(d, 0.0) for d in _DIMENSION_KEYS}
+
+        total = sum(_WEIGHTS[d] * norm_scores[d] for d in _DIMENSION_KEYS)
+        total_score = round(total * quality_adj, 2)
+
+        output.append({
+            'symbol': sym,
+            'total_score': total_score,
+            'raw_scores': raw_scores,
+            'norm_scores': norm_scores,
+            'quality_adj': quality_adj,
+            'scores': {**norm_scores, 'quality_adj': quality_adj},
+            'metrics': result.metrics,
+        })
+
+    # Step 5: 按 total_score 降序排列
+    output.sort(key=lambda x: x['total_score'], reverse=True)
+    return output

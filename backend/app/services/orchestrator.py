@@ -1116,45 +1116,39 @@ class DataOrchestrator:
         self,
         symbol: str,
         finviz_data: Dict = None,
-        mc_data: Dict = None
+        mc_data: Dict = None,
+        sector_etf: Optional[str] = None,
     ) -> Dict:
         """
-        计算单个股票的综合评分
-        
+        计算单个股票的综合评分（已迁移到 momentum_pool）
+
+        内部委托给 calculate_momentum_pool_score，保持接口向后兼容。
+
         Args:
             symbol: 股票代码
             finviz_data: Finviz 技术数据
             mc_data: MarketChameleon 期权数据
-        
+            sector_etf: 所属板块 ETF（可选）
+
         Returns:
             Dict: 评分结果
         """
-        if self._ibkr is None or not self._ibkr_ready():
+        result = await self.calculate_momentum_pool_score(
+            symbol=symbol,
+            sector_etf=sector_etf,
+            finviz_data=finviz_data,
+            mc_data=mc_data,
+        )
+        if result is None:
             return {
                 'symbol': symbol,
-                'error': 'IBKR not connected',
-                'total_score': 0
+                'error': 'momentum pool calculation returned None',
+                'total_score': 0,
             }
-        
-        try:
-            from .calculators.stock_score import StockScoreCalculator
-            
-            calc = StockScoreCalculator(self._ibkr)
-            result = calc.calculate_composite_score(
-                symbol=symbol,
-                finviz_data=finviz_data,
-                mc_data=mc_data
-            )
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"计算 {symbol} 个股评分失败: {e}")
-            return {
-                'symbol': symbol,
-                'error': str(e),
-                'total_score': 0
-            }
+        # 兼容旧调用方: 确保 total_score 有默认值
+        if result.get('total_score') is None:
+            result['total_score'] = 0
+        return result
     
     async def score_etf_holdings(
         self,
@@ -1165,33 +1159,74 @@ class DataOrchestrator:
         top_n: int = 20
     ) -> List[Dict]:
         """
-        评分 ETF 持仓股票
-        
+        评分 ETF 持仓股票（已迁移到 batch_calculate_momentum_pool）
+
         Args:
             etf_symbol: ETF 代码
             holdings: 持仓股票代码列表
             finviz_map: Finviz 数据映射
             mc_map: MarketChameleon 数据映射
             top_n: 返回 Top N
-        
+
         Returns:
             List[Dict]: 持仓评分排名
         """
-        if self._ibkr is None or not self._ibkr_ready():
+        if not self._ibkr_ready() or self._price_provider is None:
             return []
-        
+
+        finviz_map = finviz_map or {}
+        mc_map = mc_map or {}
+
         try:
-            from .calculators.stock_score import StockScoreCalculator
-            
-            calc = StockScoreCalculator(self._ibkr)
-            results = calc.score_etf_holdings(
-                symbols=holdings,
-                finviz_map=finviz_map or {},
-                mc_map=mc_map or {}
+            from .calculators.momentum_pool import batch_calculate_momentum_pool
+
+            # 获取板块 ETF 价格作为 sector baseline
+            sector_df = None
+            if etf_symbol:
+                sector_df = await asyncio.to_thread(
+                    self._price_provider.get_ohlcv,
+                    symbol=etf_symbol,
+                    duration='1 Y',
+                    bar_size='1 day',
+                )
+
+            # 构建 stock_data_map
+            stock_data_map: Dict[str, Dict[str, Any]] = {}
+            for sym in holdings:
+                try:
+                    price_df = await asyncio.to_thread(
+                        self._price_provider.get_ohlcv,
+                        symbol=sym,
+                        duration='1 Y',
+                        bar_size='1 day',
+                    )
+                    if price_df is None or price_df.empty:
+                        continue
+                    stock_data_map[sym] = {
+                        'price_df': price_df,
+                        'sector_df': sector_df,
+                        'finviz_data': finviz_map.get(sym),
+                        'mc_data': mc_map.get(sym),
+                        'iv_data': None,
+                    }
+                except Exception as e:
+                    logger.warning(f"获取 {sym} 价格数据失败: {e}")
+                    continue
+
+            if not stock_data_map:
+                return []
+
+            results = await asyncio.to_thread(
+                batch_calculate_momentum_pool,
+                stock_data_map,
             )
-            
+
+            # 添加排名
+            for i, item in enumerate(results, 1):
+                item['rank'] = i
+
             return results[:top_n]
-            
+
         except Exception as e:
             logger.error(f"评分 {etf_symbol} 持仓失败: {e}")
             return []
