@@ -803,7 +803,7 @@ async def get_market_regime(
                 if raw_status in ('A', 'B', 'C') and prev_pending and raw_status != prev_pending:
                     prev_progress = 0
 
-                calc = RegimeGateCalculator(ibkr=orchestrator.ibkr)
+                calc = RegimeGateCalculator(ibkr=orchestrator._ibkr)
                 hyst = calc.calculate_regime_with_hysteresis(
                     previous_effective_status=prev_effective,
                     confirmation_progress=prev_progress,
