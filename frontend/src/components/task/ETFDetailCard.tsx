@@ -1,4 +1,5 @@
-import React, { useEffect, useMemo, useState, useCallback } from 'react';
+import React, { useEffect, useMemo, useState, useCallback, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { RefreshProgressModal } from '../modal';
 import type { RefreshResult } from '../../types';
 import { getHoldingsRefreshProgress } from '../../services/api';
@@ -340,6 +341,72 @@ const copyTextToClipboard = async (text: string): Promise<void> => {
   }
 };
 
+interface SourceIndicatorTooltipData {
+  label: string;
+  statusLabel: string;
+  freshCount: number;
+  totalCount: number;
+  updatedAt: string | null;
+  missingTickers: string[];
+  color: string;
+}
+
+function SourceIndicator({ indicator }: { indicator: SourceIndicatorTooltipData & { isComplete: boolean; isPartial: boolean; key: string } }) {
+  const [tooltip, setTooltip] = useState<{ x: number; y: number } | null>(null);
+  const spanRef = useRef<HTMLSpanElement>(null);
+
+  const handleMouseEnter = () => {
+    if (spanRef.current) {
+      const rect = spanRef.current.getBoundingClientRect();
+      setTooltip({ x: rect.left + rect.width / 2, y: rect.top });
+    }
+  };
+
+  return (
+    <span
+      ref={spanRef}
+      className="relative inline-flex h-2.5 w-2.5 items-center justify-center rounded-full border cursor-default"
+      style={{
+        borderColor: indicator.isComplete || indicator.isPartial ? indicator.color : '#cbd5e1',
+        background: indicator.isComplete ? indicator.color : 'transparent',
+      }}
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={() => setTooltip(null)}
+    >
+      {!indicator.isComplete && !indicator.isPartial && (
+        <svg width="6" height="6" viewBox="0 0 8 8" fill="none" className="pointer-events-none">
+          <path d="M1 1L7 7M7 1L1 7" stroke="#94a3b8" strokeWidth="1.25" strokeLinecap="round" />
+        </svg>
+      )}
+      {indicator.isPartial && (
+        <span className="pointer-events-none block h-[1.25px] w-[6px] rounded" style={{ background: indicator.color }} />
+      )}
+      {tooltip && createPortal(
+        <div
+          className="fixed z-[9999] rounded-lg border border-slate-200 bg-white p-2.5 shadow-xl text-left"
+          style={{ left: tooltip.x, top: tooltip.y - 8, transform: 'translate(-50%, -100%)', minWidth: '200px', maxWidth: '320px' }}
+        >
+          <div className="mb-1 text-[11px] font-bold text-slate-700">
+            {indicator.label}: {indicator.statusLabel} ({indicator.freshCount}/{indicator.totalCount})
+          </div>
+          <div className="mb-1.5 text-[10px] text-slate-400">{formatUpdatedAt(indicator.updatedAt)}</div>
+          {!indicator.isComplete && indicator.missingTickers.length > 0 && (
+            <div>
+              <div className="mb-1 text-[10px] font-semibold text-red-500">缺失标的:</div>
+              <div className="flex flex-wrap gap-1">
+                {indicator.missingTickers.map((t) => (
+                  <span key={t} className="rounded bg-red-50 px-1 py-0.5 text-[10px] font-medium text-red-700 border border-red-200">{t}</span>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>,
+        document.body
+      )}
+    </span>
+  );
+}
+
 export function ETFDetailCard({
   etf,
   coverageRanges = [],
@@ -512,6 +579,9 @@ export function ETFDetailCard({
       const isComplete = totalCount > 0 && knownCount === totalCount && freshCount === totalCount;
       const isPartial = !isComplete && freshCount > 0;
       const statusLabel = isComplete ? '完备' : isPartial ? '部分' : '缺失';
+      const missingTickers = activeHoldings
+        .filter((holding) => !isHoldingSourceFresh(holding, sourceKey, beijingResetBoundaryMs))
+        .map((holding) => holding.ticker);
       return {
         key: sourceKey,
         label: COVERAGE_SOURCE_META[sourceKey].label,
@@ -522,6 +592,7 @@ export function ETFDetailCard({
         totalCount,
         statusLabel,
         updatedAt: latestUpdatedAt,
+        missingTickers,
       };
     });
   }, [activeHoldings, beijingResetBoundaryMs]);
@@ -948,33 +1019,7 @@ export function ETFDetailCard({
                   <div className="flex items-center gap-3 text-xs">
                     <div className="flex items-center gap-1.5">
                       {activeCoverageSourceIndicators.map((indicator) => (
-                        <span
-                          key={indicator.key}
-                          className="relative inline-flex h-2.5 w-2.5 items-center justify-center rounded-full border"
-                          style={{
-                            borderColor: indicator.isComplete || indicator.isPartial ? indicator.color : '#cbd5e1',
-                            background: indicator.isComplete ? indicator.color : 'transparent',
-                          }}
-                          title={`${indicator.label}: ${indicator.statusLabel} (${indicator.freshCount}/${indicator.totalCount}) · ${formatUpdatedAt(indicator.updatedAt)}`}
-                        >
-                          {!indicator.isComplete && !indicator.isPartial && (
-                            <svg
-                              width="6"
-                              height="6"
-                              viewBox="0 0 8 8"
-                              fill="none"
-                              className="pointer-events-none"
-                            >
-                              <path d="M1 1L7 7M7 1L1 7" stroke="#94a3b8" strokeWidth="1.25" strokeLinecap="round" />
-                            </svg>
-                          )}
-                          {indicator.isPartial && (
-                            <span
-                              className="pointer-events-none block h-[1.25px] w-[6px] rounded"
-                              style={{ background: indicator.color }}
-                            />
-                          )}
-                        </span>
+                        <SourceIndicator key={indicator.key} indicator={indicator} />
                       ))}
                     </div>
                     <div className="flex flex-col gap-1 text-left">

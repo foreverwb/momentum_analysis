@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import type { ETF, Holding } from '../../types';
 import { formatDateTimeInBeijing } from '../../utils/beijingTime';
 
@@ -54,10 +54,28 @@ function HoldingsTable({ holdings, maxDisplay }: { holdings: Holding[]; maxDispl
           <div className="text-right">持仓权重</div>
         </div>
         <div className="divide-y divide-slate-200">
-          {displayHoldings.map((h, idx) => (
-            <div key={idx} className="grid grid-cols-6 gap-2 p-3 hover:bg-slate-100 text-sm">
+          {displayHoldings.map((h, idx) => {
+            const isMissing = h.dataStatus === 'missing' || h.dataStatus === 'pending';
+            const futuMissing = h.dataSources && h.dataSources['futu'] === false;
+            return (
+            <div key={idx} className={`grid grid-cols-6 gap-2 p-3 hover:bg-slate-100 text-sm ${isMissing ? 'bg-amber-50/50' : ''}`}>
               <div className="col-span-2 flex items-center gap-2">
                 <span className="font-medium">{h.ticker}</span>
+                {futuMissing && (
+                  <span className="px-1 py-0.5 bg-amber-100 text-amber-700 rounded text-[10px] font-medium leading-none" title="Futu 数据缺失">
+                    futu
+                  </span>
+                )}
+                {h.dataStatus === 'missing' && (
+                  <span className="px-1 py-0.5 bg-red-100 text-red-600 rounded text-[10px] font-medium leading-none" title="数据缺失">
+                    缺失
+                  </span>
+                )}
+                {h.dataStatus === 'pending' && (
+                  <span className="px-1 py-0.5 bg-slate-200 text-slate-500 rounded text-[10px] font-medium leading-none" title="等待数据">
+                    待计算
+                  </span>
+                )}
               </div>
               <div className="text-right font-semibold text-slate-700">
                 {typeof h.score === 'number' ? h.score.toFixed(1) : '--'}
@@ -67,7 +85,8 @@ function HoldingsTable({ holdings, maxDisplay }: { holdings: Holding[]; maxDispl
               </div>
               <div className="text-right font-medium">{h.weight.toFixed(2)}%</div>
             </div>
-          ))}
+            );
+          })}
         </div>
         {holdings.length > maxDisplay && (
           <div className="p-3 bg-slate-100">
@@ -92,6 +111,76 @@ function HoldingsTable({ holdings, maxDisplay }: { holdings: Holding[]; maxDispl
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+// 数据状态提示组件（带悬停详情）
+function DataStatusAlert({ holdings }: { holdings?: Holding[] }) {
+  const [showTooltip, setShowTooltip] = useState(false);
+
+  const missingTickers = holdings?.filter(h => h.dataStatus === 'missing').map(h => h.ticker) ?? [];
+  const pendingTickers = holdings?.filter(h => h.dataStatus === 'pending').map(h => h.ticker) ?? [];
+  const futuMissingTickers = holdings?.filter(h => h.dataSources?.['futu'] === false).map(h => h.ticker) ?? [];
+
+  const hasIssues = missingTickers.length > 0 || pendingTickers.length > 0;
+  if (!hasIssues) return null;
+
+  return (
+    <div className="mt-4 relative">
+      <div
+        className="p-3 bg-amber-50 border border-amber-200 rounded-sm cursor-default"
+        onMouseEnter={() => setShowTooltip(true)}
+        onMouseLeave={() => setShowTooltip(false)}
+      >
+        <div className="flex items-center gap-2 text-amber-700 text-sm">
+          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="12" cy="12" r="10"></circle>
+            <line x1="12" y1="8" x2="12" y2="12"></line>
+            <line x1="12" y1="16" x2="12.01" y2="16"></line>
+          </svg>
+          <span>
+            持仓数据已上传，等待计算动能指标。
+            {missingTickers.length > 0 && <span className="font-semibold"> {missingTickers.length} 只标的数据缺失</span>}
+            {pendingTickers.length > 0 && <span className="font-semibold"> {pendingTickers.length} 只待计算</span>}
+            。请通过「任务管理」触发计算。
+          </span>
+        </div>
+      </div>
+      {showTooltip && (missingTickers.length > 0 || pendingTickers.length > 0 || futuMissingTickers.length > 0) && (
+        <div className="absolute left-0 top-full mt-1 z-50 bg-white border border-slate-200 rounded-xl shadow-xl p-4 min-w-[280px] max-w-[420px]">
+          {missingTickers.length > 0 && (
+            <div className="mb-3">
+              <div className="text-xs font-bold text-red-600 mb-1.5">数据缺失 ({missingTickers.length})</div>
+              <div className="flex flex-wrap gap-1">
+                {missingTickers.map(t => (
+                  <span key={t} className="px-1.5 py-0.5 bg-red-50 text-red-700 border border-red-200 rounded text-xs font-medium">{t}</span>
+                ))}
+              </div>
+            </div>
+          )}
+          {pendingTickers.length > 0 && (
+            <div className="mb-3">
+              <div className="text-xs font-bold text-slate-500 mb-1.5">待计算 ({pendingTickers.length})</div>
+              <div className="flex flex-wrap gap-1">
+                {pendingTickers.map(t => (
+                  <span key={t} className="px-1.5 py-0.5 bg-slate-100 text-slate-600 border border-slate-200 rounded text-xs font-medium">{t}</span>
+                ))}
+              </div>
+            </div>
+          )}
+          {futuMissingTickers.length > 0 && (
+            <div>
+              <div className="text-xs font-bold text-amber-600 mb-1.5">Futu 数据缺失 ({futuMissingTickers.length})</div>
+              <div className="flex flex-wrap gap-1">
+                {futuMissingTickers.map(t => (
+                  <span key={t} className="px-1.5 py-0.5 bg-amber-50 text-amber-700 border border-amber-200 rounded text-xs font-medium">{t}</span>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -305,16 +394,7 @@ export function ETFCard({ etf, onViewHoldings, onRefresh }: ETFCardProps) {
             </div>
           </div>
           {/* 数据状态提示 */}
-          <div className="mt-4 p-3 bg-amber-50 border border-amber-200 rounded-sm">
-            <div className="flex items-center gap-2 text-amber-700 text-sm">
-              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <circle cx="12" cy="12" r="10"></circle>
-                <line x1="12" y1="8" x2="12" y2="12"></line>
-                <line x1="12" y1="16" x2="12.01" y2="16"></line>
-              </svg>
-              <span>持仓数据已上传，等待计算动能指标。请通过「任务管理」触发计算。</span>
-            </div>
-          </div>
+          <DataStatusAlert holdings={etf.holdings} />
         </div>
       )}
 
