@@ -199,21 +199,25 @@ class TestStockListAPI:
             assert isinstance(data, list)
             assert len(data) <= 2
     
-    async def test_get_stocks_with_sector_filter(self):
+    async def test_get_stocks_with_sector_filter(self, test_db):
         """测试按板块筛选股票"""
-        async with AsyncClient(
-            transport=ASGITransport(app=app),
-            base_url="http://test"
-        ) as client:
-            response = await client.get("/api/stocks?sector=XLK")
-            
-            assert response.status_code == 200
-            data = response.json()
-            assert isinstance(data, list)
-            # 所有返回的股票都应该属于 XLK 板块
-            for stock in data:
-                if stock.get("sector"):
-                    assert stock["sector"].upper() == "XLK"
+        app.dependency_overrides[get_db] = lambda: test_db
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://test"
+            ) as client:
+                response = await client.get("/api/stocks?sector=XLK")
+
+                assert response.status_code == 200
+                data = response.json()
+                assert isinstance(data, list)
+                # 所有返回的股票都应该属于 XLK 板块
+                for stock in data:
+                    if stock.get("sector"):
+                        assert stock["sector"].upper() == "XLK"
+        finally:
+            app.dependency_overrides.pop(get_db, None)
     
     async def test_get_stocks_with_min_score(self):
         """测试按最低评分筛选"""

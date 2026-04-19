@@ -11,7 +11,11 @@ DEFAULT_API_BASE="${MOMENTUM_API_BASE_URL:-http://127.0.0.1:8000}"
 # Keep these lists empty by default.
 # Add file names only when you want to import the corresponding provider data.
 # Path resolution is handled by resolve_provider_file().
-finviz_list=()
+finviz_list=(
+  "Finviz_XLC_E_F_K_V_Y-w80_04-17_17_00_L104.json"
+"Finviz_XTL_XSD_SOXX_SMH_IGV-w80_04-17_17_30_L80.json"
+"Finviz_etfs_04-17_17_30_L11.json"
+)
 
 mc_list=()
 

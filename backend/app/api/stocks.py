@@ -486,14 +486,22 @@ def _compute_delta_payload_from_snapshots(
     if not snapshots:
         return {"delta3d": None, "delta5d": None}
 
-    current = snapshots[0].total_score or 0
+    current_snapshot = snapshots[0]
+    current = current_snapshot.total_score or 0
+    current_date = current_snapshot.date
     delta3d = None
     delta5d = None
 
-    if len(snapshots) >= 4 and snapshots[3].total_score is not None:
-        delta3d = round(current - snapshots[3].total_score, 2)
-    if len(snapshots) >= 6 and snapshots[5].total_score is not None:
-        delta5d = round(current - snapshots[5].total_score, 2)
+    for snap in snapshots[1:]:
+        if snap.total_score is None or snap.date is None:
+            continue
+        days_diff = (current_date - snap.date).days
+        if delta3d is None and days_diff >= 3:
+            delta3d = round(current - snap.total_score, 2)
+        if delta5d is None and days_diff >= 5:
+            delta5d = round(current - snap.total_score, 2)
+        if delta3d is not None and delta5d is not None:
+            break
 
     return {"delta3d": delta3d, "delta5d": delta5d}
 
@@ -789,13 +797,13 @@ async def get_stocks_by_heat(
     - 按热度评分降序排列的股票列表
     """
     valid_heat_types = ['trend', 'event', 'hedge', 'normal']
-    heat_type_lower = normalize_heat_type(heat_type)
-    
-    if heat_type_lower not in valid_heat_types:
+    heat_type_raw = str(heat_type or '').strip().lower().replace(' ', '_')
+    if heat_type_raw not in HEAT_TYPE_FILTER_ALIASES:
         raise HTTPException(
             status_code=400,
             detail=f"无效的热度类型: {heat_type}。有效类型: {', '.join(valid_heat_types)}"
         )
+    heat_type_lower = normalize_heat_type(heat_type)
     
     aliases = HEAT_TYPE_FILTER_ALIASES.get(heat_type_lower, [heat_type_lower])
     query = db.query(Stock).filter(func.lower(Stock.heat_type).in_(aliases))

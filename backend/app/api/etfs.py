@@ -671,19 +671,27 @@ def _compute_snapshot_deltas(
     snapshots = db.query(ScoreSnapshot).filter(
         ScoreSnapshot.symbol == symbol.upper(),
         ScoreSnapshot.symbol_type == symbol_type,
-    ).order_by(ScoreSnapshot.date.desc(), ScoreSnapshot.id.desc()).limit(6).all()
+    ).order_by(ScoreSnapshot.date.desc(), ScoreSnapshot.id.desc()).limit(10).all()
 
     if not snapshots:
         return {"delta3d": None, "delta5d": None}
 
-    current = snapshots[0].total_score or 0
+    current_snapshot = snapshots[0]
+    current = current_snapshot.total_score or 0
+    current_date = current_snapshot.date
     delta3d = None
     delta5d = None
 
-    if len(snapshots) >= 4 and snapshots[3].total_score is not None:
-        delta3d = round(current - snapshots[3].total_score, 2)
-    if len(snapshots) >= 6 and snapshots[5].total_score is not None:
-        delta5d = round(current - snapshots[5].total_score, 2)
+    for snap in snapshots[1:]:
+        if snap.total_score is None or snap.date is None:
+            continue
+        days_diff = (current_date - snap.date).days
+        if delta3d is None and days_diff >= 3:
+            delta3d = round(current - snap.total_score, 2)
+        if delta5d is None and days_diff >= 5:
+            delta5d = round(current - snap.total_score, 2)
+        if delta3d is not None and delta5d is not None:
+            break
 
     return {"delta3d": delta3d, "delta5d": delta5d}
 
@@ -3045,19 +3053,27 @@ async def refresh_holdings_by_coverage(
         snapshots = db.query(ScoreSnapshot).filter(
             ScoreSnapshot.symbol == symbol.upper(),
             ScoreSnapshot.symbol_type == 'stock'
-        ).order_by(ScoreSnapshot.date.desc()).limit(6).all()
+        ).order_by(ScoreSnapshot.date.desc()).limit(10).all()
 
         if not snapshots:
             return {"delta3d": None, "delta5d": None}
 
-        current = snapshots[0].total_score or 0
+        current_snapshot = snapshots[0]
+        current = current_snapshot.total_score or 0
+        current_date = current_snapshot.date
         delta3d = None
         delta5d = None
 
-        if len(snapshots) >= 4 and snapshots[3].total_score is not None:
-            delta3d = round(current - snapshots[3].total_score, 2)
-        if len(snapshots) >= 6 and snapshots[5].total_score is not None:
-            delta5d = round(current - snapshots[5].total_score, 2)
+        for snap in snapshots[1:]:
+            if snap.total_score is None or snap.date is None:
+                continue
+            days_diff = (current_date - snap.date).days
+            if delta3d is None and days_diff >= 3:
+                delta3d = round(current - snap.total_score, 2)
+            if delta5d is None and days_diff >= 5:
+                delta5d = round(current - snap.total_score, 2)
+            if delta3d is not None and delta5d is not None:
+                break
 
         return {"delta3d": delta3d, "delta5d": delta5d}
 

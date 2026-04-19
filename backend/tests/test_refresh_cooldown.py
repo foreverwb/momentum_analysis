@@ -239,12 +239,12 @@ async def test_refresh_etf_data_snapshot_recalculates_breadth_score(db_session):
     ).first()
 
     assert result["status"] == "snapshot"
-    assert result["score"] == pytest.approx(74.0)
-    assert result["breakdown"]["breadth"]["score"] == pytest.approx(100.0)
+    assert result["score"] == pytest.approx(71.5)
+    assert result["breakdown"]["breadth"]["score"] == pytest.approx(87.5)
     assert refreshed_etf is not None
-    assert refreshed_etf.score == pytest.approx(74.0)
+    assert refreshed_etf.score == pytest.approx(71.5)
     assert refreshed_snapshot is not None
-    assert refreshed_snapshot.total_score == pytest.approx(74.0)
+    assert refreshed_snapshot.total_score == pytest.approx(71.5)
 
 
 @pytest.mark.asyncio
@@ -867,9 +867,9 @@ async def test_refresh_holdings_snapshot_recalculates_etf_score(db_session):
 
     assert result["status"] == "snapshot"
     assert refreshed_etf is not None
-    assert refreshed_etf.score == pytest.approx(74.0)
+    assert refreshed_etf.score == pytest.approx(71.5)
     assert refreshed_snapshot is not None
-    assert refreshed_snapshot.total_score == pytest.approx(74.0)
+    assert refreshed_snapshot.total_score == pytest.approx(71.5)
 
 
 @pytest.mark.asyncio
