@@ -9,8 +9,10 @@ from sqlalchemy.orm import sessionmaker
 
 from app.api.etfs import (
     ETF_REFRESH_COOLDOWN_MINUTES,
+    HOLDINGS_FUTU_BATCH_CODE_BUDGET,
     HOLDINGS_REFRESH_COOLDOWN_MINUTES,
     HoldingsCoverageRequest,
+    _plan_futu_symbol_batches,
     format_etf_response,
     refresh_etf_data,
     refresh_holdings_by_coverage,
@@ -969,16 +971,29 @@ class _DummyOrchestrator:
 
 
 class _BatchFutuStub:
-    def __init__(self, payload_by_symbol):
+    class _OptionsFetcherStub:
+        def __init__(self, estimated_code_counts=None):
+            self.estimated_code_counts = estimated_code_counts or {}
+
+        def get_cached_contract_code_count(self, symbol, max_days=120, allow_stale=True):
+            return self.estimated_code_counts.get(str(symbol).upper())
+
+    def __init__(self, payload_by_symbol, *, estimated_code_counts=None, exception_by_call=None):
         self.payload_by_symbol = payload_by_symbol
         self.calls = []
+        self.options_fetcher = self._OptionsFetcherStub(estimated_code_counts=estimated_code_counts)
+        self.exception_by_call = exception_by_call or {}
 
     def is_connected(self):
         return True
 
     def fetch_iv_terms(self, symbols, **kwargs):
         normalized = [str(symbol).upper() for symbol in symbols]
+        call_index = len(self.calls)
         self.calls.append({"symbols": normalized, "kwargs": dict(kwargs)})
+        scheduled_exception = self.exception_by_call.get(call_index)
+        if scheduled_exception is not None:
+            raise scheduled_exception
         return {
             symbol: self.payload_by_symbol.get(symbol, IVTermResult())
             for symbol in normalized
@@ -1755,7 +1770,17 @@ async def test_refresh_holdings_splits_futu_requests_into_small_batches(monkeypa
         )
     db_session.commit()
 
-    futu = _BatchFutuStub({ticker: IVTermResult(iv30=20.0, total_oi=1000) for ticker in tickers})
+    estimated_code_counts = {
+        "AAPL": 220,
+        "MSFT": 180,
+        "NVDA": 210,
+        "AVGO": 90,
+        "AMD": 80,
+    }
+    futu = _BatchFutuStub(
+        {ticker: IVTermResult(iv30=20.0, total_oi=1000) for ticker in tickers},
+        estimated_code_counts=estimated_code_counts,
+    )
     orchestrator = _BatchOrchestrator(futu=futu)
     monkeypatch.setattr("app.services.orchestrator.get_orchestrator", lambda: orchestrator)
 
@@ -1767,6 +1792,110 @@ async def test_refresh_holdings_splits_futu_requests_into_small_batches(monkeypa
 
     assert result["status"] == "success"
     assert result["stocks_count"] == 5
-    assert len(futu.calls) == 2
-    assert len(futu.calls[0]["symbols"]) == 4
-    assert len(futu.calls[1]["symbols"]) == 1
+    expected_plan = _plan_futu_symbol_batches(
+        tickers,
+        estimated_code_counts,
+        code_budget=HOLDINGS_FUTU_BATCH_CODE_BUDGET,
+    )
+    assert len(futu.calls) == len(expected_plan)
+    assert [call["symbols"] for call in futu.calls] == [chunk["symbols"] for chunk in expected_plan]
+    assert all(chunk["estimated_codes"] <= HOLDINGS_FUTU_BATCH_CODE_BUDGET for chunk in expected_plan)
+
+
+def test_plan_futu_symbol_batches_uses_code_budget_not_fixed_symbol_count():
+    symbols = ["AAA", "BBB", "CCC", "DDD", "EEE"]
+    estimated_code_counts = {
+        "AAA": 220,
+        "BBB": 180,
+        "CCC": 210,
+        "DDD": 90,
+        "EEE": 80,
+    }
+
+    chunks = _plan_futu_symbol_batches(
+        symbols,
+        estimated_code_counts,
+        code_budget=HOLDINGS_FUTU_BATCH_CODE_BUDGET,
+    )
+
+    assert [chunk["symbols"] for chunk in chunks] == [["AAA", "BBB"], ["CCC", "DDD", "EEE"]]
+    assert all(chunk["estimated_codes"] <= HOLDINGS_FUTU_BATCH_CODE_BUDGET for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_refresh_holdings_futu_batch_failure_isolated_to_current_chunk(monkeypatch, db_session):
+    today = date.today()
+    now = datetime.utcnow()
+
+    etf = ETF(symbol="XLK", name="Technology", type="sector")
+    db_session.add(etf)
+    db_session.flush()
+
+    tickers = ["AAPL", "MSFT", "NVDA", "AVGO", "AMD"]
+    estimated_code_counts = {
+        "AAPL": 220,
+        "MSFT": 180,
+        "NVDA": 210,
+        "AVGO": 90,
+        "AMD": 80,
+    }
+    db_session.add_all(
+        [
+            ETFHolding(
+                etf_id=etf.id,
+                etf_symbol="XLK",
+                ticker=ticker,
+                weight=10.0 - idx,
+                data_date=today,
+            )
+            for idx, ticker in enumerate(tickers)
+        ]
+    )
+    for ticker in tickers:
+        db_session.add(
+            ImportedData(
+                symbol=ticker,
+                date=today,
+                source="finviz",
+                data={"symbol": ticker},
+                created_at=now,
+            )
+        )
+        db_session.add(
+            ImportedData(
+                symbol=ticker,
+                date=today,
+                source="marketchameleon",
+                data={"symbol": ticker},
+                created_at=now,
+            )
+        )
+    db_session.commit()
+
+    futu = _BatchFutuStub(
+        {ticker: IVTermResult(iv30=20.0, total_oi=1000) for ticker in tickers},
+        estimated_code_counts=estimated_code_counts,
+        exception_by_call={0: RuntimeError("first chunk failed")},
+    )
+    orchestrator = _BatchOrchestrator(futu=futu)
+    monkeypatch.setattr("app.services.orchestrator.get_orchestrator", lambda: orchestrator)
+
+    result = await refresh_holdings_by_coverage(
+        "XLK",
+        HoldingsCoverageRequest(coverage_type="top", coverage_value=5),
+        db=db_session,
+    )
+
+    expected_plan = _plan_futu_symbol_batches(
+        tickers,
+        estimated_code_counts,
+        code_budget=HOLDINGS_FUTU_BATCH_CODE_BUDGET,
+    )
+
+    assert result["status"] == "success"
+    assert result["futu_failed_count"] == len(expected_plan[0]["symbols"])
+    assert len(futu.calls) == len(expected_plan)
+
+    iv_rows = db_session.query(IVData).filter(IVData.symbol.in_(tickers)).all()
+    iv_symbols = {row.symbol for row in iv_rows}
+    assert iv_symbols == set(expected_plan[1]["symbols"])

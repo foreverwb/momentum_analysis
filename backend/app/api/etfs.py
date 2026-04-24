@@ -35,6 +35,10 @@ from app.core.time_utils import (
     utc_now_naive,
 )
 from app.services.parsers import normalize_heat_type
+from app.services.broker.futu.options_data import (
+    FUTU_DEFAULT_CONTRACT_CODE_ESTIMATE,
+    FUTU_SNAPSHOT_MAX_CODES_PER_REQUEST,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -64,7 +68,8 @@ ETF_REFRESH_COOLDOWN_MINUTES = _refresh_config.etf_cooldown_minutes
 ETF_REFRESH_COOLDOWN = timedelta(minutes=ETF_REFRESH_COOLDOWN_MINUTES)
 HOLDINGS_REFRESH_COOLDOWN_MINUTES = _refresh_config.holdings_cooldown_minutes
 HOLDINGS_REFRESH_COOLDOWN = timedelta(minutes=HOLDINGS_REFRESH_COOLDOWN_MINUTES)
-HOLDINGS_FUTU_BATCH_SYMBOLS = 4
+HOLDINGS_FUTU_BATCH_CODE_BUDGET = FUTU_SNAPSHOT_MAX_CODES_PER_REQUEST
+HOLDINGS_FUTU_DEFAULT_ESTIMATED_CODES = FUTU_DEFAULT_CONTRACT_CODE_ESTIMATE
 _HOLDINGS_REFRESH_PROGRESS: Dict[str, Dict[str, Any]] = {}
 _HOLDINGS_REFRESH_PROGRESS_LOCK = threading.Lock()
 _SHARE_CLASS_ALIAS_PATTERN = re.compile(r"^([A-Z][A-Z0-9]{0,5})[.-]([A-Z])$")
@@ -199,6 +204,74 @@ def _symbol_aliases(symbol: Any) -> List[str]:
     if "." in canonical:
         aliases.add(canonical.replace(".", "-", 1))
     return sorted(aliases)
+
+
+def _normalize_estimated_code_count(value: Any) -> int:
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        normalized = HOLDINGS_FUTU_DEFAULT_ESTIMATED_CODES
+    return max(1, normalized)
+
+
+def _estimate_futu_symbol_code_counts(
+    futu_connector: Any,
+    symbols: List[str],
+    *,
+    max_days: int = 120,
+) -> Dict[str, int]:
+    fetcher = getattr(futu_connector, "options_fetcher", None)
+    cached_counter = getattr(fetcher, "get_cached_contract_code_count", None)
+    estimated: Dict[str, int] = {}
+
+    for symbol in symbols:
+        count = None
+        if callable(cached_counter):
+            try:
+                count = cached_counter(symbol=symbol, max_days=max_days, allow_stale=True)
+            except Exception as exc:
+                logger.warning("refresh_holdings_futu_estimate_failed symbol=%s error=%s", symbol, exc)
+        estimated[symbol] = _normalize_estimated_code_count(count)
+    return estimated
+
+
+def _plan_futu_symbol_batches(
+    symbols: List[str],
+    estimated_code_counts: Dict[str, int],
+    *,
+    code_budget: int = HOLDINGS_FUTU_BATCH_CODE_BUDGET,
+) -> List[Dict[str, Any]]:
+    normalized_budget = max(1, int(code_budget))
+    chunks: List[Dict[str, Any]] = []
+    current_symbols: List[str] = []
+    current_estimated_codes = 0
+
+    for symbol in symbols:
+        estimated_codes = _normalize_estimated_code_count(
+            estimated_code_counts.get(symbol, HOLDINGS_FUTU_DEFAULT_ESTIMATED_CODES)
+        )
+        if current_symbols and current_estimated_codes + estimated_codes > normalized_budget:
+            chunks.append(
+                {
+                    "symbols": current_symbols,
+                    "estimated_codes": current_estimated_codes,
+                }
+            )
+            current_symbols = []
+            current_estimated_codes = 0
+
+        current_symbols.append(symbol)
+        current_estimated_codes += estimated_codes
+
+    if current_symbols:
+        chunks.append(
+            {
+                "symbols": current_symbols,
+                "estimated_codes": current_estimated_codes,
+            }
+        )
+
+    return chunks
 
 
 def _iso_utc(value: Optional[datetime]) -> Optional[str]:
@@ -3331,18 +3404,46 @@ async def refresh_holdings_by_coverage(
         if refresh_futu
         else []
     )
-    estimated_futu_seconds = estimate_iv_fetch_time(symbol_count=max(1, len(futu_symbols))) if futu_symbols else 0
+    futu_connector = getattr(orchestrator, "_futu", None)
+    futu_estimated_code_counts = (
+        _estimate_futu_symbol_code_counts(
+            futu_connector,
+            futu_symbols,
+            max_days=120,
+        )
+        if futu_symbols
+        else {}
+    )
+    futu_planned_chunks = (
+        _plan_futu_symbol_batches(
+            futu_symbols,
+            futu_estimated_code_counts,
+            code_budget=HOLDINGS_FUTU_BATCH_CODE_BUDGET,
+        )
+        if futu_symbols
+        else []
+    )
+    total_estimated_futu_codes = sum(chunk["estimated_codes"] for chunk in futu_planned_chunks)
+    estimated_futu_seconds = (
+        estimate_iv_fetch_time(
+            symbol_count=max(1, len(futu_symbols)),
+            estimated_code_count=max(1, total_estimated_futu_codes),
+        )
+        if futu_symbols
+        else 0
+    )
     futu_iv_timeout_seconds = max(45, int(estimated_futu_seconds + 15)) if futu_symbols else 45
-    futu_chunk_count = math.ceil(len(futu_symbols) / HOLDINGS_FUTU_BATCH_SYMBOLS) if futu_symbols else 0
+    futu_chunk_count = len(futu_planned_chunks)
     if futu_symbols:
         logger.info(
-            "refresh_holdings_futu_timeout_budget symbol=%s coverage=%s timeout_seconds=%s tickers=%s chunk_size=%s chunks=%s",
+            "refresh_holdings_futu_timeout_budget symbol=%s coverage=%s timeout_seconds=%s actual_symbols=%s code_budget=%s planned_chunk_count=%s estimated_codes=%s",
             symbol.upper(),
             coverage_label,
             futu_iv_timeout_seconds,
             len(futu_symbols),
-            HOLDINGS_FUTU_BATCH_SYMBOLS,
+            HOLDINGS_FUTU_BATCH_CODE_BUDGET,
             futu_chunk_count,
+            total_estimated_futu_codes,
         )
 
     def _has_futu_payload(payload: Any) -> bool:
@@ -3378,22 +3479,36 @@ async def refresh_holdings_by_coverage(
         aggregated_payload: Dict[str, Any] = {}
         failed_symbols: set[str] = set()
         total_symbols = len(normalized_symbols)
-        total_chunks = max(1, math.ceil(total_symbols / HOLDINGS_FUTU_BATCH_SYMBOLS))
+        planned_chunks = _plan_futu_symbol_batches(
+            normalized_symbols,
+            futu_estimated_code_counts or _estimate_futu_symbol_code_counts(orchestrator._futu, normalized_symbols, max_days=120),
+            code_budget=HOLDINGS_FUTU_BATCH_CODE_BUDGET,
+        )
+        total_chunks = max(1, len(planned_chunks))
+        chunk_errors: List[str] = []
+        processed_symbols = 0
 
-        for chunk_index, chunk_start in enumerate(range(0, total_symbols, HOLDINGS_FUTU_BATCH_SYMBOLS), start=1):
-            chunk_symbols = normalized_symbols[chunk_start:chunk_start + HOLDINGS_FUTU_BATCH_SYMBOLS]
+        for chunk_index, chunk in enumerate(planned_chunks, start=1):
+            chunk_symbols = chunk["symbols"]
+            chunk_estimated_codes = _normalize_estimated_code_count(chunk.get("estimated_codes"))
             chunk_timeout_seconds = max(
                 45,
-                int(estimate_iv_fetch_time(symbol_count=max(1, len(chunk_symbols))) + 15),
+                int(
+                    estimate_iv_fetch_time(
+                        symbol_count=max(1, len(chunk_symbols)),
+                        estimated_code_count=max(1, chunk_estimated_codes),
+                    ) + 15
+                ),
             )
             batch_started_at = perf_counter()
             logger.info(
-                "refresh_holdings_futu_batch_start symbol=%s coverage=%s chunk=%s/%s tickers=%s timeout_seconds=%s",
+                "refresh_holdings_futu_batch_start symbol=%s coverage=%s chunk=%s/%s actual_symbols=%s estimated_codes=%s timeout_seconds=%s",
                 symbol.upper(),
                 coverage_label,
                 chunk_index,
                 total_chunks,
                 len(chunk_symbols),
+                chunk_estimated_codes,
                 chunk_timeout_seconds,
             )
             if progress_token:
@@ -3402,7 +3517,7 @@ async def refresh_holdings_by_coverage(
                     {
                         "message": (
                             f"Futu 期权数据抓取中：第 {chunk_index}/{total_chunks} 批，"
-                            f"{min(chunk_start + len(chunk_symbols), total_symbols)}/{total_symbols} 只..."
+                            f"{min(processed_symbols + len(chunk_symbols), total_symbols)}/{total_symbols} 只..."
                         ),
                     },
                 )
@@ -3415,7 +3530,7 @@ async def refresh_holdings_by_coverage(
                         max_days=120,
                         max_retries=0,
                         progress_total=total_symbols,
-                        progress_offset=chunk_start,
+                        progress_offset=processed_symbols,
                         log_progress=True,
                         log_fetch_summary=False,
                     ),
@@ -3423,48 +3538,54 @@ async def refresh_holdings_by_coverage(
                 )
             except asyncio.TimeoutError:
                 elapsed_ms = (perf_counter() - batch_started_at) * 1000
-                remaining_symbols = normalized_symbols[chunk_start:]
-                failed_symbols.update(remaining_symbols)
+                failed_symbols.update(chunk_symbols)
+                chunk_errors.append("futu_timeout")
                 logger.warning(
-                    "refresh_holdings_futu_iv_timeout_batch symbol=%s coverage=%s chunk=%s/%s tickers=%s timeout_seconds=%s elapsed_ms=%s",
+                    "refresh_holdings_futu_iv_timeout_batch symbol=%s coverage=%s chunk=%s/%s actual_symbols=%s estimated_codes=%s timeout_seconds=%s elapsed_ms=%s failed_chunk_symbols=%s",
                     symbol.upper(),
                     coverage_label,
                     chunk_index,
                     total_chunks,
                     len(chunk_symbols),
+                    chunk_estimated_codes,
                     chunk_timeout_seconds,
                     round(elapsed_ms, 1),
+                    chunk_symbols,
                 )
                 if progress_token:
                     _patch_holdings_refresh_progress(
                         progress_token,
                         {
-                            "message": "Futu 期权数据抓取超时，剩余标的将跳过 Futu 数据。",
+                            "message": f"Futu 第 {chunk_index}/{total_chunks} 批超时，继续处理后续标的。",
                         },
                     )
-                return aggregated_payload, failed_symbols, "futu_timeout"
+                processed_symbols += len(chunk_symbols)
+                continue
             except Exception as exc:
                 elapsed_ms = (perf_counter() - batch_started_at) * 1000
-                remaining_symbols = normalized_symbols[chunk_start:]
-                failed_symbols.update(remaining_symbols)
+                failed_symbols.update(chunk_symbols)
+                chunk_errors.append(str(exc))
                 logger.warning(
-                    "refresh_holdings_futu_batch_failed symbol=%s coverage=%s chunk=%s/%s tickers=%s elapsed_ms=%s error=%s",
+                    "refresh_holdings_futu_batch_failed symbol=%s coverage=%s chunk=%s/%s actual_symbols=%s estimated_codes=%s elapsed_ms=%s error=%s failed_chunk_symbols=%s",
                     symbol.upper(),
                     coverage_label,
                     chunk_index,
                     total_chunks,
                     len(chunk_symbols),
+                    chunk_estimated_codes,
                     round(elapsed_ms, 1),
                     str(exc),
+                    chunk_symbols,
                 )
                 if progress_token:
                     _patch_holdings_refresh_progress(
                         progress_token,
                         {
-                            "message": "Futu 期权数据抓取失败，剩余标的将跳过 Futu 数据。",
+                            "message": f"Futu 第 {chunk_index}/{total_chunks} 批失败，继续处理后续标的。",
                         },
                     )
-                return aggregated_payload, failed_symbols, str(exc)
+                processed_symbols += len(chunk_symbols)
+                continue
 
             payload = iv_results if isinstance(iv_results, dict) else {}
             ok_count = 0
@@ -3473,7 +3594,8 @@ async def refresh_holdings_by_coverage(
                 item = payload.get(ticker)
                 if item is not None:
                     aggregated_payload[ticker] = item
-                if _has_futu_payload(item):
+                incomplete_payload = bool(getattr(item, "_fetch_incomplete", False))
+                if _has_futu_payload(item) and not incomplete_payload:
                     ok_count += 1
                     failed_symbols.discard(ticker)
                 else:
@@ -3482,18 +3604,21 @@ async def refresh_holdings_by_coverage(
 
             elapsed_ms = (perf_counter() - batch_started_at) * 1000
             logger.info(
-                "refresh_holdings_futu_batch_done symbol=%s coverage=%s chunk=%s/%s tickers=%s ok=%s fail=%s elapsed_ms=%s",
+                "refresh_holdings_futu_batch_done symbol=%s coverage=%s chunk=%s/%s actual_symbols=%s estimated_codes=%s ok=%s fail=%s elapsed_ms=%s",
                 symbol.upper(),
                 coverage_label,
                 chunk_index,
                 total_chunks,
                 len(chunk_symbols),
+                chunk_estimated_codes,
                 ok_count,
                 fail_count,
                 round(elapsed_ms, 1),
             )
+            processed_symbols += len(chunk_symbols)
 
-        return aggregated_payload, failed_symbols, None
+        unique_errors = list(dict.fromkeys(err for err in chunk_errors if err))
+        return aggregated_payload, failed_symbols, "; ".join(unique_errors) if unique_errors else None
 
     futu_iv_task: Optional[asyncio.Task] = None
     futu_unavailable_reason: Optional[str] = None

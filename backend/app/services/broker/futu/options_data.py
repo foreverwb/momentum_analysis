@@ -7,11 +7,15 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+import sqlite3
+from pathlib import Path
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import structlog
 
+from app.core.paths import resolve_backend_storage_paths
 from app.core.time_utils import beijing_today
 
 from .connection import FutuConnection
@@ -19,11 +23,67 @@ from .utils import OPTION_TYPE, RET_OK
 
 logger = structlog.get_logger(__name__)
 
+FUTU_OPTION_CHAIN_MAX_CALLS = 10
+FUTU_OPTION_CHAIN_PERIOD_SECONDS = 30
+FUTU_SNAPSHOT_MAX_CALLS = 60
+FUTU_SNAPSHOT_PERIOD_SECONDS = 30
+FUTU_SNAPSHOT_MAX_CODES_PER_REQUEST = 400
+FUTU_OPTION_CHAIN_MAX_WINDOW_DAYS = 30
+FUTU_CONTRACT_CATALOG_TABLE = "futu_contract_catalog_cache"
+FUTU_CACHE_DB_TIMEOUT_SECONDS = 15
+FUTU_CACHE_DB_BUSY_TIMEOUT_MS = 12000
+FUTU_DEFAULT_CONTRACT_CODE_ESTIMATE = 120
+
+
+def clamp_option_chain_window_days(window_days: int) -> int:
+    try:
+        normalized = int(window_days)
+    except (TypeError, ValueError):
+        normalized = FUTU_OPTION_CHAIN_MAX_WINDOW_DAYS
+    return max(1, min(FUTU_OPTION_CHAIN_MAX_WINDOW_DAYS, normalized))
+
+
+def build_option_chain_windows(
+    start_date: Any,
+    end_date: Any,
+    window_days: int,
+) -> List[Tuple[str, str]]:
+    normalized_window_days = clamp_option_chain_window_days(window_days)
+    ranges: List[Tuple[str, str]] = []
+    cursor = start_date
+    while cursor <= end_date:
+        window_end = min(cursor + timedelta(days=normalized_window_days - 1), end_date)
+        ranges.append(
+            (
+                cursor.strftime("%Y-%m-%d"),
+                window_end.strftime("%Y-%m-%d"),
+            )
+        )
+        cursor = window_end + timedelta(days=1)
+    return ranges
+
+
+def chunk_option_codes(
+    codes: List[str],
+    chunk_size: int = FUTU_SNAPSHOT_MAX_CODES_PER_REQUEST,
+) -> List[List[str]]:
+    try:
+        normalized_chunk_size = max(1, int(chunk_size))
+    except (TypeError, ValueError):
+        normalized_chunk_size = FUTU_SNAPSHOT_MAX_CODES_PER_REQUEST
+
+    normalized_codes = [str(code) for code in codes if str(code).strip()]
+    return [
+        normalized_codes[idx: idx + normalized_chunk_size]
+        for idx in range(0, len(normalized_codes), normalized_chunk_size)
+    ]
+
 
 @dataclass
 class OptionContract:
     code: str
     option_type: Any
+    strike: Optional[float] = None
 
 
 @dataclass
@@ -64,15 +124,29 @@ class RateLimiter:
 class FutuOptionsDataFetcher:
     """Fetch option chain and market snapshot data from Futu."""
 
+    CACHE_LOCK = threading.Lock()
+
     def __init__(
         self,
         connection: FutuConnection,
         chain_limiter: Optional[RateLimiter] = None,
         snapshot_limiter: Optional[RateLimiter] = None,
+        cache_db_file: Optional[str] = None,
     ):
         self.connection = connection
-        self.chain_limiter = chain_limiter or RateLimiter(max_calls=10, period_seconds=30)
-        self.snapshot_limiter = snapshot_limiter or RateLimiter(max_calls=60, period_seconds=30)
+        self.chain_limiter = chain_limiter or RateLimiter(
+            max_calls=FUTU_OPTION_CHAIN_MAX_CALLS,
+            period_seconds=FUTU_OPTION_CHAIN_PERIOD_SECONDS,
+        )
+        self.snapshot_limiter = snapshot_limiter or RateLimiter(
+            max_calls=FUTU_SNAPSHOT_MAX_CALLS,
+            period_seconds=FUTU_SNAPSHOT_PERIOD_SECONDS,
+        )
+        resolved_cache_db = cache_db_file or str(resolve_backend_storage_paths().futu_oi_cache_db)
+        self.cache_db_file = str(resolved_cache_db)
+
+    def set_cache_db_file(self, cache_db_file: str) -> None:
+        self.cache_db_file = str(cache_db_file)
 
     @staticmethod
     def default_option_types() -> List[Any]:
@@ -120,6 +194,220 @@ class FutuOptionsDataFetcher:
             log_fetch_summary=log_fetch_summary,
         )
         return expirations
+
+    def load_contract_catalog(
+        self,
+        symbol: str,
+        max_days: int = 120,
+        cache_date: Optional[str] = None,
+        allow_stale: bool = False,
+    ) -> Dict[str, List[OptionContract]]:
+        self._ensure_contract_catalog_table()
+
+        symbol_key = str(symbol or "").strip().upper()
+        if not symbol_key:
+            return {}
+
+        today = beijing_today()
+        today_str = today.strftime("%Y-%m-%d")
+        target_cache_date = cache_date or today_str
+        end_date = today + timedelta(days=max(1, int(max_days)))
+        selected_cache_date: Optional[str] = target_cache_date
+
+        with self.CACHE_LOCK:
+            try:
+                with self._connect_cache_db() as conn:
+                    if allow_stale:
+                        selected_row = conn.execute(
+                            f"""
+                            SELECT cache_date, max_days
+                            FROM {FUTU_CONTRACT_CATALOG_TABLE}
+                            WHERE symbol = ?
+                            ORDER BY cache_date DESC, updated_at DESC
+                            LIMIT 1
+                            """,
+                            (symbol_key,),
+                        ).fetchone()
+                        if selected_row is None:
+                            return {}
+                        selected_cache_date = str(selected_row["cache_date"])
+                        cached_max_days = self._as_int(selected_row["max_days"])
+                    else:
+                        selected_row = conn.execute(
+                            f"""
+                            SELECT cache_date, max_days
+                            FROM {FUTU_CONTRACT_CATALOG_TABLE}
+                            WHERE symbol = ? AND cache_date = ?
+                            ORDER BY updated_at DESC
+                            LIMIT 1
+                            """,
+                            (symbol_key, target_cache_date),
+                        ).fetchone()
+                        if selected_row is None:
+                            return {}
+                        cached_max_days = self._as_int(selected_row["max_days"])
+
+                    if cached_max_days is not None and cached_max_days < int(max_days):
+                        return {}
+
+                    rows = conn.execute(
+                        f"""
+                        SELECT option_code, expiry, option_type, strike
+                        FROM {FUTU_CONTRACT_CATALOG_TABLE}
+                        WHERE symbol = ?
+                          AND cache_date = ?
+                          AND expiry >= ?
+                          AND expiry <= ?
+                        ORDER BY expiry ASC, option_code ASC
+                        """,
+                        (
+                            symbol_key,
+                            selected_cache_date,
+                            today_str,
+                            end_date.strftime("%Y-%m-%d"),
+                        ),
+                    ).fetchall()
+            except Exception as exc:
+                logger.warning(
+                    "futu_load_contract_catalog_failed",
+                    symbol=symbol_key,
+                    db_file=self.cache_db_file,
+                    error=str(exc),
+                )
+                return {}
+
+        expirations: Dict[str, List[OptionContract]] = defaultdict(list)
+        for row in rows:
+            expiry = str(row["expiry"])
+            option_code = str(row["option_code"])
+            expirations[expiry].append(
+                OptionContract(
+                    code=option_code,
+                    option_type=row["option_type"],
+                    strike=self._as_float(row["strike"]),
+                )
+            )
+        return dict(expirations)
+
+    def save_contract_catalog(
+        self,
+        symbol: str,
+        catalog: Dict[str, List[OptionContract]],
+        max_days: int,
+        cache_date: Optional[str] = None,
+    ) -> None:
+        self._ensure_contract_catalog_table()
+
+        symbol_key = str(symbol or "").strip().upper()
+        if not symbol_key:
+            return
+
+        cache_date_str = cache_date or beijing_today().strftime("%Y-%m-%d")
+        rows: List[Tuple[Any, ...]] = []
+        for expiry, contracts in catalog.items():
+            for contract in contracts:
+                option_code = str(getattr(contract, "code", "") or "").strip()
+                if not option_code:
+                    continue
+                rows.append(
+                    (
+                        symbol_key,
+                        cache_date_str,
+                        option_code,
+                        str(expiry),
+                        str(getattr(contract, "option_type", "") or ""),
+                        self._as_float(getattr(contract, "strike", None)),
+                        int(max_days),
+                    )
+                )
+
+        with self.CACHE_LOCK:
+            try:
+                with self._connect_cache_db() as conn:
+                    conn.execute(
+                        f"""
+                        DELETE FROM {FUTU_CONTRACT_CATALOG_TABLE}
+                        WHERE symbol = ? AND cache_date = ?
+                        """,
+                        (symbol_key, cache_date_str),
+                    )
+                    if rows:
+                        conn.executemany(
+                            f"""
+                            INSERT INTO {FUTU_CONTRACT_CATALOG_TABLE} (
+                                symbol,
+                                cache_date,
+                                option_code,
+                                expiry,
+                                option_type,
+                                strike,
+                                max_days
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            rows,
+                        )
+            except Exception as exc:
+                logger.warning(
+                    "futu_save_contract_catalog_failed",
+                    symbol=symbol_key,
+                    db_file=self.cache_db_file,
+                    error=str(exc),
+                )
+
+    def get_or_refresh_contract_catalog(
+        self,
+        symbol: str,
+        max_days: int = 120,
+        window_days: int = 30,
+        option_types: Optional[List[Any]] = None,
+        force_refresh: bool = False,
+        log_fetch_summary: bool = True,
+    ) -> Tuple[Dict[str, List[OptionContract]], OptionChainFetchMeta]:
+        if not force_refresh:
+            cached_catalog = self.load_contract_catalog(symbol=symbol, max_days=max_days)
+            if cached_catalog:
+                today = beijing_today()
+                meta = OptionChainFetchMeta(
+                    symbol=str(symbol or "").strip().upper(),
+                    strategy="cache",
+                    total_requests=0,
+                    success_requests=0,
+                    failed_requests=0,
+                    total_contracts=sum(len(contracts) for contracts in cached_catalog.values()),
+                    unique_expirations=len(cached_catalog),
+                    near_term_contracts=self._count_near_term_contracts(cached_catalog, today, max_day=90),
+                )
+                return cached_catalog, meta
+
+        catalog, meta = self.collect_expirations_with_meta(
+            symbol=symbol,
+            max_days=max_days,
+            window_days=window_days,
+            option_types=option_types,
+            log_fetch_summary=log_fetch_summary,
+        )
+        if catalog:
+            self.save_contract_catalog(
+                symbol=symbol,
+                catalog=catalog,
+                max_days=max_days,
+            )
+        return catalog, meta
+
+    def get_cached_contract_code_count(
+        self,
+        symbol: str,
+        max_days: int = 120,
+        allow_stale: bool = True,
+    ) -> Optional[int]:
+        catalog = self.load_contract_catalog(
+            symbol=symbol,
+            max_days=max_days,
+            allow_stale=allow_stale,
+        )
+        if not catalog:
+            return None
+        return sum(len(contracts) for contracts in catalog.values())
 
     def collect_expirations_with_meta(
         self,
@@ -180,14 +468,10 @@ class FutuOptionsDataFetcher:
             )
 
         # Fallback: if full-chain failed for some option type, try windowed fetch.
-        window_days = max(1, int(window_days))
+        window_days = clamp_option_chain_window_days(window_days)
         for option_type in failed_option_types:
             window_used = True
-            window_start = today
-            while window_start <= end_date:
-                window_end = min(window_start + timedelta(days=window_days), end_date)
-                start_str = window_start.strftime("%Y-%m-%d")
-                end_str = window_end.strftime("%Y-%m-%d")
+            for start_str, end_str in build_option_chain_windows(today, end_date, window_days):
                 meta.total_requests += 1
 
                 ret, data = self.fetch_option_chain_with_retry(
@@ -205,7 +489,6 @@ class FutuOptionsDataFetcher:
                         end_date=end_str,
                         error=data,
                     )
-                    window_start = window_end + timedelta(days=1)
                     continue
 
                 meta.success_requests += 1
@@ -217,7 +500,6 @@ class FutuOptionsDataFetcher:
                     start_date=today,
                     end_date=end_date,
                 )
-                window_start = window_end + timedelta(days=1)
 
         # Some OpenD versions only return near-term contracts for full-chain calls.
         # Supplement far-term ranges to improve IV60/IV90 and OI bucket coverage.
@@ -232,11 +514,7 @@ class FutuOptionsDataFetcher:
             if supplement_start <= end_date:
                 window_used = True
                 for option_type in option_types:
-                    window_start = supplement_start
-                    while window_start <= end_date:
-                        window_end = min(window_start + timedelta(days=window_days), end_date)
-                        start_str = window_start.strftime("%Y-%m-%d")
-                        end_str = window_end.strftime("%Y-%m-%d")
+                    for start_str, end_str in build_option_chain_windows(supplement_start, end_date, window_days):
                         meta.total_requests += 1
 
                         ret, data = self.fetch_option_chain_with_retry(
@@ -254,7 +532,6 @@ class FutuOptionsDataFetcher:
                                 end_date=end_str,
                                 error=data,
                             )
-                            window_start = window_end + timedelta(days=1)
                             continue
 
                         meta.success_requests += 1
@@ -266,7 +543,6 @@ class FutuOptionsDataFetcher:
                             start_date=today,
                             end_date=end_date,
                         )
-                        window_start = window_end + timedelta(days=1)
 
         if full_success_option_types and window_used:
             meta.strategy = "mixed"
@@ -298,32 +574,60 @@ class FutuOptionsDataFetcher:
         self,
         expirations: Dict[str, List[OptionContract]],
     ) -> Dict[str, Dict]:
-        client = self.connection.get_client()
-        if client is None:
-            return {}
-
         codes: List[str] = []
         for contracts in expirations.values():
             codes.extend(contract.code for contract in contracts)
 
-        if not codes:
-            return {}
+        return self.fetch_snapshot_map_from_codes(codes)
 
-        codes = list(dict.fromkeys(codes))
+    def fetch_snapshot_map_from_codes(
+        self,
+        codes: List[str],
+        chunk_size: int = FUTU_SNAPSHOT_MAX_CODES_PER_REQUEST,
+    ) -> Dict[str, Dict]:
+        snapshot_map, _failed_codes = self.fetch_snapshot_map_from_codes_with_failures(
+            codes=codes,
+            chunk_size=chunk_size,
+        )
+        return snapshot_map
+
+    def fetch_snapshot_map_from_codes_with_failures(
+        self,
+        codes: List[str],
+        chunk_size: int = FUTU_SNAPSHOT_MAX_CODES_PER_REQUEST,
+    ) -> Tuple[Dict[str, Dict], set[str]]:
+        client = self.connection.get_client()
+        if client is None:
+            return {}, set()
+
+        deduped_codes = list(dict.fromkeys(str(code) for code in codes if str(code).strip()))
+        if not deduped_codes:
+            return {}, set()
+
         snapshot_map: Dict[str, Dict] = {}
-
-        chunk_size = 400
-        for idx in range(0, len(codes), chunk_size):
-            batch = codes[idx : idx + chunk_size]
+        failed_codes: set[str] = set()
+        for batch_index, batch in enumerate(chunk_option_codes(deduped_codes, chunk_size=chunk_size), start=1):
             self.snapshot_limiter.acquire()
             try:
                 ret, data = client.get_market_snapshot(batch)
             except Exception as exc:
-                logger.warning("futu_get_snapshot_failed", error=str(exc))
+                failed_codes.update(batch)
+                logger.warning(
+                    "futu_get_snapshot_failed",
+                    batch_index=batch_index,
+                    batch_size=len(batch),
+                    error=str(exc),
+                )
                 continue
 
             if not self._is_ret_ok(ret):
-                logger.warning("futu_get_snapshot_failed", error=str(data))
+                failed_codes.update(batch)
+                logger.warning(
+                    "futu_get_snapshot_failed",
+                    batch_index=batch_index,
+                    batch_size=len(batch),
+                    error=str(data),
+                )
                 continue
 
             records = self.dataframe_to_records(data)
@@ -332,7 +636,7 @@ class FutuOptionsDataFetcher:
                 if code:
                     snapshot_map[str(code)] = rec
 
-        return snapshot_map
+        return snapshot_map, failed_codes
 
     def fetch_option_chain_with_retry(
         self,
@@ -437,6 +741,7 @@ class FutuOptionsDataFetcher:
                 OptionContract(
                     code=option_code,
                     option_type=self.get_record_option_type(record, fallback=option_type),
+                    strike=self.get_option_strike(record),
                 )
             )
 
@@ -546,6 +851,18 @@ class FutuOptionsDataFetcher:
         return fallback
 
     @staticmethod
+    def get_option_strike(record: Dict) -> Optional[float]:
+        for key in ("strike_price", "strike", "exercise_price", "exercise", "option_strike"):
+            value = record.get(key)
+            try:
+                if value is None:
+                    continue
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @staticmethod
     def get_snapshot_value(snapshot: Dict, keys: List[str]) -> Optional[float]:
         for key in keys:
             if key in snapshot and snapshot[key] is not None:
@@ -586,6 +903,71 @@ class FutuOptionsDataFetcher:
         if value is None:
             return "N/A"
         return f"{value:.2f}"
+
+    @staticmethod
+    def _as_int(value: Any) -> Optional[int]:
+        try:
+            if value is None:
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _as_float(value: Any) -> Optional[float]:
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _connect_cache_db(self) -> sqlite3.Connection:
+        db_path = Path(self.cache_db_file).expanduser()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(
+            str(db_path),
+            timeout=FUTU_CACHE_DB_TIMEOUT_SECONDS,
+        )
+        try:
+            conn.execute(f"PRAGMA busy_timeout = {FUTU_CACHE_DB_BUSY_TIMEOUT_MS}")
+            conn.execute("PRAGMA journal_mode = WAL")
+        except Exception:
+            pass
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _ensure_contract_catalog_table(self) -> None:
+        with self.CACHE_LOCK:
+            try:
+                with self._connect_cache_db() as conn:
+                    conn.execute(
+                        f"""
+                        CREATE TABLE IF NOT EXISTS {FUTU_CONTRACT_CATALOG_TABLE} (
+                            symbol TEXT NOT NULL,
+                            cache_date TEXT NOT NULL,
+                            option_code TEXT NOT NULL,
+                            expiry TEXT NOT NULL,
+                            option_type TEXT,
+                            strike REAL,
+                            max_days INTEGER,
+                            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            PRIMARY KEY (symbol, cache_date, option_code)
+                        )
+                        """
+                    )
+                    conn.execute(
+                        f"""
+                        CREATE INDEX IF NOT EXISTS idx_{FUTU_CONTRACT_CATALOG_TABLE}_symbol_date
+                        ON {FUTU_CONTRACT_CATALOG_TABLE} (symbol, cache_date, expiry)
+                        """
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "futu_init_contract_catalog_table_failed",
+                    db_file=self.cache_db_file,
+                    error=str(exc),
+                )
 
     @staticmethod
     def _is_ret_ok(ret: Any) -> bool:

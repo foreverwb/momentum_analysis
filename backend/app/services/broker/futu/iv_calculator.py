@@ -19,7 +19,13 @@ import structlog
 from ....core.paths import resolve_backend_storage_paths
 from ....core.time_utils import beijing_today
 from .connection import FutuConnection
-from .options_data import FutuOptionsDataFetcher, OptionContract
+from .options_data import (
+    FUTU_OPTION_CHAIN_MAX_CALLS,
+    FUTU_SNAPSHOT_MAX_CALLS,
+    FUTU_SNAPSHOT_MAX_CODES_PER_REQUEST,
+    FutuOptionsDataFetcher,
+    OptionContract,
+)
 from .utils import OPTION_TYPE
 
 logger = structlog.get_logger(__name__)
@@ -72,6 +78,8 @@ class IVTermResult:
     delta_oi_bucket_8_30_5d: Optional[int] = None
     delta_oi_bucket_31_90_5d: Optional[int] = None
     _snapshot_payload: Optional[Dict[str, Any]] = field(default=None, repr=False, compare=False)
+    _fetch_incomplete: bool = field(default=False, repr=False, compare=False)
+    _fetch_error: Optional[str] = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -108,6 +116,14 @@ class FutuIVCalculator:
         # Keep parameter name for backward compatibility; storage is now SQLite.
         self.oi_cache_db_file = str(oi_cache_file)
         self.oi_cache_file = self.oi_cache_db_file
+        set_cache_db_file = getattr(self.options_fetcher, "set_cache_db_file", None)
+        if callable(set_cache_db_file):
+            set_cache_db_file(self.oi_cache_db_file)
+        elif hasattr(self.options_fetcher, "cache_db_file"):
+            try:
+                setattr(self.options_fetcher, "cache_db_file", self.oi_cache_db_file)
+            except Exception:
+                pass
         self._ensure_cache_table()
 
     def fetch_iv_terms(
@@ -135,15 +151,85 @@ class FutuIVCalculator:
         today = beijing_today()
         cache = self._load_oi_cache()
         cache_changed = False
+        option_types = self._resolve_option_types()
+        symbol_catalogs: Dict[str, Dict[str, List[OptionContract]]] = {}
+        symbol_catalog_meta: Dict[str, Any] = {}
+        symbol_codes: Dict[str, List[str]] = {}
 
         for idx, symbol in enumerate(symbols_list, start=1 + progress_offset):
             try:
-                result = self._fetch_symbol_iv_terms_with_retry(
+                expirations, fetch_meta = self._load_symbol_contract_catalog_with_retry(
                     symbol=symbol,
                     max_days=max_days,
                     window_days=window_days,
                     max_retries=max_retries,
+                    option_types=option_types,
                     log_fetch_summary=log_fetch_summary,
+                )
+                symbol_catalogs[symbol] = expirations
+                symbol_catalog_meta[symbol] = fetch_meta
+                symbol_codes[symbol] = list(
+                    dict.fromkeys(
+                        contract.code
+                        for contracts in expirations.values()
+                        for contract in contracts
+                        if getattr(contract, "code", None)
+                    )
+                )
+            except Exception as exc:
+                logger.warning(
+                    "futu_fetch_iv_terms_catalog_failed",
+                    symbol=symbol,
+                    index=idx,
+                    total=total,
+                    error=str(exc),
+                )
+                symbol_catalogs[symbol] = {}
+                symbol_catalog_meta[symbol] = None
+                symbol_codes[symbol] = []
+
+        all_codes = list(
+            dict.fromkeys(
+                code
+                for codes in symbol_codes.values()
+                for code in codes
+            )
+        )
+        if all_codes:
+            fetch_snapshot_with_failures = getattr(
+                self.options_fetcher,
+                "fetch_snapshot_map_from_codes_with_failures",
+                None,
+            )
+            if callable(fetch_snapshot_with_failures):
+                global_snapshot_map, failed_snapshot_codes = fetch_snapshot_with_failures(all_codes)
+            else:
+                fetch_snapshot_from_codes = getattr(self.options_fetcher, "fetch_snapshot_map_from_codes", None)
+                if callable(fetch_snapshot_from_codes):
+                    global_snapshot_map = fetch_snapshot_from_codes(all_codes)
+                    failed_snapshot_codes = set()
+                else:
+                    global_snapshot_map = {}
+                    for expirations in symbol_catalogs.values():
+                        global_snapshot_map.update(self.options_fetcher.fetch_snapshot_map(expirations))
+                    failed_snapshot_codes = set()
+        else:
+            global_snapshot_map = {}
+            failed_snapshot_codes = set()
+
+        for idx, symbol in enumerate(symbols_list, start=1 + progress_offset):
+            try:
+                result = self._build_symbol_iv_terms(
+                    symbol=symbol,
+                    expirations=symbol_catalogs.get(symbol, {}),
+                    fetch_meta=symbol_catalog_meta.get(symbol),
+                    snapshot_map={
+                        code: global_snapshot_map[code]
+                        for code in symbol_codes.get(symbol, [])
+                        if code in global_snapshot_map
+                    },
+                    today=today,
+                    snapshot_failed=bool(set(symbol_codes.get(symbol, [])) & failed_snapshot_codes),
                 )
 
                 if any(
@@ -275,45 +361,134 @@ class FutuIVCalculator:
         window_days: int,
         log_fetch_summary: bool = True,
     ) -> IVTermResult:
+        expirations, fetch_meta = self._load_symbol_contract_catalog(
+            symbol=symbol,
+            max_days=max_days,
+            window_days=window_days,
+            option_types=self._resolve_option_types(),
+            log_fetch_summary=log_fetch_summary,
+        )
+        snapshot_map = self.options_fetcher.fetch_snapshot_map(expirations)
+        return self._build_symbol_iv_terms(
+            symbol=symbol,
+            expirations=expirations,
+            fetch_meta=fetch_meta,
+            snapshot_map=snapshot_map,
+            today=beijing_today(),
+        )
+
+    def _resolve_option_types(self) -> List[Any]:
         option_types_resolver = getattr(self.options_fetcher, "default_option_types", None)
         if callable(option_types_resolver):
-            option_types = option_types_resolver()
-        else:
-            option_types = FutuOptionsDataFetcher.default_option_types()
+            return option_types_resolver()
+        return FutuOptionsDataFetcher.default_option_types()
 
-        expirations, fetch_meta = self.options_fetcher.collect_expirations_with_meta(
+    def _load_symbol_contract_catalog(
+        self,
+        symbol: str,
+        max_days: int,
+        window_days: int,
+        option_types: Optional[List[Any]],
+        log_fetch_summary: bool,
+    ) -> Tuple[Dict[str, List[OptionContract]], Any]:
+        catalog_loader = getattr(self.options_fetcher, "get_or_refresh_contract_catalog", None)
+        if callable(catalog_loader):
+            return catalog_loader(
+                symbol=symbol,
+                max_days=max_days,
+                window_days=window_days,
+                option_types=option_types,
+                force_refresh=False,
+                log_fetch_summary=log_fetch_summary,
+            )
+        return self.options_fetcher.collect_expirations_with_meta(
             symbol=symbol,
             max_days=max_days,
             window_days=window_days,
             option_types=option_types,
             log_fetch_summary=log_fetch_summary,
         )
+
+    def _load_symbol_contract_catalog_with_retry(
+        self,
+        symbol: str,
+        max_days: int,
+        window_days: int,
+        max_retries: int,
+        option_types: Optional[List[Any]],
+        log_fetch_summary: bool,
+    ) -> Tuple[Dict[str, List[OptionContract]], Any]:
+        for attempt in range(max_retries + 1):
+            try:
+                return self._load_symbol_contract_catalog(
+                    symbol=symbol,
+                    max_days=max_days,
+                    window_days=window_days,
+                    option_types=option_types,
+                    log_fetch_summary=log_fetch_summary,
+                )
+            except Exception as exc:
+                if attempt < max_retries:
+                    sleep_seconds = min(30.0, 2 ** attempt)
+                    logger.warning(
+                        "futu_load_contract_catalog_retry",
+                        symbol=symbol,
+                        attempt=attempt + 1,
+                        max_retries=max_retries,
+                        sleep_seconds=sleep_seconds,
+                        error=str(exc),
+                    )
+                    time.sleep(sleep_seconds)
+                    continue
+                raise
+        return {}, None
+
+    def _build_symbol_iv_terms(
+        self,
+        symbol: str,
+        expirations: Dict[str, List[OptionContract]],
+        fetch_meta: Any,
+        snapshot_map: Dict[str, Dict],
+        today: Any,
+        snapshot_failed: bool = False,
+    ) -> IVTermResult:
+        fetch_strategy = getattr(fetch_meta, "strategy", "none")
+        failed_requests = getattr(fetch_meta, "failed_requests", 0)
+        success_requests = getattr(fetch_meta, "success_requests", 0)
+        unique_expirations = getattr(fetch_meta, "unique_expirations", 0)
         if not expirations:
             logger.warning(
                 "futu_no_option_expiration",
                 symbol=symbol,
-                strategy=fetch_meta.strategy,
-                failed_requests=fetch_meta.failed_requests,
-                success_requests=fetch_meta.success_requests,
+                strategy=fetch_strategy,
+                failed_requests=failed_requests,
+                success_requests=success_requests,
             )
-            return IVTermResult()
+            return IVTermResult(
+                _fetch_incomplete=snapshot_failed,
+                _fetch_error="no_catalog",
+            )
 
-        today = beijing_today()
         near_term_expirations = self._count_near_term_expirations(expirations, today, max_day=90)
         if near_term_expirations == 0:
             logger.warning(
                 "futu_option_chain_near_term_missing",
                 symbol=symbol,
-                strategy=fetch_meta.strategy,
-                failed_requests=fetch_meta.failed_requests,
-                success_requests=fetch_meta.success_requests,
-                unique_expirations=fetch_meta.unique_expirations,
+                strategy=fetch_strategy,
+                failed_requests=failed_requests,
+                success_requests=success_requests,
+                unique_expirations=unique_expirations,
             )
-            return IVTermResult()
+            return IVTermResult(
+                _fetch_incomplete=snapshot_failed,
+                _fetch_error="near_term_missing",
+            )
 
-        snapshot_map = self.options_fetcher.fetch_snapshot_map(expirations)
         if not snapshot_map:
-            return IVTermResult()
+            return IVTermResult(
+                _fetch_incomplete=snapshot_failed,
+                _fetch_error="snapshot_missing",
+            )
 
         points = self._build_iv_points(expirations, snapshot_map, today)
 
@@ -347,6 +522,8 @@ class FutuIVCalculator:
             put_oi_bucket_0_7=self._extract_snapshot_bucket_metric(snapshot_payload, "0_7", "put"),
             put_oi_bucket_8_30=self._extract_snapshot_bucket_metric(snapshot_payload, "8_30", "put"),
             put_oi_bucket_31_90=self._extract_snapshot_bucket_metric(snapshot_payload, "31_90", "put"),
+            _fetch_incomplete=snapshot_failed,
+            _fetch_error="snapshot_chunk_failed" if snapshot_failed else None,
         )
         result._snapshot_payload = snapshot_payload
         return result
@@ -1416,12 +1593,20 @@ class FutuIVCalculator:
 
 def estimate_iv_fetch_time(
     symbol_count: int,
+    estimated_code_count: Optional[int] = None,
     windows_per_symbol: int = 4,
     option_type_count: int = 1,
 ) -> float:
     option_chain_calls = symbol_count * windows_per_symbol * option_type_count
-    snapshot_calls = symbol_count
+    if estimated_code_count is not None:
+        snapshot_calls = max(
+            1,
+            (max(1, int(estimated_code_count)) + FUTU_SNAPSHOT_MAX_CODES_PER_REQUEST - 1)
+            // FUTU_SNAPSHOT_MAX_CODES_PER_REQUEST,
+        )
+    else:
+        snapshot_calls = symbol_count
 
-    chain_batches = (option_chain_calls + 9) // 10
-    snapshot_batches = (snapshot_calls + 59) // 60
+    chain_batches = (option_chain_calls + FUTU_OPTION_CHAIN_MAX_CALLS - 1) // FUTU_OPTION_CHAIN_MAX_CALLS
+    snapshot_batches = (snapshot_calls + FUTU_SNAPSHOT_MAX_CALLS - 1) // FUTU_SNAPSHOT_MAX_CALLS
     return max(chain_batches, snapshot_batches) * 30.0
