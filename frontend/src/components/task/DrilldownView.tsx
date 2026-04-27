@@ -9,7 +9,7 @@
  * 不做：
  *  - 具体 NodeTree / 中栏内容 / NodeDetailPanel 的 UI 实现（留给 Task 4.8 / 4.9 / 4.10）
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import * as api from '../../services/api';
 import type {
@@ -19,6 +19,7 @@ import type {
   NodeTrendMetric,
   TaskViewMode,
 } from '../../types';
+import { NodeTree } from './NodeTree';
 
 interface DrilldownViewProps {
   task: Task;
@@ -47,12 +48,28 @@ export function DrilldownView({ task, onViewStockDetail: _onViewStockDetail }: D
   // _onViewStockDetail 由 Task 4.10 NodeDetailPanel 使用，这里保留 prop 接通点。
   void _onViewStockDetail;
 
-  const [lens, _setLens] = useState<TaskViewMode>('gics');
+  const [lens, setLens] = useState<TaskViewMode>('gics');
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
-  const [_expandedIds, _setExpandedIds] = useState<Set<string>>(new Set());
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
   const [trendPeriod, _setTrendPeriod] = useState<NodeTrendPeriod>('20d');
   const [trendMetric, _setTrendMetric] = useState<NodeTrendMetric>('relative');
   const [_showAllHoldings, _setShowAllHoldings] = useState<boolean>(false);
+
+  const handleSelect = useCallback((node: ResearchNode) => {
+    setSelectedNodeId(node.id);
+  }, []);
+
+  const handleToggleExpand = useCallback((nodeId: string) => {
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(nodeId)) {
+        next.delete(nodeId);
+      } else {
+        next.add(nodeId);
+      }
+      return next;
+    });
+  }, []);
 
   // Restore selection from localStorage
   useEffect(() => {
@@ -67,7 +84,7 @@ export function DrilldownView({ task, onViewStockDetail: _onViewStockDetail }: D
     }
   }, [task.id, selectedNodeId]);
 
-  const { data: nodeTree } = useQuery({
+  const { data: nodeTree, isLoading: treeLoading } = useQuery({
     queryKey: api.drilldownQueryKeys.nodeTree(task.id, lens),
     queryFn: () => api.getTaskNodeTree(task.id, lens),
     staleTime: TREE_STALE_MS,
@@ -81,6 +98,18 @@ export function DrilldownView({ task, onViewStockDetail: _onViewStockDetail }: D
     () => allNodes.find((n) => n.id === selectedNodeId) ?? allNodes[0] ?? null,
     [allNodes, selectedNodeId]
   );
+
+  // Auto-expand root and first child on initial tree load
+  useEffect(() => {
+    if (!nodeTree || nodeTree.length === 0) return;
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      const root = nodeTree[0];
+      next.add(root.id);
+      if (root.children?.length) next.add(root.children[0].id);
+      return next;
+    });
+  }, [nodeTree]);
 
   // Holdings for selected node
   useQuery({
@@ -110,19 +139,18 @@ export function DrilldownView({ task, onViewStockDetail: _onViewStockDetail }: D
 
   return (
     <div style={{ display: 'flex', height: '100%', overflow: 'hidden' }}>
-      {/* LEFT 280 — Task 4.8 NodeTree */}
-      <aside
-        style={{
-          width: 280,
-          flexShrink: 0,
-          borderRight: '1px solid #e2e8f0',
-          background: '#fff',
-        }}
-      >
-        <div style={{ padding: 16, fontSize: 12, color: '#64748b' }}>
-          NodeTree (Task 4.8)
-        </div>
-      </aside>
+      {/* LEFT 280 — NodeTree */}
+      <NodeTree
+        nodes={nodeTree ?? []}
+        selectedNodeId={selectedNode?.id ?? null}
+        expandedIds={expandedIds}
+        lens={lens}
+        onSelect={handleSelect}
+        onToggleExpand={handleToggleExpand}
+        onLensChange={setLens}
+        totalNodeCount={allNodes.length}
+        isLoading={treeLoading}
+      />
 
       {/* CENTER flex — Task 4.9 regime / trend / matrix / holdings / data-source */}
       <main
