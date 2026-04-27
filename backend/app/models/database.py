@@ -82,6 +82,32 @@ class TaskType(enum.Enum):
     MOMENTUM = "momentum"
 
 
+class NodeType(enum.Enum):
+    """节点的语义类型"""
+    GICS = "gics"            # GICS 分类节点 (XLK / 半导体 / 软件)
+    CHAIN = "chain"          # 产业链节点 (设备 / 计算 / 连接)
+    LEAF = "leaf"            # 介质叶子节点 (光 / 铜)
+    EVIDENCE = "evidence"    # 证据/主题节点 (云计算 / 网络安全)
+
+
+class NodeEdgeType(enum.Enum):
+    """节点之间关系的类型"""
+    CLASSIFICATION_PARENT = "classification_parent"  # GICS 父子
+    CHAIN_PARENT = "chain_parent"                    # 产业链父子
+    PROXY_OF = "proxy_of"                            # ETF 是节点的 proxy
+    CORROBORATES = "corroborates"                    # 主题节点用于确认主节点
+    OVERLAPS_WITH = "overlaps_with"                  # 成分重叠
+    DRIVES = "drives"                                # 上游驱动下游
+    DEPENDS_ON = "depends_on"                        # 下游依赖上游
+
+
+class NodeProxyRole(enum.Enum):
+    """proxy 的角色"""
+    PRIMARY = "primary"
+    SECONDARY = "secondary"
+    EXTENSION = "extension"   # chain extension（跨出父 ETF 成分）
+
+
 class Stock(Base):
     __tablename__ = "stocks"
 
@@ -378,6 +404,99 @@ class RankBufferRecord(Base):
     )
 
 
+# ============ 节点层模型 (Phase 4 - Drilldown Upgrade) ============
+
+class AnalyticNode(Base):
+    """研究节点 - 板块下钻的一等分析对象"""
+    __tablename__ = "analytic_nodes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    node_id = Column(String(64), unique=True, nullable=False, index=True)
+    # node_id 是业务主键, e.g. 'XLK', 'semi', 'semi-compute', 'conn-optical'
+    label = Column(String(64), nullable=False)        # '半导体'
+    sublabel = Column(String(128), nullable=True)     # 'Semiconductors & Equip.'
+    node_type = Column(String(20), nullable=False, index=True)  # NodeType value
+    level = Column(Integer, default=0, index=True)    # 0=root, 1=sub-sector, 2=segment, 3=leaf
+    representation_confidence = Column(Float, default=1.0)  # 0-1, synthetic 节点 < 1
+    description = Column(Text, nullable=True)
+    extra = Column(JSON, default=dict)  # 自由扩展: tags, oem_metadata, etc.
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class NodeEdge(Base):
+    """节点之间的关系边"""
+    __tablename__ = "node_edges"
+
+    id = Column(Integer, primary_key=True)
+    src_node_id = Column(String(64), ForeignKey('analytic_nodes.node_id'), nullable=False, index=True)
+    dst_node_id = Column(String(64), ForeignKey('analytic_nodes.node_id'), nullable=False, index=True)
+    edge_type = Column(String(32), nullable=False, index=True)  # NodeEdgeType value
+    weight = Column(Float, default=1.0)  # 边权重 (用于 chain confirmation 的加权)
+    extra = Column(JSON, default=dict)
+
+    __table_args__ = (
+        UniqueConstraint('src_node_id', 'dst_node_id', 'edge_type', name='uix_node_edge_triple'),
+    )
+
+
+class NodeProxy(Base):
+    """节点的 ETF proxy 映射"""
+    __tablename__ = "node_proxies"
+
+    id = Column(Integer, primary_key=True)
+    node_id = Column(String(64), ForeignKey('analytic_nodes.node_id'), nullable=False, index=True)
+    etf_symbol = Column(String(20), nullable=False, index=True)  # 'SOXX' / 'SMH' / 'IGV'
+    role = Column(String(20), nullable=False, default='primary')  # NodeProxyRole value
+    purity = Column(Float, default=1.0)   # ETF 表达此 node 的纯度 (0-1)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint('node_id', 'etf_symbol', 'role', name='uix_node_proxy_node_etf_role'),
+    )
+
+
+class SyntheticBasketDefinition(Base):
+    """合成篮成分定义 - 节点没有干净 ETF proxy 时使用"""
+    __tablename__ = "synthetic_basket_definitions"
+
+    id = Column(Integer, primary_key=True)
+    node_id = Column(String(64), ForeignKey('analytic_nodes.node_id'), nullable=False, index=True)
+    ticker = Column(String(20), nullable=False, index=True)
+    target_weight = Column(Float, nullable=True)
+    # null = 等权或动态权重；非 null = 显式目标权重
+    weighting_strategy = Column(String(20), default='equal')
+    # 'equal' / 'mcap' / 'parent_etf_weight' / 'fixed'
+    chain_extension = Column(Boolean, default=False)
+    # True 表示这只票跨出了父 ETF 的成分范围（光/铜叶子常见）
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint('node_id', 'ticker', name='uix_basket_node_ticker'),
+    )
+
+
+class NodePriceSeries(Base):
+    """合成节点的价格序列缓存
+    （ETF proxy 节点直接读 PriceHistory，无需缓存；只有 synthetic 才落这里）"""
+    __tablename__ = "node_price_series"
+
+    id = Column(Integer, primary_key=True)
+    node_id = Column(String(64), ForeignKey('analytic_nodes.node_id'), nullable=False, index=True)
+    date = Column(Date, nullable=False, index=True)
+    close = Column(Float, nullable=False)        # 合成"价格"(归一化基准 100 起算)
+    constituents_count = Column(Integer, default=0)
+    coverage_ratio = Column(Float, default=1.0)  # 当日有数据的成分股比例
+    weighting_strategy = Column(String(20))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint('node_id', 'date', name='uix_node_price_series_date'),
+    )
+
+
 # ============ 辅助函数 ============
 
 def is_valid_ticker(ticker: str) -> bool:
@@ -420,6 +539,7 @@ def init_db():
     _ensure_stocks_heat_columns()
     _ensure_iv_data_bucket_columns()
     _ensure_options_overlay_indexes()
+    _ensure_node_tables_indexes()
     logger.info("数据库表已创建")
 
 
@@ -497,6 +617,36 @@ def _ensure_options_overlay_indexes():
                 text(
                     "CREATE INDEX IF NOT EXISTS idx_iv_symbol_date_id "
                     "ON iv_data(symbol, date DESC, id DESC)"
+                )
+            )
+
+
+def _ensure_node_tables_indexes():
+    """为节点层表补齐查询常用索引（仅 sqlite）"""
+    if engine.dialect.name != "sqlite":
+        return
+    inspector = inspect(engine)
+    table_names = set(inspector.get_table_names())
+    with engine.begin() as conn:
+        if "analytic_nodes" in table_names:
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_analytic_nodes_node_type "
+                    "ON analytic_nodes(node_type)"
+                )
+            )
+        if "node_edges" in table_names:
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_node_edges_edge_type "
+                    "ON node_edges(edge_type)"
+                )
+            )
+        if "node_proxies" in table_names:
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_node_proxies_etf_symbol "
+                    "ON node_proxies(etf_symbol)"
                 )
             )
 
