@@ -1,0 +1,163 @@
+# XLK 节点 taxonomy 种子配置
+# 需求文档 §4 — XLK 完整节点结构
+# 维护规则: 只改此文件, 不修改任何 .py 核心逻辑
+nodes:
+  - node_id: XLK
+    label: XLK
+    sublabel: Technology Select Sector
+    node_type: gics
+    level: 0
+    representation_confidence: 1.0
+
+  - node_id: semi
+    label: 半导体
+    sublabel: Semiconductors & Equip.
+    node_type: gics
+    level: 1
+    representation_confidence: 1.0
+
+  - node_id: soft
+    label: 软件
+    sublabel: Application Software
+    node_type: gics
+    level: 1
+    representation_confidence: 1.0
+
+  - node_id: hw
+    label: 硬件
+    sublabel: Tech Hardware & Equipment
+    node_type: gics
+    level: 1
+    representation_confidence: 0.7   # synthetic aggregate, 标记纯度
+
+  - node_id: semi-equip
+    label: 设备
+    sublabel: Semiconductor Equipment
+    node_type: chain
+    level: 2
+    representation_confidence: 0.85
+
+  - node_id: semi-compute
+    label: 计算
+    sublabel: AI Compute / GPU
+    node_type: chain
+    level: 2
+    representation_confidence: 0.8
+
+  - node_id: semi-mem
+    label: 存储
+    sublabel: Memory / DRAM
+    node_type: chain
+    level: 2
+    representation_confidence: 0.85
+
+  - node_id: semi-conn
+    label: 连接
+    sublabel: High-Speed Interconnect
+    node_type: chain
+    level: 2
+    representation_confidence: 0.7
+
+  - node_id: conn-optical
+    label: 光互联
+    sublabel: Optical Transceivers
+    node_type: leaf
+    level: 3
+    representation_confidence: 0.65
+
+  - node_id: conn-copper
+    label: 铜缆
+    sublabel: Active Copper / Connectors
+    node_type: leaf
+    level: 3
+    representation_confidence: 0.65
+
+  - node_id: soft-cloud
+    label: 云计算
+    sublabel: Cloud Platforms
+    node_type: evidence
+    level: 2
+    representation_confidence: 0.7
+
+  - node_id: soft-cyber
+    label: 网络安全
+    sublabel: Cybersecurity
+    node_type: evidence
+    level: 2
+    representation_confidence: 0.7
+
+edges:
+  # GICS 分类
+  - {src: XLK,      dst: semi, type: classification_parent}
+  - {src: XLK,      dst: soft, type: classification_parent}
+  - {src: XLK,      dst: hw,   type: classification_parent}
+
+  # 产业链
+  - {src: semi,      dst: semi-equip,   type: chain_parent}
+  - {src: semi,      dst: semi-compute, type: chain_parent}
+  - {src: semi,      dst: semi-mem,     type: chain_parent}
+  - {src: semi,      dst: semi-conn,    type: chain_parent}
+  - {src: semi-conn, dst: conn-optical, type: chain_parent}
+  - {src: semi-conn, dst: conn-copper,  type: chain_parent}
+
+  # 证据节点 (corroborates 软件)
+  - {src: soft-cloud, dst: soft, type: corroborates, weight: 0.6}
+  - {src: soft-cyber, dst: soft, type: corroborates, weight: 0.4}
+
+  # 上下游驱动 (设备/连接 驱动 计算)
+  - {src: semi-equip,   dst: semi-compute, type: drives,      weight: 0.5}
+  - {src: semi-conn,    dst: semi-compute, type: drives,      weight: 0.5}
+  - {src: semi-compute, dst: semi-equip,   type: depends_on,  weight: 0.5}
+  - {src: semi-compute, dst: semi-conn,    type: depends_on,  weight: 0.5}
+
+proxies:
+  - {node_id: XLK,        etf: XLK,  role: primary,   purity: 1.0}
+  - {node_id: semi,       etf: SOXX, role: primary,   purity: 0.95}
+  - {node_id: semi,       etf: SMH,  role: secondary, purity: 0.85}
+  - {node_id: soft,       etf: IGV,  role: primary,   purity: 0.9}
+  - {node_id: soft-cloud, etf: SKYY, role: primary,   purity: 0.75}
+  - {node_id: soft-cyber, etf: HACK, role: primary,   purity: 0.8}
+
+baskets:
+  # 硬件 — 父 ETF 内聚合
+  - {node_id: hw, ticker: AAPL, weighting_strategy: parent_etf_weight, chain_extension: false}
+  - {node_id: hw, ticker: HPQ,  weighting_strategy: parent_etf_weight, chain_extension: false}
+  - {node_id: hw, ticker: DELL, weighting_strategy: parent_etf_weight, chain_extension: false}
+  - {node_id: hw, ticker: NTAP, weighting_strategy: parent_etf_weight, chain_extension: false}
+  - {node_id: hw, ticker: STX,  weighting_strategy: parent_etf_weight, chain_extension: false}
+
+  # 设备
+  - {node_id: semi-equip, ticker: AMAT, weighting_strategy: equal}
+  - {node_id: semi-equip, ticker: LRCX, weighting_strategy: equal}
+  - {node_id: semi-equip, ticker: KLAC, weighting_strategy: equal}
+  - {node_id: semi-equip, ticker: ASML, weighting_strategy: equal}
+  - {node_id: semi-equip, ticker: TER,  weighting_strategy: equal}
+
+  # 计算
+  - {node_id: semi-compute, ticker: NVDA, weighting_strategy: mcap}
+  - {node_id: semi-compute, ticker: AMD,  weighting_strategy: mcap}
+  - {node_id: semi-compute, ticker: AVGO, weighting_strategy: mcap}
+
+  # 存储
+  - {node_id: semi-mem, ticker: MU,  weighting_strategy: mcap}
+  - {node_id: semi-mem, ticker: WDC, weighting_strategy: mcap}
+  - {node_id: semi-mem, ticker: STX, weighting_strategy: mcap}
+
+  # 连接
+  - {node_id: semi-conn, ticker: ANET, weighting_strategy: mcap}
+  - {node_id: semi-conn, ticker: CRDO, weighting_strategy: mcap}
+  - {node_id: semi-conn, ticker: APH,  weighting_strategy: mcap}
+  - {node_id: semi-conn, ticker: MTSI, weighting_strategy: mcap}
+  - {node_id: semi-conn, ticker: LITE, weighting_strategy: mcap}
+
+  # 光 (chain extension: 可能跨出 XLK 成分)
+  - {node_id: conn-optical, ticker: CIEN, weighting_strategy: equal, chain_extension: true}
+  - {node_id: conn-optical, ticker: LITE, weighting_strategy: equal, chain_extension: true}
+  - {node_id: conn-optical, ticker: COHR, weighting_strategy: equal, chain_extension: true}
+  - {node_id: conn-optical, ticker: AAOI, weighting_strategy: equal, chain_extension: true}
+
+  # 铜
+  - {node_id: conn-copper, ticker: CRDO, weighting_strategy: equal, chain_extension: true}
+  - {node_id: conn-copper, ticker: APH,  weighting_strategy: equal}
+  - {node_id: conn-copper, ticker: TEL,  weighting_strategy: equal}
+  - {node_id: conn-copper, ticker: MTSI, weighting_strategy: equal}

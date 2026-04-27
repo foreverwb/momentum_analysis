@@ -85,6 +85,7 @@ TOP_LEVEL_COMMANDS = {
     "list-holdings",
     "finviz",
     "mc",
+    "load-node-taxonomy",
     *ALL_REFRESH_COMMANDS,
 }
 FILE_PREFIX_ATTR_BY_COMMAND = {
@@ -1978,6 +1979,24 @@ def cmd_list_holdings(args):
         db.close()
 
 
+def cmd_load_node_taxonomy(args):
+    """处理 load-node-taxonomy 命令"""
+    from app.models.database import init_db
+    from app.services.node_taxonomy_loader import load_taxonomy
+
+    yaml_path = Path(args.yaml_path).resolve()
+    print(f"正在加载 taxonomy: {yaml_path}")
+
+    init_db()
+    counts = load_taxonomy(yaml_path)
+
+    print(json.dumps(counts, ensure_ascii=False))
+    print(
+        f"\n完成: nodes={counts['nodes']}, edges={counts['edges']}, "
+        f"proxies={counts['proxies']}, baskets={counts['baskets']}"
+    )
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="python -m app.cli",
@@ -2265,6 +2284,16 @@ def build_parser():
     )
     refresh_list_parser.set_defaults(func=cmd_refresh_list)
 
+    load_taxonomy_parser = subparsers.add_parser(
+        'load-node-taxonomy',
+        help='从 YAML 加载节点 taxonomy 到数据库（幂等）',
+    )
+    load_taxonomy_parser.add_argument(
+        'yaml_path',
+        help='taxonomy YAML 文件路径，例如 backend/data/node_taxonomy/xlk.yaml',
+    )
+    load_taxonomy_parser.set_defaults(func=cmd_load_node_taxonomy)
+
     return parser
 
 
@@ -2276,7 +2305,7 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    if args.command in {"uploads", "update", "init", "list-etfs", "list-holdings", "finviz", "mc"}:
+    if args.command in {"uploads", "update", "init", "list-etfs", "list-holdings", "finviz", "mc", "load-node-taxonomy"}:
         _ensure_db_dependencies()
 
     try:
