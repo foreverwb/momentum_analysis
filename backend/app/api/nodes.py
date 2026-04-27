@@ -1,6 +1,6 @@
-"""节点中心化下钻 API（Phase 4 — Drilldown Upgrade Task 4.6）。
+"""节点中心化下钻 API（Phase 4 — Drilldown Upgrade Task 4.6/4.11）。
 
-职责: 提供前端"节点树 / 节点持仓 / 节点走势对比"3 个只读端点。
+职责: 提供前端"节点树 / 节点持仓 / 节点走势对比 / 节点目录"4 个只读端点。
 所有计算结果来自 Task 4.3/4.4 的引擎; 本模块不做任何评分或合成逻辑,
 只负责图遍历、契约组装、字段格式化。
 
@@ -25,6 +25,7 @@ from app.models.database import (
     AnalyticNode,
     NodeEdge,
     NodeEdgeType,
+    NodeProxy,
     NodePriceSeries,
     PriceHistory,
     Stock,
@@ -39,6 +40,9 @@ from app.services.calculators.node_score import (
 
 
 router = APIRouter()
+
+# 目录端点挂在 /api/nodes (不含 task_id) — Task 4.11
+catalog_router = APIRouter()
 
 
 # ============ 常量 ============
@@ -70,6 +74,115 @@ _VALID_LENS = ("gics", "chain", "hybrid")
 _VALID_TREND_PERIODS = (5, 20, 63)
 _VALID_TREND_METRICS = ("relative", "return20d", "score")
 _VALID_LABEL_TZ = ("beijing", "market")
+
+
+# ============ 0. GET /api/nodes/catalog (Task 4.11 — task-free) ============
+
+
+@catalog_router.get("/catalog", response_model=List[Dict[str, Any]])
+async def get_node_catalog(
+    root_node: str,
+    include_evidence: bool = True,
+    db: Session = Depends(get_db),
+) -> List[Dict[str, Any]]:
+    """返回某个根节点（如 XLK）下可被选中的所有子节点 + 证据节点。
+
+    用于创建任务和追加节点的 modal（Task 4.11）。
+
+    Args:
+        root_node: 根节点业务 ID（如 'XLK'）。
+        include_evidence: 是否包含 corroborates 边连到子树内任意节点的 evidence 节点。
+        db: SQLAlchemy session。
+
+    Returns:
+        [{id, label, sublabel, level, node_type, proxy_etf, proxy_label, parent_id}]
+        按 level 升序 / label 字典序排列。
+
+    Raises:
+        HTTPException 404: root_node 不存在。
+    """
+    normalized_root = root_node.strip().upper()
+    if not _node_exists(db, normalized_root):
+        raise HTTPException(status_code=404, detail=f"Node {normalized_root} not found")
+
+    # 取 root 的所有后代 (hybrid lens 覆盖 gics + chain 两类边)
+    node_ids, _ = _traverse_nodes(db, normalized_root, "hybrid", max_depth=10)
+
+    # 批量拉节点元数据
+    nodes = (
+        db.query(AnalyticNode)
+        .filter(AnalyticNode.node_id.in_(node_ids))
+        .all()
+    )
+    node_meta: Dict[str, AnalyticNode] = {n.node_id: n for n in nodes}
+
+    # 批量拉 primary proxy (每节点至多一条)
+    proxy_rows = (
+        db.query(NodeProxy.node_id, NodeProxy.etf_symbol)
+        .filter(NodeProxy.node_id.in_(node_ids))
+        .filter(NodeProxy.role == "primary")
+        .all()
+    )
+    primary_proxy: Dict[str, str] = {r.node_id: r.etf_symbol for r in proxy_rows}
+
+    # 批量拉父节点 (classification_parent edge src → node)
+    parent_rows = (
+        db.query(NodeEdge.dst_node_id, NodeEdge.src_node_id)
+        .filter(NodeEdge.dst_node_id.in_(node_ids))
+        .filter(NodeEdge.edge_type == NodeEdgeType.CLASSIFICATION_PARENT.value)
+        .all()
+    )
+    # dst=child, src=parent
+    parent_map: Dict[str, str] = {r.dst_node_id: r.src_node_id for r in parent_rows}
+
+    result_ids = set(node_ids)
+
+    # 可选: evidence 节点 — corroborates 边目标在子树内
+    if include_evidence:
+        evidence_rows = (
+            db.query(NodeEdge.src_node_id)
+            .filter(NodeEdge.dst_node_id.in_(node_ids))
+            .filter(NodeEdge.edge_type == NodeEdgeType.CORROBORATES.value)
+            .all()
+        )
+        evidence_ids = [r.src_node_id for r in evidence_rows if r.src_node_id not in result_ids]
+        if evidence_ids:
+            ev_nodes = (
+                db.query(AnalyticNode)
+                .filter(AnalyticNode.node_id.in_(evidence_ids))
+                .all()
+            )
+            for n in ev_nodes:
+                node_meta[n.node_id] = n
+            ev_proxy_rows = (
+                db.query(NodeProxy.node_id, NodeProxy.etf_symbol)
+                .filter(NodeProxy.node_id.in_(evidence_ids))
+                .filter(NodeProxy.role == "primary")
+                .all()
+            )
+            for r in ev_proxy_rows:
+                primary_proxy[r.node_id] = r.etf_symbol
+            result_ids.update(evidence_ids)
+
+    out: List[Dict[str, Any]] = []
+    for nid in result_ids:
+        meta = node_meta.get(nid)
+        if meta is None:
+            continue
+        proxy_sym = primary_proxy.get(nid)
+        out.append({
+            "id": nid,
+            "label": meta.label,
+            "sublabel": meta.sublabel or meta.label,
+            "level": int(meta.level or 0),
+            "node_type": meta.node_type,
+            "proxy_etf": proxy_sym,
+            "proxy_label": proxy_sym,
+            "parent_id": parent_map.get(nid),
+        })
+
+    out.sort(key=lambda x: (x["level"], x["label"]))
+    return out
 
 
 # ============ 1. GET /api/tasks/{task_id}/nodes ============

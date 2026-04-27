@@ -436,9 +436,26 @@ export interface CreateTaskInput {
   baseIndices?: string[];
   sector?: string;
   etfs: string[];
+  // Phase 4.11 新增
+  rootNode?: string;
+  viewMode?: TaskViewMode;
+  selectedNodes?: string[];
+  pinnedEvidenceNodes?: string[];
+  maxDepth?: number;
 }
 
 // ============ Phase 4: Drilldown Node Types ============
+
+export interface NodeCatalogItem {
+  id: string;
+  label: string;
+  sublabel: string;
+  level: number;
+  node_type: string;
+  proxy_etf: string | null;
+  proxy_label: string | null;
+  parent_id: string | null;
+}
 
 export type NodeProxyType = 'etf' | 'synthetic';
 export type TaskViewMode = 'gics' | 'chain' | 'hybrid';

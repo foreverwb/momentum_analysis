@@ -1956,12 +1956,12 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
     setETFModalOpen(true);
   };
 
-  const handleAddTaskETFs = async (symbols: string[]) => {
+  const handleAddTaskETFs = async (symbols: string[], selectedNodes?: string[]) => {
     if (!task.id) {
       throw new Error('当前任务不存在');
     }
 
-    const updatedTask = await api.addTaskETFs(task.id, symbols);
+    const updatedTask = await api.addTaskETFs(task.id, symbols, selectedNodes);
     queryClient.setQueryData(taskQueryKeys.detail(task.id), updatedTask);
     queryClient.setQueryData(taskQueryKeys.detail(String(task.id)), updatedTask);
     void queryClient.invalidateQueries({ queryKey: taskQueryKeys.lists() });
@@ -2156,6 +2156,7 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
         taskType={task.type}
         taskSector={task.sector}
         existingEtfs={task.etfs}
+        existingNodes={(task as { selectedNodes?: string[] }).selectedNodes ?? []}
         onSubmit={handleAddTaskETFs}
       />
       <HoldingsImportModal

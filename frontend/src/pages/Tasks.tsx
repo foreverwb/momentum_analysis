@@ -49,8 +49,11 @@ export function Tasks() {
       baseIndices: taskData.baseIndices,
       sector: taskData.sector ?? undefined,
       etfs: taskData.etfs,
+      rootNode: taskData.rootNode,
+      viewMode: taskData.viewMode,
+      selectedNodes: taskData.selectedNodes,
+      pinnedEvidenceNodes: taskData.pinnedEvidenceNodes,
     });
-    console.log('Task created:', taskData);
   };
 
   const handleViewTask = (task: Task) => {

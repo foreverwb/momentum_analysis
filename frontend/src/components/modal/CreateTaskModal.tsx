@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Modal } from './Modal';
-import type { TaskType } from '../../types';
+import type { TaskType, NodeCatalogItem, TaskViewMode } from '../../types';
+import * as api from '../../services/api';
 
 type BaseIndexSymbol = 'SPY' | 'QQQ' | 'IWM';
 
@@ -18,6 +19,11 @@ export interface CreateTaskData {
   sector: string | null;
   baseIndex: string;
   baseIndices: BaseIndexSymbol[];
+  // Phase 4.11 — node-centric drilldown fields
+  rootNode?: string;
+  viewMode?: TaskViewMode;
+  selectedNodes?: string[];
+  pinnedEvidenceNodes?: string[];
 }
 
 // ETF Data
@@ -35,6 +41,7 @@ const SECTOR_ETFS = [
   { symbol: 'XLB', name: '材料' },
 ];
 
+// rotation / momentum tasks still need per-sector industry ETFs (hardcoded, unchanged)
 const INDUSTRY_ETFS: Record<string, { symbol: string; name: string }[]> = {
   XLK: [
     { symbol: 'SOXX', name: '半导体' },
@@ -109,6 +116,12 @@ export function CreateTaskModal({ isOpen, onClose, onSubmit }: CreateTaskModalPr
   const [selectedSector, setSelectedSector] = useState<string | null>(null);
   const [baseIndices, setBaseIndices] = useState<BaseIndexSymbol[]>(['SPY']);
 
+  // drilldown node-centric state (Phase 4.11)
+  const [catalogItems, setCatalogItems] = useState<NodeCatalogItem[]>([]);
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  const [selectedNodes, setSelectedNodes] = useState<string[]>([]);
+  const [selectedEvidenceIds, setSelectedEvidenceIds] = useState<string[]>([]);
+
   const resetForm = () => {
     setCurrentStep(1);
     setTaskName('');
@@ -116,7 +129,39 @@ export function CreateTaskModal({ isOpen, onClose, onSubmit }: CreateTaskModalPr
     setSelectedETFs([]);
     setSelectedSector(null);
     setBaseIndices(['SPY']);
+    setCatalogItems([]);
+    setSelectedNodes([]);
+    setSelectedEvidenceIds([]);
   };
+
+  // When drilldown sector changes, load catalog and auto-select GICS nodes
+  useEffect(() => {
+    if (taskType !== 'drilldown' || !selectedSector) {
+      setCatalogItems([]);
+      setSelectedNodes([]);
+      setSelectedEvidenceIds([]);
+      return;
+    }
+    let cancelled = false;
+    setCatalogLoading(true);
+    api.getNodeCatalog(selectedSector, true).then((items) => {
+      if (cancelled) return;
+      setCatalogItems(items);
+      // Auto-select all GICS-type nodes
+      const gicsIds = items
+        .filter((n) => n.node_type === 'gics')
+        .map((n) => n.id);
+      setSelectedNodes(gicsIds);
+      setSelectedEvidenceIds([]);
+      setCatalogLoading(false);
+    }).catch(() => {
+      if (!cancelled) {
+        setCatalogItems([]);
+        setCatalogLoading(false);
+      }
+    });
+    return () => { cancelled = true; };
+  }, [taskType, selectedSector]);
 
   const handleClose = () => {
     resetForm();
@@ -135,19 +180,52 @@ export function CreateTaskModal({ isOpen, onClose, onSubmit }: CreateTaskModalPr
     }
   };
 
+  // Build nodeIdToProxy map for etfs compatibility field
+  const nodeIdToProxy = React.useMemo<Record<string, string>>(() => {
+    const map: Record<string, string> = {};
+    for (const item of catalogItems) {
+      if (item.proxy_etf) {
+        map[item.id] = item.proxy_etf;
+      }
+    }
+    return map;
+  }, [catalogItems]);
+
   const handleSubmit = () => {
     const normalizedTaskName = taskName.trim();
     const normalizedBaseIndices: BaseIndexSymbol[] = baseIndices.length > 0 ? baseIndices : ['SPY'];
     const taskTitle = normalizedTaskName || generateTaskTitle();
-    onSubmit({
-      type: taskType,
-      name: normalizedTaskName,
-      title: taskTitle,
-      etfs: selectedETFs,
-      sector: selectedSector,
-      baseIndex: normalizedBaseIndices.join(','),
-      baseIndices: normalizedBaseIndices,
-    });
+
+    if (taskType === 'drilldown' && selectedSector) {
+      const allSelectedNodes = [...selectedNodes, ...selectedEvidenceIds];
+      const proxyEtfs = allSelectedNodes
+        .flatMap((id) => (nodeIdToProxy[id] ? [nodeIdToProxy[id]] : []))
+        .filter((v, i, a) => a.indexOf(v) === i);
+
+      onSubmit({
+        type: taskType,
+        name: normalizedTaskName,
+        title: taskTitle,
+        etfs: proxyEtfs,
+        sector: selectedSector,
+        baseIndex: normalizedBaseIndices.join(','),
+        baseIndices: normalizedBaseIndices,
+        rootNode: selectedSector,
+        viewMode: 'gics',
+        selectedNodes: allSelectedNodes,
+        pinnedEvidenceNodes: selectedEvidenceIds,
+      });
+    } else {
+      onSubmit({
+        type: taskType,
+        name: normalizedTaskName,
+        title: taskTitle,
+        etfs: selectedETFs,
+        sector: selectedSector,
+        baseIndex: normalizedBaseIndices.join(','),
+        baseIndices: normalizedBaseIndices,
+      });
+    }
     handleClose();
   };
 
@@ -187,10 +265,14 @@ export function CreateTaskModal({ isOpen, onClose, onSubmit }: CreateTaskModalPr
         return taskName.trim().length > 0;
       case 2:
         if (taskType === 'rotation') return selectedETFs.length >= 2;
-        if (taskType === 'drilldown') return selectedSector && selectedETFs.length >= 1;
+        if (taskType === 'drilldown') return selectedSector !== null;
         if (taskType === 'momentum') return selectedSector && selectedETFs.length >= 1;
         return false;
       case 3:
+        if (taskType === 'drilldown') {
+          // need at least one node selected (GICS auto-selected on catalog load)
+          return selectedNodes.length > 0 || selectedEvidenceIds.length > 0;
+        }
         return baseIndices.length > 0;
       case 4:
         return true;
@@ -217,6 +299,27 @@ export function CreateTaskModal({ isOpen, onClose, onSubmit }: CreateTaskModalPr
           />
         );
       case 3:
+        if (taskType === 'drilldown' && selectedSector) {
+          return (
+            <StepSelectNodes
+              sector={selectedSector}
+              catalogItems={catalogItems}
+              loading={catalogLoading}
+              selectedNodes={selectedNodes}
+              selectedEvidenceIds={selectedEvidenceIds}
+              onToggleNode={(id) =>
+                setSelectedNodes((prev) =>
+                  prev.includes(id) ? prev.filter((n) => n !== id) : [...prev, id]
+                )
+              }
+              onToggleEvidence={(id) =>
+                setSelectedEvidenceIds((prev) =>
+                  prev.includes(id) ? prev.filter((n) => n !== id) : [...prev, id]
+                )
+              }
+            />
+          );
+        }
         return (
           <StepSelectAnchor
             baseIndices={baseIndices}
@@ -230,18 +333,28 @@ export function CreateTaskModal({ isOpen, onClose, onSubmit }: CreateTaskModalPr
         return (
           <StepConfirm
             taskType={taskType}
-            selectedETFs={selectedETFs}
+            selectedETFs={taskType === 'drilldown' && selectedSector
+              ? [...selectedNodes, ...selectedEvidenceIds]
+              : selectedETFs
+            }
             selectedSector={selectedSector}
             baseIndices={baseIndices}
             taskName={taskName}
             onNameChange={setTaskName}
             defaultTitle={generateTaskTitle()}
+            isNodeCentric={taskType === 'drilldown' && !!selectedSector}
           />
         );
       default:
         return null;
     }
   };
+
+  // For drilldown, step 3 label changes
+  const stepLabels =
+    taskType === 'drilldown'
+      ? ['选择类型', '选择板块', '选择节点', '确认创建']
+      : ['选择类型', '配置ETF', '锚定层级', '确认创建'];
 
   return (
     <Modal
@@ -278,67 +391,63 @@ export function CreateTaskModal({ isOpen, onClose, onSubmit }: CreateTaskModalPr
         </>
       }
     >
-      <StepNav currentStep={currentStep} />
+      <StepNav currentStep={currentStep} labels={stepLabels} />
       <div className="mt-6">{renderStepContent()}</div>
     </Modal>
   );
 }
 
 // Step Navigation Component
-function StepNav({ currentStep }: { currentStep: number }) {
-  const steps = [
-    { num: 1, label: '选择类型' },
-    { num: 2, label: '配置ETF' },
-    { num: 3, label: '锚定层级' },
-    { num: 4, label: '确认创建' },
-  ];
-
+function StepNav({ currentStep, labels }: { currentStep: number; labels: string[] }) {
   return (
     <div className="flex items-center justify-center gap-2">
-      {steps.map((step, index) => (
-        <React.Fragment key={step.num}>
-          <div
-            className={`
-              flex items-center gap-2 px-4 py-2 rounded-sm transition-colors
-              ${currentStep === step.num ? 'bg-blue-50' : ''}
-              ${currentStep > step.num ? 'opacity-70' : ''}
-            `}
-          >
-            <span
-              className={`
-                w-7 h-7 flex items-center justify-center rounded-full text-[13px] font-semibold transition-colors
-                ${currentStep === step.num
-                  ? 'bg-[var(--accent-blue)] text-white'
-                  : currentStep > step.num
-                  ? 'bg-[var(--accent-green)] text-white'
-                  : 'bg-[var(--border-light)] text-[var(--text-muted)]'
-                }
-              `}
-            >
-              {currentStep > step.num ? '✓' : step.num}
-            </span>
-            <span
-              className={`
-                text-sm font-medium
-                ${currentStep === step.num
-                  ? 'text-[var(--accent-blue)]'
-                  : 'text-[var(--text-muted)]'
-                }
-              `}
-            >
-              {step.label}
-            </span>
-          </div>
-          {index < steps.length - 1 && (
+      {labels.map((label, index) => {
+        const stepNum = index + 1;
+        return (
+          <React.Fragment key={stepNum}>
             <div
               className={`
-                w-10 h-0.5 transition-colors
-                ${currentStep > step.num ? 'bg-[var(--accent-green)]' : 'bg-[var(--border-light)]'}
+                flex items-center gap-2 px-4 py-2 rounded-sm transition-colors
+                ${currentStep === stepNum ? 'bg-blue-50' : ''}
+                ${currentStep > stepNum ? 'opacity-70' : ''}
               `}
-            />
-          )}
-        </React.Fragment>
-      ))}
+            >
+              <span
+                className={`
+                  w-7 h-7 flex items-center justify-center rounded-full text-[13px] font-semibold transition-colors
+                  ${currentStep === stepNum
+                    ? 'bg-[var(--accent-blue)] text-white'
+                    : currentStep > stepNum
+                    ? 'bg-[var(--accent-green)] text-white'
+                    : 'bg-[var(--border-light)] text-[var(--text-muted)]'
+                  }
+                `}
+              >
+                {currentStep > stepNum ? '✓' : stepNum}
+              </span>
+              <span
+                className={`
+                  text-sm font-medium
+                  ${currentStep === stepNum
+                    ? 'text-[var(--accent-blue)]'
+                    : 'text-[var(--text-muted)]'
+                  }
+                `}
+              >
+                {label}
+              </span>
+            </div>
+            {index < labels.length - 1 && (
+              <div
+                className={`
+                  w-10 h-0.5 transition-colors
+                  ${currentStep > stepNum ? 'bg-[var(--accent-green)]' : 'bg-[var(--border-light)]'}
+                `}
+              />
+            )}
+          </React.Fragment>
+        );
+      })}
     </div>
   );
 }
@@ -395,7 +504,7 @@ function StepSelectType({
   );
 }
 
-// Step 2: Configure ETFs
+// Step 2: Configure ETFs (rotation/momentum unchanged; drilldown shows sector only)
 function StepConfigureETFs({
   taskType,
   selectedETFs,
@@ -438,13 +547,43 @@ function StepConfigureETFs({
     );
   }
 
+  if (taskType === 'drilldown') {
+    return (
+      <div>
+        <h3 className="text-base font-semibold mb-2">选择板块</h3>
+        <p className="text-sm text-[var(--text-muted)] mb-4">选择要下钻分析的板块，下一步将从后端加载该板块的节点树</p>
+        <div className="flex flex-wrap gap-2.5">
+          {SECTOR_ETFS.map((etf) => (
+            <button
+              key={etf.symbol}
+              onClick={() => onSelectSector(etf.symbol)}
+              className={`
+                px-4 py-2.5 rounded-[var(--radius-md)] text-sm font-medium border-2 transition-all cursor-pointer
+                ${selectedSector === etf.symbol
+                  ? 'bg-blue-50 border-[var(--accent-blue)] text-[var(--accent-blue)]'
+                  : 'bg-[var(--bg-tertiary)] border-transparent text-[var(--text-secondary)] hover:border-[var(--border-medium)]'
+                }
+              `}
+            >
+              {etf.symbol} · {etf.name}
+            </button>
+          ))}
+        </div>
+        {selectedSector && (
+          <div className="mt-4 text-sm text-[var(--text-muted)]">
+            已选择板块：<span className="font-medium text-[var(--accent-blue)]">{selectedSector}</span>，点击"下一步"加载节点树
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // momentum
   return (
     <div>
       <div className="mb-6">
         <h3 className="text-base font-semibold mb-2">选择板块</h3>
-        <p className="text-sm text-[var(--text-muted)] mb-4">
-          {taskType === 'drilldown' ? '选择要下钻分析的板块' : '选择要追踪动能股的板块'}
-        </p>
+        <p className="text-sm text-[var(--text-muted)] mb-4">选择要追踪动能股的板块</p>
         <div className="flex flex-wrap gap-2.5">
           {SECTOR_ETFS.map((etf) => (
             <button
@@ -494,7 +633,163 @@ function StepConfigureETFs({
   );
 }
 
-// Step 3: Select Anchor/Baseline
+// Step 3 (drilldown): Node catalog picker
+function StepSelectNodes({
+  sector,
+  catalogItems,
+  loading,
+  selectedNodes,
+  selectedEvidenceIds,
+  onToggleNode,
+  onToggleEvidence,
+}: {
+  sector: string;
+  catalogItems: NodeCatalogItem[];
+  loading: boolean;
+  selectedNodes: string[];
+  selectedEvidenceIds: string[];
+  onToggleNode: (id: string) => void;
+  onToggleEvidence: (id: string) => void;
+}) {
+  const gicsNodes = catalogItems.filter((n) => n.node_type === 'gics');
+  const chainNodes = catalogItems.filter((n) => n.node_type === 'chain' || n.node_type === 'leaf');
+  const evidenceNodes = catalogItems.filter((n) => n.node_type === 'evidence');
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center gap-2 py-12 text-sm text-[var(--text-muted)]">
+        <svg className="h-4 w-4 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+        </svg>
+        <span>正在加载 {sector} 节点树...</span>
+      </div>
+    );
+  }
+
+  if (catalogItems.length === 0) {
+    return (
+      <div className="py-10 text-center text-sm text-[var(--text-muted)]">
+        未找到 {sector} 的节点数据，请先导入节点图谱。
+      </div>
+    );
+  }
+
+  const totalSelected = selectedNodes.length + selectedEvidenceIds.length;
+
+  return (
+    <div className="space-y-5">
+      <div className="flex items-center justify-between">
+        <div>
+          <h3 className="text-base font-semibold">选择监控节点</h3>
+          <p className="text-sm text-[var(--text-muted)] mt-0.5">
+            板块：<span className="font-medium">{sector}</span> · 已选 {totalSelected} 个节点
+          </p>
+        </div>
+      </div>
+
+      {/* GICS 子节点 (default all selected) */}
+      {gicsNodes.length > 0 && (
+        <NodeGroup
+          title="GICS 行业节点"
+          description="默认全选，可取消"
+          color="blue"
+          nodes={gicsNodes}
+          selectedIds={selectedNodes}
+          onToggle={onToggleNode}
+        />
+      )}
+
+      {/* 产业链节点 (手选) */}
+      {chainNodes.length > 0 && (
+        <NodeGroup
+          title="产业链节点"
+          description="按需选择"
+          color="purple"
+          nodes={chainNodes}
+          selectedIds={selectedNodes}
+          onToggle={onToggleNode}
+        />
+      )}
+
+      {/* 证据节点 (手选) */}
+      {evidenceNodes.length > 0 && (
+        <NodeGroup
+          title="证据 / 主题节点"
+          description="用于交叉确认，按需固定"
+          color="amber"
+          nodes={evidenceNodes}
+          selectedIds={selectedEvidenceIds}
+          onToggle={onToggleEvidence}
+        />
+      )}
+    </div>
+  );
+}
+
+type ChipColor = 'blue' | 'purple' | 'amber';
+
+function NodeGroup({
+  title,
+  description,
+  color,
+  nodes,
+  selectedIds,
+  onToggle,
+}: {
+  title: string;
+  description: string;
+  color: ChipColor;
+  nodes: NodeCatalogItem[];
+  selectedIds: string[];
+  onToggle: (id: string) => void;
+}) {
+  const colorMap: Record<ChipColor, { selected: string; unselected: string }> = {
+    blue: {
+      selected: 'bg-blue-50 border-[var(--accent-blue)] text-[var(--accent-blue)]',
+      unselected: 'bg-[var(--bg-tertiary)] border-transparent text-[var(--text-secondary)] hover:border-[var(--border-medium)]',
+    },
+    purple: {
+      selected: 'bg-purple-50 border-[var(--accent-purple)] text-[var(--accent-purple)]',
+      unselected: 'bg-[var(--bg-tertiary)] border-transparent text-[var(--text-secondary)] hover:border-[var(--border-medium)]',
+    },
+    amber: {
+      selected: 'bg-amber-50 border-amber-400 text-amber-700',
+      unselected: 'bg-[var(--bg-tertiary)] border-transparent text-[var(--text-secondary)] hover:border-[var(--border-medium)]',
+    },
+  };
+
+  return (
+    <div>
+      <div className="flex items-baseline gap-2 mb-2">
+        <h4 className="text-sm font-semibold">{title}</h4>
+        <span className="text-xs text-[var(--text-muted)]">{description}</span>
+      </div>
+      <div className="flex flex-wrap gap-2">
+        {nodes.map((node) => {
+          const isSelected = selectedIds.includes(node.id);
+          return (
+            <button
+              key={node.id}
+              onClick={() => onToggle(node.id)}
+              className={`
+                px-3 py-2 rounded-[var(--radius-md)] text-sm font-medium border-2 transition-all cursor-pointer
+                ${isSelected ? colorMap[color].selected : colorMap[color].unselected}
+              `}
+            >
+              <span>{node.label}</span>
+              {node.proxy_etf && (
+                <span className="ml-1.5 text-[11px] opacity-70">{node.proxy_etf}</span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// Step 3 (rotation/momentum): Select Anchor/Baseline
 function StepSelectAnchor({
   baseIndices,
   onToggle,
@@ -574,6 +869,7 @@ function StepConfirm({
   taskName,
   onNameChange,
   defaultTitle,
+  isNodeCentric,
 }: {
   taskType: TaskType;
   selectedETFs: string[];
@@ -582,6 +878,7 @@ function StepConfirm({
   taskName: string;
   onNameChange: (name: string) => void;
   defaultTitle: string;
+  isNodeCentric: boolean;
 }) {
   const finalTitle = taskName.trim() || defaultTitle;
 
@@ -626,17 +923,25 @@ function StepConfirm({
             </div>
           )}
           <div className="py-2">
-            <span className="text-[var(--text-muted)] block mb-2">监控ETF</span>
-            <div className="flex flex-wrap gap-2">
-              {selectedETFs.map((etf) => (
-                <span
-                  key={etf}
-                  className="px-3 py-1 bg-[var(--bg-tertiary)] rounded-[var(--radius-sm)] text-sm font-medium"
-                >
-                  {etf}
-                </span>
-              ))}
-            </div>
+            <span className="text-[var(--text-muted)] block mb-2">
+              {isNodeCentric ? '选中节点' : '监控ETF'}
+            </span>
+            {selectedETFs.length === 0 ? (
+              <span className="text-sm text-[var(--text-muted)]">
+                {isNodeCentric ? '（已自动选择 GICS 节点）' : '--'}
+              </span>
+            ) : (
+              <div className="flex flex-wrap gap-2">
+                {selectedETFs.map((item) => (
+                  <span
+                    key={item}
+                    className="px-3 py-1 bg-[var(--bg-tertiary)] rounded-[var(--radius-sm)] text-sm font-medium"
+                  >
+                    {item}
+                  </span>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       </div>

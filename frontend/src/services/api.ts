@@ -14,6 +14,7 @@ import type {
   ETF,
   Task,
   CreateTaskInput,
+  NodeCatalogItem,
   ResearchNode,
   NodeHolding,
   NodeTrendResponse,
@@ -1632,6 +1633,11 @@ export async function createTask(input: CreateTaskInput): Promise<Task> {
     baseIndex: normalizedBaseIndices.join(','),
     sector: input.sector,
     etfs: input.etfs,
+    rootNode: input.rootNode,
+    viewMode: input.viewMode,
+    selectedNodes: input.selectedNodes,
+    pinnedEvidenceNodes: input.pinnedEvidenceNodes,
+    maxDepth: input.maxDepth,
   };
   const response = await fetchApi<unknown>('/tasks', {
     method: 'POST',
@@ -1663,15 +1669,42 @@ export async function updateTask(id: string | number, input: CreateTaskInput): P
 /**
  * Add ETFs to an existing task
  */
-export async function addTaskETFs(id: string | number, etfs: string[]): Promise<Task> {
+export async function addTaskETFs(
+  id: string | number,
+  etfs: string[],
+  selectedNodes?: string[],
+): Promise<Task> {
   const taskId = normalizeTaskId(id);
+  const body: { etfs: string[]; selectedNodes?: string[] } = {
+    etfs: normalizeTaskEtfs(etfs),
+  };
+  if (selectedNodes !== undefined) {
+    body.selectedNodes = selectedNodes;
+  }
   const response = await fetchApi<unknown>(`/tasks/${taskId}/etfs`, {
     method: 'POST',
-    body: JSON.stringify({
-      etfs: normalizeTaskEtfs(etfs),
-    }),
+    body: JSON.stringify(body),
   });
   return normalizeTask(response);
+}
+
+/**
+ * Get node catalog for a root node (Task 4.11)
+ * Used by CreateTaskModal and AddTaskETFsModal to list selectable nodes.
+ */
+export async function getNodeCatalog(
+  rootNode: string,
+  includeEvidence = true,
+): Promise<NodeCatalogItem[]> {
+  const params = new URLSearchParams({
+    root_node: rootNode.trim().toUpperCase(),
+    include_evidence: String(includeEvidence),
+  });
+  const response = await fetchApi<unknown>(`/nodes/catalog?${params.toString()}`);
+  if (!Array.isArray(response)) {
+    return [];
+  }
+  return response as NodeCatalogItem[];
 }
 
 /**

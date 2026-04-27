@@ -111,6 +111,8 @@ app.include_router(stocks.router, prefix="/api/stocks", tags=["Stocks"])
 app.include_router(etfs.router, prefix="/api/etfs", tags=["ETFs"])
 app.include_router(tasks.router, prefix="/api/tasks", tags=["Tasks"])
 app.include_router(nodes.router, prefix="/api/tasks", tags=["nodes"])
+# Task 4.11: catalog endpoint is task-free, lives at /api/nodes
+app.include_router(nodes.catalog_router, prefix="/api/nodes", tags=["nodes"])
 app.include_router(refresh_jobs.router)
 
 # Task 11: 新增路由
