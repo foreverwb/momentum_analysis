@@ -438,6 +438,57 @@ export interface CreateTaskInput {
   etfs: string[];
 }
 
+// ============ Phase 4: Drilldown Node Types ============
+
+export type NodeProxyType = 'etf' | 'synthetic';
+export type TaskViewMode = 'gics' | 'chain' | 'hybrid';
+export type NodeTrendMetric = 'relative' | 'return20d' | 'score';
+export type NodeTrendPeriod = '5d' | '20d' | '63d';
+
+export interface ResearchNode {
+  id: string;
+  label: string;
+  sublabel: string;
+  level: number;
+  proxy: string | null;
+  proxyType: NodeProxyType;
+  proxyLabel?: string;
+  score: number;
+  scoreVsParent: number | null;
+  contribution: number | null;
+  relStrength: string;
+  breadth: number;
+  delta3d: number | null;
+  delta5d: number | null;
+  children: ResearchNode[];
+}
+
+export interface NodeHolding extends Holding {
+  name?: string;
+  return20d: number;
+  rs20d: number;
+  delta3d: number;
+  delta5d: number;
+  status?: 'complete' | 'pending' | 'missing';
+}
+
+export interface NodeTrendSeries {
+  symbol: string;
+  color: string;
+  values: (number | null)[];
+}
+
+export interface NodeTrendResponse {
+  task_id: number;
+  node_id: string;
+  period: number;
+  metric: NodeTrendMetric;
+  label_tz: 'beijing' | 'market';
+  symbols: string[];
+  dates: string[];
+  series: NodeTrendSeries[];
+}
+
 export interface RefreshResult {
   status: 'success' | 'error' | 'partial' | 'snapshot' | 'failed' | 'warning';
   symbol: string;

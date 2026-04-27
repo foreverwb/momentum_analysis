@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query';
 import { RelativeTrendChart, type RelativeTrendSeries } from '../chart';
 import { ETFDetailCard } from './ETFDetailCard';
+import { DrilldownView } from './DrilldownView';
 import { AddTaskETFsModal, HoldingsImportModal, ETFImportModal, RefreshProgressModal } from '../modal';
 import { LoadingState, ErrorMessage } from '../common';
 import type { Task, ETF, Holding, RefreshResult } from '../../types';
@@ -2076,6 +2077,10 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
         isComplete={refreshComplete}
       />
 
+      {task.type === 'drilldown' ? (
+        <DrilldownView task={task} onViewStockDetail={onViewStockDetail} />
+      ) : (
+      <>
       {/* Trend Chart Section */}
       <div className="mb-6">
         {trendError && (
@@ -2141,6 +2146,8 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
           })}
         </div>
       </div>
+      </>
+      )}
 
       {/* Modals */}
       <AddTaskETFsModal

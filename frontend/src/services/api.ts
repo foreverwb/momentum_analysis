@@ -12,8 +12,14 @@ import type {
   SectorSummary,
   CompareData,
   ETF,
-  Task, 
-  CreateTaskInput
+  Task,
+  CreateTaskInput,
+  ResearchNode,
+  NodeHolding,
+  NodeTrendResponse,
+  NodeTrendPeriod,
+  NodeTrendMetric,
+  TaskViewMode
 } from '../types';
 import { getBeijingCutoffBoundaryMs, getBeijingSyncWindowKey, parseUtcTimestampMs } from '../utils/beijingTime';
 
@@ -2268,3 +2274,60 @@ export async function getOptionsOverlayData(symbol: string): Promise<OptionsOver
   const response = await fetchApi<unknown>(`/stocks/symbol/${encodeSymbolPathSegment(symbol)}/options-overlay`);
   return normalizeOptionsOverlayData(response, symbol);
 }
+
+// ============================================================================
+// Phase 4: Node API (Drilldown)
+// ============================================================================
+
+const NODE_TREND_PERIOD_DAYS: Record<NodeTrendPeriod, number> = {
+  '5d': 5,
+  '20d': 20,
+  '63d': 63,
+};
+
+export async function getTaskNodeTree(
+  taskId: number,
+  lens: TaskViewMode = 'gics'
+): Promise<ResearchNode[]> {
+  const params = new URLSearchParams({ lens });
+  return fetchApi<ResearchNode[]>(`/tasks/${taskId}/nodes?${params.toString()}`);
+}
+
+export async function getNodeHoldings(
+  taskId: number,
+  nodeId: string
+): Promise<NodeHolding[]> {
+  return fetchApi<NodeHolding[]>(
+    `/tasks/${taskId}/nodes/${encodeURIComponent(nodeId)}/holdings`
+  );
+}
+
+export async function getNodeTrendSeries(
+  taskId: number,
+  nodeId: string,
+  period: NodeTrendPeriod,
+  metric: NodeTrendMetric,
+  labelTz: 'beijing' | 'market' = 'beijing'
+): Promise<NodeTrendResponse> {
+  const params = new URLSearchParams({
+    period: String(NODE_TREND_PERIOD_DAYS[period]),
+    metric,
+    label_tz: labelTz,
+  });
+  return fetchApi<NodeTrendResponse>(
+    `/tasks/${taskId}/nodes/${encodeURIComponent(nodeId)}/trend-comparison?${params.toString()}`
+  );
+}
+
+export const drilldownQueryKeys = {
+  nodeTree: (taskId: number, lens: TaskViewMode) =>
+    ['task-nodes', taskId, lens] as const,
+  nodeHoldings: (taskId: number, nodeId: string) =>
+    ['node-holdings', taskId, nodeId] as const,
+  nodeTrend: (
+    taskId: number,
+    nodeId: string,
+    period: NodeTrendPeriod,
+    metric: NodeTrendMetric
+  ) => ['node-trend', taskId, nodeId, period, metric] as const,
+};
