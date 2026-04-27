@@ -86,6 +86,7 @@ TOP_LEVEL_COMMANDS = {
     "finviz",
     "mc",
     "load-node-taxonomy",
+    "migrate-drilldown-tasks",
     *ALL_REFRESH_COMMANDS,
 }
 FILE_PREFIX_ATTR_BY_COMMAND = {
@@ -1997,6 +1998,32 @@ def cmd_load_node_taxonomy(args):
     )
 
 
+def cmd_migrate_drilldown_tasks(args):
+    """处理 migrate-drilldown-tasks 命令"""
+    from app.models.database import SessionLocal, init_db
+    from app.services.migrations import migrate_drilldown_tasks_to_node_first
+
+    init_db()
+
+    if args.commit and args.dry_run:
+        print("[ERROR] --commit 与 --dry-run 不能同时使用", file=sys.stderr)
+        sys.exit(2)
+
+    dry_run = not args.commit  # 默认 dry_run, 必须显式 --commit 才写库
+    db = SessionLocal()
+    try:
+        result = migrate_drilldown_tasks_to_node_first(db, dry_run=dry_run)
+    finally:
+        db.close()
+
+    print(json.dumps(
+        {k: v for k, v in result.items() if k != "details"},
+        ensure_ascii=False,
+    ))
+    for item in result.get("details", []):
+        print(f"  - {item}")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="python -m app.cli",
@@ -2294,6 +2321,20 @@ def build_parser():
     )
     load_taxonomy_parser.set_defaults(func=cmd_load_node_taxonomy)
 
+    migrate_drilldown_parser = subparsers.add_parser(
+        'migrate-drilldown-tasks',
+        help='把现有 drilldown 任务从 sector+etfs[] 迁移到 root_node+selected_nodes（Phase 4）',
+    )
+    migrate_drilldown_parser.add_argument(
+        '--dry-run', action='store_true',
+        help='只打印迁移计划，不写库（默认行为）',
+    )
+    migrate_drilldown_parser.add_argument(
+        '--commit', action='store_true',
+        help='真正执行迁移并写库',
+    )
+    migrate_drilldown_parser.set_defaults(func=cmd_migrate_drilldown_tasks)
+
     return parser
 
 
@@ -2305,7 +2346,7 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    if args.command in {"uploads", "update", "init", "list-etfs", "list-holdings", "finviz", "mc", "load-node-taxonomy"}:
+    if args.command in {"uploads", "update", "init", "list-etfs", "list-holdings", "finviz", "mc", "load-node-taxonomy", "migrate-drilldown-tasks"}:
         _ensure_db_dependencies()
 
     try:

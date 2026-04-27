@@ -26,6 +26,7 @@ router = APIRouter()
 def format_task_response(task: Task) -> dict:
     """格式化任务响应数据"""
     base_indices = _normalize_base_indices(task.base_index)
+    # Phase 4 新增字段使用 getattr 取值，兼容尚未迁移的旧 ORM 实例
     return {
         "id": task.id,
         "title": task.title,
@@ -34,6 +35,11 @@ def format_task_response(task: Task) -> dict:
         "baseIndices": base_indices,
         "sector": task.sector,
         "etfs": task.etfs or [],
+        "rootNode": getattr(task, "root_node", None),
+        "viewMode": getattr(task, "view_mode", None) or "gics",
+        "selectedNodes": getattr(task, "selected_nodes", None) or [],
+        "pinnedEvidenceNodes": getattr(task, "pinned_evidence_nodes", None) or [],
+        "maxDepth": getattr(task, "max_depth", None) or 3,
         "createdAt": format_beijing_date(task.created_at),
         "updatedAt": utc_isoformat(task.updated_at),
     }
@@ -98,15 +104,20 @@ def _validate_task_etfs(
     sector: Optional[str],
     etfs: Any,
     db: Session,
+    root_node: Optional[str] = None,
 ) -> Tuple[Optional[str], List[str]]:
     normalized_type = str(task_type or "").strip().lower()
     normalized_sector = _normalize_optional_symbol(sector)
     normalized_etfs = _dedupe_symbols(_normalize_symbols(etfs))
+    # Phase 4: drilldown 任务若已切到 Node-Centric (root_node 已设置),
+    # 跳过强校验（行业 ETF + parent_sector 必须匹配 sector），
+    # 因为新模型下 ETF 来自任意 NodeProxy，可能跨行业/跨板块。
+    has_root_node = bool(_normalize_optional_symbol(root_node))
 
     if normalized_type not in {"rotation", "drilldown", "momentum"}:
         raise HTTPException(status_code=400, detail=f"Unsupported task type: {task_type}")
 
-    if normalized_type in {"drilldown", "momentum"} and not normalized_sector:
+    if normalized_type in {"drilldown", "momentum"} and not normalized_sector and not has_root_node:
         raise HTTPException(status_code=400, detail="该任务类型必须指定板块 ETF")
 
     if not normalized_etfs:
@@ -134,6 +145,11 @@ def _validate_task_etfs(
                 detail=f"板块轮动任务只能添加板块 ETF: {', '.join(invalid_symbols)}",
             )
         return None, normalized_etfs
+
+    # Node-Centric drilldown 任务跳过强校验：ETF 可由 NodeProxy 决定，
+    # 类型不再要求一定是 industry，也不强制 parent_sector 匹配。
+    if normalized_type == "drilldown" and has_root_node:
+        return normalized_sector, normalized_etfs
 
     invalid_symbols = [
         symbol for symbol in normalized_etfs
@@ -407,11 +423,13 @@ async def create_task(task: TaskCreate, db: Session = Depends(get_db)):
     创建新的监控任务
     """
     base_indices = _normalize_base_indices(task.baseIndex)
+    normalized_root_node = _normalize_optional_symbol(task.rootNode)
     normalized_sector, normalized_etfs = _validate_task_etfs(
         task_type=task.type.value,
         sector=task.sector,
         etfs=task.etfs,
         db=db,
+        root_node=normalized_root_node,
     )
     new_task = Task(
         title=task.title,
@@ -419,6 +437,12 @@ async def create_task(task: TaskCreate, db: Session = Depends(get_db)):
         base_index=",".join(base_indices),
         sector=normalized_sector,
         etfs=normalized_etfs,
+        root_node=normalized_root_node,
+        view_mode=(task.viewMode or "gics"),
+        selected_nodes=list(task.selectedNodes or []),
+        pinned_evidence_nodes=list(task.pinnedEvidenceNodes or []),
+        max_depth=int(task.maxDepth) if task.maxDepth is not None else 3,
+        extra={},
         created_at=datetime.utcnow()
     )
     
@@ -444,18 +468,32 @@ async def update_task(
         raise HTTPException(status_code=404, detail="Task not found")
     
     base_indices = _normalize_base_indices(task_update.baseIndex)
+    normalized_root_node = _normalize_optional_symbol(task_update.rootNode)
+    if normalized_root_node is None:
+        # 客户端未传 rootNode 字段 -> 沿用历史值，避免误清空
+        normalized_root_node = getattr(task, "root_node", None)
     normalized_sector, normalized_etfs = _validate_task_etfs(
         task_type=task_update.type.value,
         sector=task_update.sector,
         etfs=task_update.etfs,
         db=db,
+        root_node=normalized_root_node,
     )
     task.title = task_update.title
     task.type = task_update.type.value
     task.base_index = ",".join(base_indices)
     task.sector = normalized_sector
     task.etfs = normalized_etfs
-    
+    task.root_node = normalized_root_node
+    if task_update.viewMode is not None:
+        task.view_mode = task_update.viewMode
+    if task_update.selectedNodes is not None:
+        task.selected_nodes = list(task_update.selectedNodes)
+    if task_update.pinnedEvidenceNodes is not None:
+        task.pinned_evidence_nodes = list(task_update.pinnedEvidenceNodes)
+    if task_update.maxDepth is not None:
+        task.max_depth = int(task_update.maxDepth)
+
     db.commit()
     db.refresh(task)
     
@@ -481,6 +519,7 @@ async def add_task_etfs(
         sector=task.sector,
         etfs=payload.etfs,
         db=db,
+        root_node=getattr(task, "root_node", None),
     )
     if not requested_etfs:
         raise HTTPException(status_code=400, detail="请至少选择一个 ETF")
@@ -489,6 +528,13 @@ async def add_task_etfs(
     # 这样即使旧任务包含与当前板块映射不一致的遗留 ETF，也不会阻塞新增合法标的。
     existing_etfs = _dedupe_symbols(_normalize_symbols(task.etfs))
     task.etfs = _dedupe_symbols(existing_etfs + requested_etfs)
+    if payload.selectedNodes:
+        existing_nodes = list(getattr(task, "selected_nodes", None) or [])
+        merged: List[str] = list(existing_nodes)
+        for node_id in payload.selectedNodes:
+            if node_id and node_id not in merged:
+                merged.append(node_id)
+        task.selected_nodes = merged
     task.updated_at = datetime.utcnow()
 
     db.commit()

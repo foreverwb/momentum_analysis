@@ -200,7 +200,22 @@ class Task(Base):
     
     # ETFs JSON array
     etfs = Column(JSON)
-    
+
+    # ===== Phase 4 新增：Node-Centric Drilldown 字段 =====
+    # 旧字段 sector / etfs 保留用于向后兼容（Phase 4.10 之后再清理）
+    root_node = Column(String(64), nullable=True, index=True)
+    # node_id, e.g. 'XLK'；旧 drilldown 任务迁移时取值 = sector
+    view_mode = Column(String(20), default='gics')
+    # 'gics' / 'chain' / 'hybrid'
+    selected_nodes = Column(JSON, default=list)
+    # 用户在节点树中选中的 node_id 列表
+    pinned_evidence_nodes = Column(JSON, default=list)
+    # 钉住作为证据展示的 node_id 列表
+    max_depth = Column(Integer, default=3)
+    # 树最大展示深度
+    extra = Column(JSON, default=dict)
+    # 自由扩展，例如 selected_etfs_legacy 等迁移信息
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -540,7 +555,43 @@ def init_db():
     _ensure_iv_data_bucket_columns()
     _ensure_options_overlay_indexes()
     _ensure_node_tables_indexes()
+    _ensure_tasks_node_fields_columns()
     logger.info("数据库表已创建")
+
+
+def _ensure_tasks_node_fields_columns():
+    """为旧版 SQLite 数据库补齐 Phase 4 新增的 tasks 字段 (Node-Centric)。
+
+    所有列都 nullable / 带默认值，确保不会破坏老数据行。
+    """
+    if engine.dialect.name != "sqlite":
+        return
+    inspector = inspect(engine)
+    if "tasks" not in inspector.get_table_names():
+        return
+    column_names = {col["name"] for col in inspector.get_columns("tasks")}
+
+    # (col_name, col_type, default_sql)
+    new_columns = [
+        ("root_node", "VARCHAR(64)", "NULL"),
+        ("view_mode", "VARCHAR(20)", "'gics'"),
+        ("selected_nodes", "JSON", "'[]'"),
+        ("pinned_evidence_nodes", "JSON", "'[]'"),
+        ("max_depth", "INTEGER", "3"),
+        ("extra", "JSON", "'{}'"),
+    ]
+    with engine.begin() as conn:
+        for col_name, col_type, default_sql in new_columns:
+            if col_name in column_names:
+                continue
+            conn.execute(text(
+                f"ALTER TABLE tasks ADD COLUMN {col_name} {col_type} DEFAULT {default_sql}"
+            ))
+            logger.info(f"已补齐列: tasks.{col_name}")
+        if "root_node" not in column_names:
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_root_node ON tasks(root_node)"
+            ))
 
 
 def _ensure_etfs_parent_sector_column():

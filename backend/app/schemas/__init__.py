@@ -114,6 +114,12 @@ class TaskBase(BaseModel):
     baseIndex: str
     sector: Optional[str] = None
     etfs: List[str]
+    # Phase 4 新增（Node-Centric Drilldown）— 全部可选以保持向后兼容
+    rootNode: Optional[str] = None
+    viewMode: Optional[str] = None
+    selectedNodes: Optional[List[str]] = None
+    pinnedEvidenceNodes: Optional[List[str]] = None
+    maxDepth: Optional[int] = None
 
 
 class TaskCreate(TaskBase):
@@ -122,6 +128,8 @@ class TaskCreate(TaskBase):
 
 class TaskEtfsAdd(BaseModel):
     etfs: List[str]
+    # 允许追加 ETF 时一并扩展 selected_nodes（可选）
+    selectedNodes: Optional[List[str]] = None
 
 
 class TaskResponse(TaskBase):
