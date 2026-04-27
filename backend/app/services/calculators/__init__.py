@@ -66,6 +66,13 @@ from .node_basket import (
     get_node_proxy_etf,
     is_synthetic_node,
 )
+from .node_score import (
+    NODE_BASE_WEIGHTS,
+    NodeScoreResult,
+    batch_calculate_node_scores,
+    calculate_node_score,
+    compute_chain_confirmation,
+)
 
 __all__ = [
     # 移动平均线
@@ -124,6 +131,11 @@ __all__ = [
     'get_node_holdings',
     'get_node_proxy_etf',
     'is_synthetic_node',
+    'NODE_BASE_WEIGHTS',
+    'NodeScoreResult',
+    'batch_calculate_node_scores',
+    'calculate_node_score',
+    'compute_chain_confirmation',
 ]
 
 # ETF 评分计算器
