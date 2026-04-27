@@ -7,7 +7,7 @@
 import React, { useMemo } from 'react';
 import type { ResearchNode, TaskViewMode } from '../../types';
 import { Sparkline } from './Sparkline';
-import { scoreTierColor } from './nodeStyles';
+import { scoreTierColor, fmtScore } from './nodeStyles';
 
 // ─── Pixel constants — 需求文档 §Panel 2 ─────────────────────────────────────
 const INDENT_BASE = 12;
@@ -67,16 +67,11 @@ function ProxyTag({ proxyType, proxy }: ProxyTagProps) {
 
 // ─── Sparkline data derivation — 前端凑 5 点序列（需求文档 §3 Sparkline 数据来源）──
 function buildSparkData(node: ResearchNode): number[] {
-  const { score, delta3d, delta5d } = node;
-  const d3 = delta3d ?? 0;
-  const d5 = delta5d ?? 0;
-  return [
-    score - d5 - d3,
-    score - d5,
-    score - d3,
-    score + d3 * 0.5,
-    score,
-  ];
+  // score=null（计算未就绪）时返回平线，避免 NaN 路径
+  const s = node.score ?? 0;
+  const d3 = node.delta3d ?? 0;
+  const d5 = node.delta5d ?? 0;
+  return [s - d5 - d3, s - d5, s - d3, s + d3 * 0.5, s];
 }
 
 // ─── Single node row ──────────────────────────────────────────────────────────
@@ -193,7 +188,7 @@ function NodeItem({
               textAlign: 'right',
             }}
           >
-            {node.score.toFixed(0)}
+            {fmtScore(node.score)}
           </span>
         </div>
       </div>

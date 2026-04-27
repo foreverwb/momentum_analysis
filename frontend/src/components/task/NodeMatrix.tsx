@@ -8,7 +8,7 @@
 import React, { useMemo } from 'react';
 import type { ResearchNode } from '../../types';
 import { Sparkline } from './Sparkline';
-import { scoreTierColor, deltaColor, fmtDelta } from './nodeStyles';
+import { scoreTierColor, deltaColor, fmtDelta, fmtScore, fmtPercent } from './nodeStyles';
 
 // ─── Contribution progress bar — 需求文档 §Card 3 Sub-Node Matrix ─────────────
 function ContribBar({
@@ -45,16 +45,11 @@ function ContribBar({
 }
 
 function buildSparkData(node: ResearchNode): number[] {
-  const { score, delta3d, delta5d } = node;
-  const d3 = delta3d ?? 0;
-  const d5 = delta5d ?? 0;
-  return [
-    score - d5 - d3,
-    score - d5,
-    score - d3,
-    score + d3 * 0.5,
-    score,
-  ];
+  // score=null（计算未就绪）时返回平线，避免 NaN 路径
+  const s = node.score ?? 0;
+  const d3 = node.delta3d ?? 0;
+  const d5 = node.delta5d ?? 0;
+  return [s - d5 - d3, s - d5, s - d3, s + d3 * 0.5, s];
 }
 
 interface ChildCardProps {
@@ -125,7 +120,7 @@ function ChildCard({ child, onSelect }: ChildCardProps): React.ReactElement {
             flexShrink: 0,
           }}
         >
-          {child.score.toFixed(0)}
+          {fmtScore(child.score)}
         </span>
       </div>
 
@@ -187,7 +182,7 @@ function ChildCard({ child, onSelect }: ChildCardProps): React.ReactElement {
         <span>
           广度{' '}
           <span style={{ fontWeight: 600, color: '#1e293b' }}>
-            {child.breadth.toFixed(0)}%
+            {fmtPercent(child.breadth)}%
           </span>
         </span>
       </div>

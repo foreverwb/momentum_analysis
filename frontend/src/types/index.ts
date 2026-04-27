@@ -470,11 +470,12 @@ export interface ResearchNode {
   proxy: string | null;
   proxyType: NodeProxyType;
   proxyLabel?: string;
-  score: number;
+  // 计算结果未就绪时为 null（后端 /api/tasks/{id}/nodes docstring 约定）
+  score: number | null;
   scoreVsParent: number | null;
   contribution: number | null;
   relStrength: string;
-  breadth: number;
+  breadth: number | null;
   delta3d: number | null;
   delta5d: number | null;
   children: ResearchNode[];

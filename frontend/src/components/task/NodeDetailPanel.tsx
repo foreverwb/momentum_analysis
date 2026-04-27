@@ -9,12 +9,19 @@ import type { ResearchNode, NodeHolding } from '../../types';
 import { Sparkline } from './Sparkline';
 
 // ─── Score / Delta helpers ────────────────────────────────────────────────────
+// score / breadth 在后端可能未就绪而返回 null，所有 helper 接受 null
 
-function scoreColor(s: number): string {
+function scoreColor(s: number | null | undefined): string {
+  if (s === null || s === undefined) return '#64748b';
   if (s >= 85) return '#059669';
   if (s >= 70) return '#2563eb';
   if (s >= 60) return '#d97706';
   return '#64748b';
+}
+
+function fmtScore(v: number | null | undefined, digits = 0): string {
+  if (v === null || v === undefined) return '--';
+  return v.toFixed(digits);
 }
 
 function deltaColor(v: number | null | undefined): string {
@@ -27,13 +34,15 @@ function fmtDelta(v: number | null | undefined, suffix = ''): string {
   return (v > 0 ? '+' : '') + v.toFixed(1) + suffix;
 }
 
-function breadthColor(v: number): string {
+function breadthColor(v: number | null | undefined): string {
+  if (v === null || v === undefined) return '#94a3b8';
   if (v >= 70) return '#22c55e';
   if (v >= 50) return '#2563eb';
   return '#d97706';
 }
 
-function breadthFill(v: number): string {
+function breadthFill(v: number | null | undefined): string {
+  if (v === null || v === undefined) return '#cbd5e1';
   if (v >= 70) return '#22c55e';
   if (v >= 50) return '#3b82f6';
   return '#f59e0b';
@@ -87,12 +96,14 @@ function ProxyTagSmall({ node }: { node: ResearchNode }) {
   );
 }
 
-function ContribBar({ value, fill }: { value: number; fill: string }) {
+function ContribBar({ value, fill }: { value: number | null | undefined; fill: string }) {
+  // value=null（计算未就绪）时显示空槽
+  const pct = value === null || value === undefined ? 0 : Math.min(100, value);
   return (
     <div style={{ height: 5, background: '#e2e8f0', borderRadius: 3, overflow: 'hidden', flex: 1 }}>
       <div style={{
         height: '100%',
-        width: `${Math.min(100, value)}%`,
+        width: `${pct}%`,
         background: fill,
         borderRadius: 3,
         transition: 'width 0.3s ease',
@@ -128,7 +139,7 @@ function NodeHeaderCard({ node }: { node: ResearchNode }) {
         </div>
         <div style={{ textAlign: 'right', flexShrink: 0, marginLeft: 10 }}>
           <div style={{ fontSize: 30, fontWeight: 700, lineHeight: 1, color: scoreColor(node.score) }}>
-            {node.score.toFixed(1)}
+            {fmtScore(node.score, 1)}
           </div>
           <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 2 }}>综合分</div>
         </div>
@@ -189,14 +200,14 @@ function ContributionCard({ node }: { node: ResearchNode }) {
         <div>
           <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
             <span style={{ fontSize: 12, color: '#64748b' }}>对母板块贡献</span>
-            <span style={{ fontSize: 12, fontWeight: 700, color: '#2563eb' }}>{node.contribution}%</span>
+            <span style={{ fontSize: 12, fontWeight: 700, color: '#2563eb' }}>{fmtScore(node.contribution)}%</span>
           </div>
           <ContribBar value={node.contribution} fill="#3b82f6" />
         </div>
         <div>
           <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
             <span style={{ fontSize: 12, color: '#64748b' }}>持仓广度 (&gt;50MA)</span>
-            <span style={{ fontSize: 12, fontWeight: 700, color: breadthColor(node.breadth) }}>{node.breadth}%</span>
+            <span style={{ fontSize: 12, fontWeight: 700, color: breadthColor(node.breadth) }}>{fmtScore(node.breadth)}%</span>
           </div>
           <ContribBar value={node.breadth} fill={breadthFill(node.breadth)} />
         </div>
@@ -213,7 +224,10 @@ interface SiblingRankingCardProps {
 
 function SiblingRankingCard({ siblings, selectedNode, onSelectNode }: SiblingRankingCardProps) {
   if (siblings.length === 0) return null;
-  const sorted = useMemo(() => [...siblings].sort((a, b) => b.score - a.score), [siblings]);
+  const sorted = useMemo(
+    () => [...siblings].sort((a, b) => (b.score ?? 0) - (a.score ?? 0)),
+    [siblings]
+  );
 
   return (
     <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 14, padding: 14 }}>
@@ -221,8 +235,9 @@ function SiblingRankingCard({ siblings, selectedNode, onSelectNode }: SiblingRan
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
         {sorted.map((sib, i) => {
           const isSelected = sib.id === selectedNode.id;
-          // Flat placeholder sparkline — sibling's score as constant array
-          const sparkData = [sib.score * 0.9, sib.score * 0.92, sib.score * 0.95, sib.score * 0.97, sib.score];
+          // Flat placeholder sparkline — score=null（计算未就绪）退化为平线 0
+          const sScore = sib.score ?? 0;
+          const sparkData = [sScore * 0.9, sScore * 0.92, sScore * 0.95, sScore * 0.97, sScore];
           return (
             <div
               key={sib.id}
@@ -248,7 +263,7 @@ function SiblingRankingCard({ siblings, selectedNode, onSelectNode }: SiblingRan
               </div>
               <Sparkline
                 data={sparkData}
-                color={sib.score >= 80 ? '#22c55e' : '#3b82f6'}
+                color={(sib.score ?? 0) >= 80 ? '#22c55e' : '#3b82f6'}
                 width={36}
                 height={16}
               />
@@ -259,7 +274,7 @@ function SiblingRankingCard({ siblings, selectedNode, onSelectNode }: SiblingRan
                 minWidth: 28,
                 textAlign: 'right',
               }}>
-                {sib.score.toFixed(0)}
+                {fmtScore(sib.score)}
               </span>
             </div>
           );
@@ -337,7 +352,10 @@ interface ChildrenOverviewCardProps {
 
 function ChildrenOverviewCard({ children, onSelectNode }: ChildrenOverviewCardProps) {
   if (children.length === 0) return null;
-  const sorted = useMemo(() => [...children].sort((a, b) => b.score - a.score), [children]);
+  const sorted = useMemo(
+    () => [...children].sort((a, b) => (b.score ?? 0) - (a.score ?? 0)),
+    [children]
+  );
 
   return (
     <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 14, padding: 14 }}>
@@ -376,7 +394,7 @@ function ChildrenOverviewCard({ children, onSelectNode }: ChildrenOverviewCardPr
                 color: scoreColor(child.score),
                 minWidth: 28, textAlign: 'right',
               }}>
-                {child.score.toFixed(0)}
+                {fmtScore(child.score)}
               </span>
             </div>
           );

@@ -18,7 +18,9 @@ export const SCORE_COLORS = {
   base: '#64748b',  // slate-500
 } as const;
 
-export function scoreTierColor(score: number): string {
+// score / breadth 在后端可能未就绪而返回 null，这里统一用 base 兜底
+export function scoreTierColor(score: number | null | undefined): string {
+  if (score === null || score === undefined) return SCORE_COLORS.base;
   if (score >= TIER_HIGH) return SCORE_COLORS.high;
   if (score >= TIER_MID) return SCORE_COLORS.mid;
   if (score >= TIER_LOW) return SCORE_COLORS.low;
@@ -35,4 +37,16 @@ export function deltaColor(v: number | null | undefined): string {
 export function fmtDelta(v: number | null | undefined, suffix = ''): string {
   if (v === null || v === undefined) return '--';
   return (v > 0 ? '+' : '') + v.toFixed(1) + suffix;
+}
+
+// 节点 score 文案：null → '--'；其余按 digits 精度展示
+export function fmtScore(v: number | null | undefined, digits = 0): string {
+  if (v === null || v === undefined) return '--';
+  return v.toFixed(digits);
+}
+
+// 节点 breadth / contribution 等百分位：null → '--'；不带 % 后缀，由调用方拼接
+export function fmtPercent(v: number | null | undefined, digits = 0): string {
+  if (v === null || v === undefined) return '--';
+  return v.toFixed(digits);
 }
