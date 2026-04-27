@@ -1,5 +1,5 @@
 /**
- * DrilldownView — Phase 4 三栏骨架。
+ * DrilldownView — Phase 4 三栏布局（Task 4.9 中栏装配完成）。
  *
  * 职责：
  *  - 拉取节点树 / 当前节点持仓 / 趋势序列（React Query）
@@ -7,7 +7,7 @@
  *  - localStorage 持久化 selectedNodeId（每个 task 独立 key）
  *
  * 不做：
- *  - 具体 NodeTree / 中栏内容 / NodeDetailPanel 的 UI 实现（留给 Task 4.8 / 4.9 / 4.10）
+ *  - NodeDetailPanel 的 UI 实现（留给 Task 4.10）
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
@@ -20,6 +20,11 @@ import type {
   TaskViewMode,
 } from '../../types';
 import { NodeTree } from './NodeTree';
+import { RegimeBadge } from './RegimeBadge';
+import { NodeTrendChart } from './NodeTrendChart';
+import { NodeMatrix } from './NodeMatrix';
+import { NodeHoldingsTable } from './NodeHoldingsTable';
+import { DataSourceBar } from './DataSourceBar';
 
 interface DrilldownViewProps {
   task: Task;
@@ -44,16 +49,13 @@ function flattenTree(nodes: ResearchNode[]): ResearchNode[] {
   return out;
 }
 
-export function DrilldownView({ task, onViewStockDetail: _onViewStockDetail }: DrilldownViewProps) {
-  // _onViewStockDetail 由 Task 4.10 NodeDetailPanel 使用，这里保留 prop 接通点。
-  void _onViewStockDetail;
-
+export function DrilldownView({ task, onViewStockDetail }: DrilldownViewProps) {
   const [lens, setLens] = useState<TaskViewMode>('gics');
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
-  const [trendPeriod, _setTrendPeriod] = useState<NodeTrendPeriod>('20d');
-  const [trendMetric, _setTrendMetric] = useState<NodeTrendMetric>('relative');
-  const [_showAllHoldings, _setShowAllHoldings] = useState<boolean>(false);
+  const [trendPeriod, setTrendPeriod] = useState<NodeTrendPeriod>('20d');
+  const [trendMetric, setTrendMetric] = useState<NodeTrendMetric>('relative');
+  const [showAllHoldings, setShowAllHoldings] = useState<boolean>(false);
 
   const handleSelect = useCallback((node: ResearchNode) => {
     setSelectedNodeId(node.id);
@@ -112,7 +114,7 @@ export function DrilldownView({ task, onViewStockDetail: _onViewStockDetail }: D
   }, [nodeTree]);
 
   // Holdings for selected node
-  useQuery({
+  const { data: holdings = [] } = useQuery({
     queryKey: selectedNode
       ? api.drilldownQueryKeys.nodeHoldings(task.id, selectedNode.id)
       : ['node-holdings-noop'],
@@ -125,7 +127,7 @@ export function DrilldownView({ task, onViewStockDetail: _onViewStockDetail }: D
   });
 
   // Trend series for selected node
-  useQuery({
+  const { data: trendData } = useQuery({
     queryKey: selectedNode
       ? api.drilldownQueryKeys.nodeTrend(task.id, selectedNode.id, trendPeriod, trendMetric)
       : ['node-trend-noop'],
@@ -152,7 +154,7 @@ export function DrilldownView({ task, onViewStockDetail: _onViewStockDetail }: D
         isLoading={treeLoading}
       />
 
-      {/* CENTER flex — Task 4.9 regime / trend / matrix / holdings / data-source */}
+      {/* CENTER flex — Regime / Trend / Matrix / Holdings / DataSource */}
       <main
         style={{
           flex: 1,
@@ -161,8 +163,38 @@ export function DrilldownView({ task, onViewStockDetail: _onViewStockDetail }: D
           background: '#f8fafc',
         }}
       >
-        <div style={{ fontSize: 12, color: '#64748b' }}>
-          Center (Task 4.9). Selected: {selectedNode?.label ?? '—'}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <RegimeBadge />
+          {selectedNode && (
+            <>
+              <NodeTrendChart
+                selectedNode={selectedNode}
+                data={trendData ?? null}
+                period={trendPeriod}
+                metric={trendMetric}
+                onPeriodChange={setTrendPeriod}
+                onMetricChange={setTrendMetric}
+                isLoading={false}
+              />
+              {(selectedNode.children?.length ?? 0) > 0 && (
+                <NodeMatrix
+                  selectedNode={selectedNode}
+                  onSelectChild={(child) => {
+                    setSelectedNodeId(child.id);
+                    setExpandedIds((prev) => new Set([...prev, selectedNode.id, child.id]));
+                  }}
+                />
+              )}
+              <NodeHoldingsTable
+                holdings={holdings}
+                showAll={showAllHoldings}
+                onShowAll={() => setShowAllHoldings(true)}
+                onRowClick={onViewStockDetail}
+                isLoading={false}
+              />
+              <DataSourceBar />
+            </>
+          )}
         </div>
       </main>
 
