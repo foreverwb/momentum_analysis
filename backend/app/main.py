@@ -6,7 +6,7 @@ from uuid import uuid4
 import structlog
 from structlog.contextvars import bind_contextvars, clear_contextvars
 
-from app.api import stocks, etfs, tasks, refresh_jobs
+from app.api import stocks, etfs, tasks, refresh_jobs, nodes
 from app.api import market, import_data, broker
 from app.core.logging_config import configure_logging
 from app.models.database import engine, Base, init_db, init_default_sector_etfs
@@ -110,6 +110,7 @@ app.add_middleware(
 app.include_router(stocks.router, prefix="/api/stocks", tags=["Stocks"])
 app.include_router(etfs.router, prefix="/api/etfs", tags=["ETFs"])
 app.include_router(tasks.router, prefix="/api/tasks", tags=["Tasks"])
+app.include_router(nodes.router, prefix="/api/tasks", tags=["nodes"])
 app.include_router(refresh_jobs.router)
 
 # Task 11: 新增路由

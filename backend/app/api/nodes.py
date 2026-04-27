@@ -1,0 +1,717 @@
+"""节点中心化下钻 API（Phase 4 — Drilldown Upgrade Task 4.6）。
+
+职责: 提供前端"节点树 / 节点持仓 / 节点走势对比"3 个只读端点。
+所有计算结果来自 Task 4.3/4.4 的引擎; 本模块不做任何评分或合成逻辑,
+只负责图遍历、契约组装、字段格式化。
+
+禁止:
+- 修改 node_score / node_basket / series_utils 的任何函数 (CLAUDE.md §扩展性)
+- 在本层抛领域异常 (按 CLAUDE.md 分层错误处理: HTTPException 仅在本层)
+- 写库 (节点价格/snapshot 的 idempotent upsert 由计算引擎内部完成,
+  与 Task 4.6 约束中"compute_basket_price_series 已在 4.3 内部 idempotent upsert"
+  的兜底口径一致)
+"""
+
+from __future__ import annotations
+
+from datetime import date as date_t
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from sqlalchemy.orm import Session
+
+from app.models import get_db
+from app.models.database import (
+    AnalyticNode,
+    NodeEdge,
+    NodeEdgeType,
+    NodePriceSeries,
+    PriceHistory,
+    Stock,
+    Task,
+)
+from app.api.series_utils import _format_date_labels  # noqa: WPS437 — 复用同模块格式化
+from app.services.calculators.node_basket import get_node_holdings
+from app.services.calculators.node_score import (
+    NodeScoreResult,
+    batch_calculate_node_scores,
+)
+
+
+router = APIRouter()
+
+
+# ============ 常量 ============
+
+# 节点树缓存窗口 — 与前端 React Query staleTime 5min 对齐
+_NODE_TREE_CACHE_SECONDS = 300
+
+# 走势对比固定 3 路 (node / parent / SPY) 的颜色
+# 来源: README "Trend Chart" 段 + Phase4 Task 4.6 §3
+_COLOR_NODE = "#3b82f6"
+_COLOR_PARENT = "#8b5cf6"
+_COLOR_SPY = "#94a3b8"
+_BENCHMARK_SYMBOL = "SPY"
+
+# 走势对比读取的最大天数, 满足 period=63 + 缓冲
+_TREND_PRICE_LIMIT = 120
+
+# 持仓 rs20d / return20d 计算窗口
+_HOLDING_RS_WINDOW = 20
+
+# proxyType 映射: 计算层 'unknown' (无 proxy 也无 basket) 退化为 'synthetic'
+# README 类型 NodeProxyType 仅允许 'etf' | 'synthetic'
+_PROXY_TYPE_FALLBACK = "synthetic"
+
+# 合法 lens
+_VALID_LENS = ("gics", "chain", "hybrid")
+
+# 走势对比合法参数
+_VALID_TREND_PERIODS = (5, 20, 63)
+_VALID_TREND_METRICS = ("relative", "return20d", "score")
+_VALID_LABEL_TZ = ("beijing", "market")
+
+
+# ============ 1. GET /api/tasks/{task_id}/nodes ============
+
+
+@router.get("/{task_id}/nodes", response_model=List[Dict[str, Any]])
+async def get_task_node_tree(
+    task_id: int,
+    response: Response,
+    lens: Optional[str] = Query(
+        None,
+        description="视图: gics(分类) / chain(产业链) / hybrid(并集); 默认从 task.view_mode 兜底",
+    ),
+    db: Session = Depends(get_db),
+) -> List[Dict[str, Any]]:
+    """返回任务的研究节点树 (含每个节点的实时分数)。
+
+    Args:
+        task_id: 任务 ID。
+        lens: 视图; 缺省时回退到 task.view_mode, 仍缺省时为 'gics'。
+        db: SQLAlchemy session。
+
+    Returns:
+        ResearchNode[] (深度遍历结果, 含 children); 字段语义见 README。
+        计算结果未就绪的字段返回 null。
+
+    Raises:
+        HTTPException 404: task / root_node 不存在。
+        HTTPException 400: lens 非法。
+    """
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    root_node_id, view_mode, max_depth = _resolve_task_node_config(task)
+    resolved_lens = (lens or view_mode or "gics").strip().lower()
+    if resolved_lens not in _VALID_LENS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"lens must be one of {_VALID_LENS}",
+        )
+
+    if not root_node_id:
+        raise HTTPException(
+            status_code=404,
+            detail="Task has no resolvable root_node (run migration or set rootNode)",
+        )
+
+    if not _node_exists(db, root_node_id):
+        raise HTTPException(status_code=404, detail=f"Node {root_node_id} not found")
+
+    node_ids, child_map = _traverse_nodes(db, root_node_id, resolved_lens, max_depth)
+    if not node_ids:
+        node_ids = [root_node_id]
+
+    score_results = batch_calculate_node_scores(node_ids, db)
+    score_map: Dict[str, NodeScoreResult] = {r.node_id: r for r in score_results}
+
+    response.headers["Cache-Control"] = f"max-age={_NODE_TREE_CACHE_SECONDS}"
+
+    tree = _format_research_node(root_node_id, child_map, score_map, db)
+    return [tree] if tree else []
+
+
+# ============ 2. GET /api/tasks/{task_id}/nodes/{node_id}/holdings ============
+
+
+@router.get(
+    "/{task_id}/nodes/{node_id}/holdings",
+    response_model=List[Dict[str, Any]],
+)
+async def get_node_holdings_endpoint(
+    task_id: int,
+    node_id: str,
+    db: Session = Depends(get_db),
+) -> List[Dict[str, Any]]:
+    """返回节点的成分股清单 + 节点级 RS / 收益 / 评分。
+
+    Args:
+        task_id: 任务 ID (用于校验 task 存在; 持仓本身与任务无关)。
+        node_id: 节点业务主键。
+        db: SQLAlchemy session。
+
+    Returns:
+        NodeHolding[] (按 score 降序; score 缺失时按 weight 降序)。
+        rs20d 以"节点价格序列"为基准 (synthetic 走 NodePriceSeries, ETF proxy 走
+        proxy ETF 的 PriceHistory), 不是 vs SPY。
+
+    Raises:
+        HTTPException 404: task / node 不存在。
+    """
+    if db.query(Task.id).filter(Task.id == task_id).first() is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if not _node_exists(db, node_id):
+        raise HTTPException(status_code=404, detail=f"Node {node_id} not found")
+
+    holdings = get_node_holdings(node_id, db)
+    if not holdings:
+        return []
+
+    node_prices = _load_node_close_series(db, node_id)
+    node_closes = [c for _, c in node_prices]
+
+    out: List[Dict[str, Any]] = []
+    for holding in holdings:
+        ticker = str(holding.get("ticker") or "").strip().upper()
+        if not ticker:
+            continue
+        out.append(_build_holding_entry(db, ticker, holding, node_closes))
+
+    out.sort(
+        key=lambda h: (
+            h["score"] if h.get("score") is not None else -1.0,
+            h.get("weight") or 0.0,
+        ),
+        reverse=True,
+    )
+    return out
+
+
+# ============ 3. GET /api/tasks/{task_id}/nodes/{node_id}/trend-comparison ============
+
+
+@router.get(
+    "/{task_id}/nodes/{node_id}/trend-comparison",
+    response_model=Dict[str, Any],
+)
+async def get_node_trend_comparison(
+    task_id: int,
+    node_id: str,
+    period: int = Query(20, description="对比周期: 5/20/63"),
+    metric: str = Query("relative", description="指标: relative/return20d/score"),
+    label_tz: str = Query("beijing", description="日期标签时区"),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """节点 vs 父节点 vs SPY 的走势对比 (与现有 /tasks/{id}/trend-comparison 同结构)。
+
+    Args:
+        task_id: 任务 ID。
+        node_id: 节点业务主键。
+        period: 对比交易日数。
+        metric: relative (累计相对收益) / return20d / score。
+        label_tz: 日期标签时区。
+        db: SQLAlchemy session。
+
+    Returns:
+        {task_id, node_id, period, metric, label_tz, symbols, dates, series}.
+        series 固定 3 条: [node, parent, SPY], 颜色固定。
+
+    Raises:
+        HTTPException 404: task / node 不存在。
+        HTTPException 400: 参数非法。
+    """
+    if period not in _VALID_TREND_PERIODS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"period must be one of {_VALID_TREND_PERIODS}",
+        )
+    if metric not in _VALID_TREND_METRICS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"metric must be one of {_VALID_TREND_METRICS}",
+        )
+    normalized_tz = (label_tz or "beijing").strip().lower()
+    if normalized_tz not in _VALID_LABEL_TZ:
+        raise HTTPException(
+            status_code=400,
+            detail=f"label_tz must be one of {_VALID_LABEL_TZ}",
+        )
+
+    if db.query(Task.id).filter(Task.id == task_id).first() is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if not _node_exists(db, node_id):
+        raise HTTPException(status_code=404, detail=f"Node {node_id} not found")
+
+    parent_id = _find_classification_parent(db, node_id)
+    symbols: List[str] = [node_id]
+    if parent_id:
+        symbols.append(parent_id)
+    symbols.append(_BENCHMARK_SYMBOL)
+
+    dates, series = _build_node_trend_series(
+        db, symbols, period=period, metric=metric, label_tz=normalized_tz
+    )
+
+    color_map = _trend_color_map(node_id, parent_id)
+    enriched_series = [
+        {
+            "symbol": entry["symbol"],
+            "color": color_map.get(entry["symbol"], _COLOR_SPY),
+            "values": entry["values"],
+        }
+        for entry in series
+    ]
+
+    return {
+        "task_id": task_id,
+        "node_id": node_id,
+        "period": period,
+        "metric": metric,
+        "label_tz": normalized_tz,
+        "symbols": symbols,
+        "dates": dates,
+        "series": enriched_series,
+    }
+
+
+# ============ 内部辅助: 任务配置解析 ============
+
+
+def _resolve_task_node_config(task: Task) -> Tuple[Optional[str], str, int]:
+    """从 task 取 (root_node, view_mode, max_depth); 旧任务 in-memory 兜底。
+
+    旧任务 (root_node 为空) 用 sector 字段作为 root_node 兜底, 与
+    migrate_drilldown_tasks_to_node_first 的映射一致, 但不写库。
+    """
+    root_node = (getattr(task, "root_node", None) or "").strip() or None
+    if not root_node and task.sector:
+        root_node = str(task.sector).strip().upper() or None
+    view_mode = (getattr(task, "view_mode", None) or "gics").strip().lower()
+    max_depth_val = getattr(task, "max_depth", None)
+    try:
+        max_depth = int(max_depth_val) if max_depth_val is not None else 3
+    except (TypeError, ValueError):
+        max_depth = 3
+    return root_node, view_mode, max(0, max_depth)
+
+
+def _node_exists(db: Session, node_id: str) -> bool:
+    return (
+        db.query(AnalyticNode.id)
+        .filter(AnalyticNode.node_id == node_id)
+        .first()
+        is not None
+    )
+
+
+# ============ 内部辅助: 图遍历 ============
+
+
+def _lens_edge_types(lens: str) -> List[str]:
+    if lens == "gics":
+        return [NodeEdgeType.CLASSIFICATION_PARENT.value]
+    if lens == "chain":
+        return [NodeEdgeType.CHAIN_PARENT.value]
+    return [
+        NodeEdgeType.CLASSIFICATION_PARENT.value,
+        NodeEdgeType.CHAIN_PARENT.value,
+    ]
+
+
+def _traverse_nodes(
+    db: Session,
+    root_node_id: str,
+    lens: str,
+    max_depth: int,
+) -> Tuple[List[str], Dict[str, List[str]]]:
+    """BFS 遍历 root 的所有后代; 返回 (节点列表, parent_id -> [child_id])。
+
+    深度限制: max_depth (≤ 0 时只返回 root)。
+    """
+    edge_types = _lens_edge_types(lens)
+    visited: Set[str] = {root_node_id}
+    ordered: List[str] = [root_node_id]
+    children_map: Dict[str, List[str]] = {}
+
+    if max_depth <= 0:
+        return ordered, children_map
+
+    frontier: List[Tuple[str, int]] = [(root_node_id, 0)]
+    while frontier:
+        next_frontier: List[Tuple[str, int]] = []
+        for parent_id, depth in frontier:
+            if depth >= max_depth:
+                continue
+            child_rows = (
+                db.query(NodeEdge.dst_node_id)
+                .filter(NodeEdge.src_node_id == parent_id)
+                .filter(NodeEdge.edge_type.in_(edge_types))
+                .all()
+            )
+            child_ids = [c[0] for c in child_rows if c[0]]
+            if not child_ids:
+                continue
+            for child_id in child_ids:
+                if child_id in visited:
+                    # 同一节点不重复挂载, 避免 hybrid lens 下成环
+                    continue
+                visited.add(child_id)
+                ordered.append(child_id)
+                children_map.setdefault(parent_id, []).append(child_id)
+                next_frontier.append((child_id, depth + 1))
+        frontier = next_frontier
+
+    return ordered, children_map
+
+
+def _find_classification_parent(db: Session, node_id: str) -> Optional[str]:
+    edge = (
+        db.query(NodeEdge.src_node_id)
+        .filter(NodeEdge.dst_node_id == node_id)
+        .filter(NodeEdge.edge_type == NodeEdgeType.CLASSIFICATION_PARENT.value)
+        .first()
+    )
+    return edge[0] if edge else None
+
+
+# ============ 内部辅助: ResearchNode 组装 ============
+
+
+def _format_research_node(
+    node_id: str,
+    children_map: Dict[str, List[str]],
+    score_map: Dict[str, NodeScoreResult],
+    db: Session,
+) -> Optional[Dict[str, Any]]:
+    """递归把 NodeScoreResult 转成 ResearchNode JSON。
+
+    没有 score 时仍输出节点骨架 (label / level 取自 AnalyticNode), 数值字段为 null。
+    """
+    score = score_map.get(node_id)
+    if score is None:
+        meta = (
+            db.query(AnalyticNode)
+            .filter(AnalyticNode.node_id == node_id)
+            .first()
+        )
+        if meta is None:
+            return None
+        node_payload: Dict[str, Any] = {
+            "id": node_id,
+            "label": meta.label,
+            "sublabel": meta.label,
+            "level": int(meta.level or 0),
+            "proxy": None,
+            "proxyType": _PROXY_TYPE_FALLBACK,
+            "proxyLabel": None,
+            "score": None,
+            "scoreVsParent": None,
+            "contribution": None,
+            "relStrength": _format_rs_string(None),
+            "breadth": None,
+            "delta3d": None,
+            "delta5d": None,
+        }
+    else:
+        proxy_type = (
+            score.proxy_type if score.proxy_type in ("etf", "synthetic")
+            else _PROXY_TYPE_FALLBACK
+        )
+        node_payload = {
+            "id": score.node_id,
+            "label": score.label,
+            "sublabel": score.label,
+            "level": int(score.level),
+            "proxy": score.proxy_symbol,
+            "proxyType": proxy_type,
+            "proxyLabel": score.proxy_label,
+            "score": float(score.total_score),
+            "scoreVsParent": score.score_vs_parent,
+            "contribution": score.contribution,
+            "relStrength": _format_rs_string(score.rel_strength),
+            "breadth": _round_or_none(score.breadth, 2),
+            "delta3d": score.delta3d,
+            "delta5d": score.delta5d,
+        }
+
+    children_payload: List[Dict[str, Any]] = []
+    for child_id in children_map.get(node_id, []):
+        child_node = _format_research_node(child_id, children_map, score_map, db)
+        if child_node is not None:
+            children_payload.append(child_node)
+    node_payload["children"] = children_payload
+    return node_payload
+
+
+def _format_rs_string(rs_value: Optional[float]) -> str:
+    """把 rel_strength (RS_20D_change, 单位 %) 格式化为 '+9.1%' / '-2.4%'。
+
+    None / 数据不足 → 空串 (前端按需折叠显示)。
+    """
+    if rs_value is None:
+        return ""
+    sign = "+" if rs_value >= 0 else ""
+    return f"{sign}{rs_value:.1f}%"
+
+
+def _round_or_none(value: Optional[float], ndigits: int) -> Optional[float]:
+    if value is None:
+        return None
+    return round(float(value), ndigits)
+
+
+# ============ 内部辅助: 持仓数据 ============
+
+
+def _build_holding_entry(
+    db: Session,
+    ticker: str,
+    holding: Dict[str, Any],
+    node_closes: List[float],
+) -> Dict[str, Any]:
+    stock = db.query(Stock).filter(Stock.symbol == ticker).first()
+    score_value: Optional[float] = None
+    name: Optional[str] = None
+    delta3d: Optional[float] = None
+    delta5d: Optional[float] = None
+    if stock is not None:
+        score_value = (
+            float(stock.score_total) if stock.score_total is not None else None
+        )
+        name = stock.name
+        changes = stock.changes or {}
+        if isinstance(changes, dict):
+            delta3d = changes.get("delta3d")
+            delta5d = changes.get("delta5d")
+
+    stock_closes = _load_recent_closes(db, ticker, _TREND_PRICE_LIMIT)
+    return20d = _compute_return_pct(stock_closes, _HOLDING_RS_WINDOW)
+    rs20d = _compute_rs_change(stock_closes, node_closes, _HOLDING_RS_WINDOW)
+
+    data_status = _resolve_holding_status(db, ticker)
+
+    return {
+        "ticker": ticker,
+        "weight": float(holding.get("weight") or 0.0),
+        "score": score_value,
+        "name": name,
+        "return20d": return20d,
+        "rs20d": rs20d,
+        "delta3d": delta3d if delta3d is not None else 0.0,
+        "delta5d": delta5d if delta5d is not None else 0.0,
+        "dataStatus": data_status,
+    }
+
+
+def _resolve_holding_status(db: Session, ticker: str) -> str:
+    """finviz + iv 都齐 → 'complete'; 缺一 → 'pending'; 都缺 → 'missing'。"""
+    from app.models import ImportedData, IVData  # 局部导入避免循环
+
+    has_finviz = (
+        db.query(ImportedData.id)
+        .filter(ImportedData.symbol == ticker)
+        .filter(ImportedData.source == "finviz")
+        .first()
+        is not None
+    )
+    has_iv = (
+        db.query(IVData.id)
+        .filter(IVData.symbol == ticker)
+        .first()
+        is not None
+    )
+    if has_finviz and has_iv:
+        return "complete"
+    if has_finviz or has_iv:
+        return "pending"
+    return "missing"
+
+
+def _load_recent_closes(db: Session, symbol: str, limit: int) -> List[float]:
+    rows = (
+        db.query(PriceHistory.date, PriceHistory.close)
+        .filter(PriceHistory.symbol == symbol.upper())
+        .order_by(PriceHistory.date.desc())
+        .limit(limit)
+        .all()
+    )
+    rows = list(reversed(rows))
+    return [float(c) for _, c in rows if c is not None]
+
+
+def _compute_return_pct(closes: List[float], window: int) -> float:
+    """近 window 个交易日累计收益 (decimal, 0.18 = +18%)。数据不足返回 0.0。"""
+    if len(closes) <= window:
+        return 0.0
+    base = closes[-window - 1]
+    if base <= 0:
+        return 0.0
+    return round((closes[-1] - base) / base, 4)
+
+
+def _compute_rs_change(
+    stock_closes: List[float],
+    node_closes: List[float],
+    window: int,
+) -> float:
+    """20D RS 变化 (单位: 百分点) — stock_return - node_return 的差值 × 100。
+
+    任意一侧数据不足 → 0.0 (前端按 0 渲染)。
+    """
+    if len(stock_closes) <= window or len(node_closes) <= window:
+        return 0.0
+    s_now, s_then = stock_closes[-1], stock_closes[-window - 1]
+    n_now, n_then = node_closes[-1], node_closes[-window - 1]
+    if s_then <= 0 or n_then <= 0:
+        return 0.0
+    s_ret = (s_now - s_then) / s_then
+    n_ret = (n_now - n_then) / n_then
+    return round((s_ret - n_ret) * 100.0, 2)
+
+
+# ============ 内部辅助: 节点价格序列 / 走势对比 ============
+
+
+def _load_node_close_series(
+    db: Session, node_id: str
+) -> List[Tuple[date_t, float]]:
+    """节点价格序列 (按日期升序); synthetic → NodePriceSeries, ETF proxy → PriceHistory。
+
+    若两边都查不到, 返回空列表。
+    """
+    rows = (
+        db.query(NodePriceSeries.date, NodePriceSeries.close)
+        .filter(NodePriceSeries.node_id == node_id)
+        .order_by(NodePriceSeries.date.asc())
+        .all()
+    )
+    if rows:
+        return [(d, float(c)) for d, c in rows if c is not None]
+
+    # 退化: node_id 本身可能就是 ETF symbol (GICS 节点)
+    rows = (
+        db.query(PriceHistory.date, PriceHistory.close)
+        .filter(PriceHistory.symbol == node_id.upper())
+        .order_by(PriceHistory.date.asc())
+        .all()
+    )
+    return [(d, float(c)) for d, c in rows if c is not None]
+
+
+def _load_symbol_close_series(
+    db: Session, symbol: str
+) -> List[Tuple[date_t, float]]:
+    rows = (
+        db.query(PriceHistory.date, PriceHistory.close)
+        .filter(PriceHistory.symbol == symbol.upper())
+        .order_by(PriceHistory.date.asc())
+        .all()
+    )
+    return [(d, float(c)) for d, c in rows if c is not None]
+
+
+def _resolve_series_for_symbol(
+    db: Session, symbol: str
+) -> List[Tuple[date_t, float]]:
+    """symbol 是节点 ID → 走 NodePriceSeries; 否则 (SPY/parent ETF) 走 PriceHistory。"""
+    if _node_exists(db, symbol):
+        return _load_node_close_series(db, symbol)
+    return _load_symbol_close_series(db, symbol)
+
+
+def _build_node_trend_series(
+    db: Session,
+    symbols: List[str],
+    *,
+    period: int,
+    metric: str,
+    label_tz: str,
+) -> Tuple[List[str], List[Dict[str, Any]]]:
+    """构造 trend-comparison 的 dates + series (兼容 node_id / ETF / SPY)。
+
+    metric=score 暂不支持节点级 (ScoreSnapshot 写入但 build_metric_series 走 stock/etf
+    类型映射), 统一退化为 relative。
+    """
+    series_data: Dict[str, Dict[date_t, float]] = {}
+    for symbol in symbols:
+        rows = _resolve_series_for_symbol(db, symbol)
+        if len(rows) > _TREND_PRICE_LIMIT:
+            rows = rows[-_TREND_PRICE_LIMIT:]
+        series_data[symbol] = {d: c for d, c in rows}
+
+    all_dates = sorted({d for data in series_data.values() for d in data.keys()})
+    if metric == "return20d":
+        if len(all_dates) > period + _HOLDING_RS_WINDOW:
+            all_dates = all_dates[-(period + _HOLDING_RS_WINDOW):]
+    if len(all_dates) > period:
+        truncate_dates = all_dates[-period:]
+    else:
+        truncate_dates = list(all_dates)
+
+    date_labels = _format_date_labels(truncate_dates, label_tz=label_tz)
+
+    series: List[Dict[str, Any]] = []
+    for symbol in symbols:
+        data_map = series_data.get(symbol, {})
+        if metric == "return20d":
+            values = _series_return_window(data_map, truncate_dates, _HOLDING_RS_WINDOW)
+        else:
+            # relative / score (node 层无 score 序列, 退化 relative)
+            values = _series_relative(data_map, truncate_dates)
+        series.append({"symbol": symbol, "values": values})
+
+    return date_labels, series
+
+
+def _series_relative(
+    data_map: Dict[date_t, float], dates: List[date_t]
+) -> List[Optional[float]]:
+    base_value: Optional[float] = None
+    for d in dates:
+        if d in data_map:
+            base_value = data_map[d]
+            break
+    values: List[Optional[float]] = []
+    for d in dates:
+        close = data_map.get(d)
+        if base_value is None or close is None or base_value == 0:
+            values.append(None)
+        else:
+            values.append(round((close - base_value) / base_value * 100.0, 2))
+    return values
+
+
+def _series_return_window(
+    data_map: Dict[date_t, float],
+    dates: List[date_t],
+    window: int,
+) -> List[Optional[float]]:
+    """rolling window return (%); 不足窗口返回 None。"""
+    sorted_items = sorted(data_map.items())
+    if len(sorted_items) <= window:
+        return [None for _ in dates]
+    by_date = {d: idx for idx, (d, _) in enumerate(sorted_items)}
+    closes = [c for _, c in sorted_items]
+
+    values: List[Optional[float]] = []
+    for d in dates:
+        idx = by_date.get(d)
+        if idx is None or idx < window:
+            values.append(None)
+            continue
+        base = closes[idx - window]
+        if base == 0:
+            values.append(None)
+            continue
+        values.append(round((closes[idx] - base) / base * 100.0, 2))
+    return values
+
+
+def _trend_color_map(node_id: str, parent_id: Optional[str]) -> Dict[str, str]:
+    out = {node_id: _COLOR_NODE, _BENCHMARK_SYMBOL: _COLOR_SPY}
+    if parent_id:
+        out[parent_id] = _COLOR_PARENT
+    return out
