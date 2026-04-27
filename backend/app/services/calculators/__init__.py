@@ -59,6 +59,13 @@ from .technical import (
 from .momentum import MomentumCalculator
 from .momentum_pool import MomentumPoolResult, calculate_momentum_pool_result
 from .rank_buffer import RankBuffer, RankBufferConfig, RankBufferState
+from .node_basket import (
+    BasketComputeResult,
+    compute_basket_price_series,
+    get_node_holdings,
+    get_node_proxy_etf,
+    is_synthetic_node,
+)
 
 __all__ = [
     # 移动平均线
@@ -112,6 +119,11 @@ __all__ = [
     'RankBuffer',
     'RankBufferConfig',
     'RankBufferState',
+    'BasketComputeResult',
+    'compute_basket_price_series',
+    'get_node_holdings',
+    'get_node_proxy_etf',
+    'is_synthetic_node',
 ]
 
 # ETF 评分计算器
