@@ -25,6 +25,7 @@ import { NodeTrendChart } from './NodeTrendChart';
 import { NodeMatrix } from './NodeMatrix';
 import { NodeHoldingsTable } from './NodeHoldingsTable';
 import { DataSourceBar } from './DataSourceBar';
+import { NodeDetailPanel } from './NodeDetailPanel';
 
 interface DrilldownViewProps {
   task: Task;
@@ -198,18 +199,24 @@ export function DrilldownView({ task, onViewStockDetail }: DrilldownViewProps) {
         </div>
       </main>
 
-      {/* RIGHT 300 — Task 4.10 NodeDetailPanel */}
+      {/* RIGHT 300 — NodeDetailPanel */}
       <aside
         style={{
           width: 300,
           flexShrink: 0,
           borderLeft: '1px solid #e2e8f0',
           background: '#f8fafc',
+          overflowY: 'auto',
         }}
       >
-        <div style={{ padding: 16, fontSize: 12, color: '#64748b' }}>
-          NodeDetailPanel (Task 4.10)
-        </div>
+        {selectedNode && (
+          <NodeDetailPanel
+            selectedNode={selectedNode}
+            allNodes={allNodes}
+            holdings={holdings}
+            onSelectNode={(n) => setSelectedNodeId(n.id)}
+          />
+        )}
       </aside>
     </div>
   );
