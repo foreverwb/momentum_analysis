@@ -226,7 +226,7 @@ export interface NodeTreeProps {
 }
 
 const LENS_OPTIONS: { value: TaskViewMode; label: string }[] = [
-  { value: 'gics', label: 'GICS 分类' },
+  { value: 'hybrid', label: 'GICS 分类' },
   { value: 'chain', label: '产业链图' },
 ];
 
@@ -323,6 +323,7 @@ export function NodeTree({
           fontSize: 10,
           color: '#94a3b8',
           flexShrink: 0,
+          borderBottom: '1px solid #f1f5f9',
         }}
       >
         <span style={{ flex: 1 }}>节点 / 代理</span>
@@ -331,7 +332,7 @@ export function NodeTree({
       </div>
 
       {/* Scrollable node list */}
-      <div style={{ flex: 1, overflowY: 'auto', paddingBottom: 12 }}>
+      <div style={{ flex: 1, overflowY: 'auto', paddingBottom: 12, paddingTop: 4 }}>
         {isLoading ? (
           <div style={{ padding: 16, fontSize: 12, color: '#94a3b8', textAlign: 'center' }}>
             加载中…

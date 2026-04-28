@@ -6,7 +6,7 @@
  * 不做：数据拉取（holdings 由父组件传入）、状态持久化。
  */
 import React, { useMemo, useState } from 'react';
-import type { NodeHolding } from '../../types';
+import type { NodeHolding, NodeProxyType } from '../../types';
 import { scoreTierColor, deltaColor } from './nodeStyles';
 
 // ─── Row count before truncation — 需求文档 §Card 4 ───────────────────────────
@@ -23,9 +23,9 @@ type SortKey = keyof Pick<NodeHolding, 'weight' | 'score' | 'return20d' | 'rs20d
 
 const SORT_KEYS: SortKey[] = ['weight', 'score', 'return20d', 'rs20d', 'delta3d', 'delta5d'];
 
-function fmtPct(v: number | null | undefined): string {
+function fmtPctDirect(v: number | null | undefined): string {
   if (v === null || v === undefined) return '--';
-  return (v > 0 ? '+' : '') + (v * 100).toFixed(1) + '%';
+  return (v > 0 ? '+' : '') + v.toFixed(1) + '%';
 }
 
 function fmtDeltaNum(v: number | null | undefined): string {
@@ -47,6 +47,9 @@ export interface NodeHoldingsTableProps {
   onShowAll: () => void;
   onRowClick?: (ticker: string) => void;
   isLoading: boolean;
+  nodeProxyType?: NodeProxyType;
+  nodeProxy?: string | null;
+  nodeProxyLabel?: string | null;
 }
 
 export function NodeHoldingsTable({
@@ -55,6 +58,8 @@ export function NodeHoldingsTable({
   onShowAll,
   onRowClick,
   isLoading,
+  nodeProxyType,
+  nodeProxy,
 }: NodeHoldingsTableProps): React.ReactElement {
   const [sortKey, setSortKey] = useState<SortKey>('score');
   const [sortAsc, setSortAsc] = useState(false);
@@ -111,7 +116,11 @@ export function NodeHoldingsTable({
         <div>
           <span style={{ fontSize: 13, fontWeight: 700, color: '#1e293b' }}>持仓标的</span>
           <span style={{ fontSize: 11, color: '#94a3b8', marginLeft: 6 }}>
-            共 {holdings.length} 只 · 按{sortKey === 'score' ? '动能分' : sortKey}
+            {nodeProxyType === 'etf' && nodeProxy
+              ? `${nodeProxy} 成分股 · 共 ${holdings.length} 只`
+              : nodeProxyType === 'synthetic'
+              ? `合成篮成分股 · 共 ${holdings.length} 只`
+              : `共 ${holdings.length} 只`}
           </span>
         </div>
       </div>
@@ -272,7 +281,7 @@ export function NodeHoldingsTable({
                           fontVariantNumeric: 'tabular-nums',
                         }}
                       >
-                        {fmtPct(h.return20d)}
+                        {fmtPctDirect(h.return20d)}
                       </td>
 
                       {/* RS节点 */}
@@ -286,7 +295,7 @@ export function NodeHoldingsTable({
                           fontVariantNumeric: 'tabular-nums',
                         }}
                       >
-                        {fmtPct(h.rs20d / 100)}
+                        {fmtPctDirect(h.rs20d)}
                       </td>
 
                       {/* 3D Δ */}

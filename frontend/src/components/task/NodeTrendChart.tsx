@@ -78,7 +78,7 @@ function SegmentedControl<T extends string>({
               padding: '3px 10px',
               border: 'none',
               borderRadius: 6,
-              fontSize: 11,
+              fontSize: 12,
               fontWeight: 500,
               cursor: 'pointer',
               background: active ? '#fff' : 'transparent',
@@ -179,7 +179,7 @@ export function NodeTrendChart({
         {/* Left: node label + proxy + sublabel */}
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
-            <span style={{ fontSize: 13, fontWeight: 700, color: '#1e293b' }}>{nodeLabel}</span>
+            <span style={{ fontSize: 14, fontWeight: 700, color: '#1e293b' }}>{nodeLabel}</span>
             <span
               style={{
                 fontSize: 10,
@@ -196,7 +196,7 @@ export function NodeTrendChart({
               {tag}
             </span>
           </div>
-          <div style={{ fontSize: 12, color: '#64748b' }}>{selectedNode.sublabel}</div>
+          <div style={{ fontSize: 12, color: '#64748b' }}>相对走势对比 · {selectedNode.sublabel}</div>
         </div>
 
         {/* Right: controls */}

@@ -1968,6 +1968,16 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
     setResolvedEtfs(resolveMonitoredEtfs(updatedTask.etfs, updatedTask.type, updatedTask.sector));
   };
 
+  if (task.type === 'drilldown') {
+    return (
+      <DrilldownView
+        task={task}
+        onBack={onBack}
+        onViewStockDetail={onViewStockDetail}
+      />
+    );
+  }
+
   if (isLoading) {
     return <LoadingState message="正在加载监控任务数据..." />;
   }
@@ -2077,9 +2087,6 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
         isComplete={refreshComplete}
       />
 
-      {task.type === 'drilldown' ? (
-        <DrilldownView task={task} onViewStockDetail={onViewStockDetail} />
-      ) : (
       <>
       {/* Trend Chart Section */}
       <div className="mb-6">
@@ -2147,7 +2154,6 @@ export function TaskDetail({ task, onBack, onViewStockDetail }: TaskDetailProps)
         </div>
       </div>
       </>
-      )}
 
       {/* Modals */}
       <AddTaskETFsModal

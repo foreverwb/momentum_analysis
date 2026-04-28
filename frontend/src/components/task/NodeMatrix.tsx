@@ -215,7 +215,7 @@ export function NodeMatrix({
     >
       {/* Section header */}
       <div style={{ fontSize: 13, fontWeight: 700, color: '#1e293b', marginBottom: 12 }}>
-        子节点矩阵
+        子节点动能矩阵
         <span style={{ fontSize: 11, color: '#94a3b8', fontWeight: 400, marginLeft: 6 }}>
           {children.length} 个子节点
         </span>
