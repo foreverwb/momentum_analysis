@@ -86,7 +86,13 @@ def _seed_prices(
 
 
 def _seed_xlk_world(db) -> None:
-    """灌入测试任务 + XLK 节点拓扑 + ETF/synthetic basket + 60+ 天价格。"""
+    """灌入测试任务 + XLK 节点拓扑 + ETF/synthetic basket + 60+ 天价格。
+
+    Task 4.12: 拓扑与 production xlk.yaml 对齐 ——
+        XLK --classification--> semi --chain--> {equip,compute,mem,conn}
+                                    semi-conn --chain--> {optical,copper}
+    使 default lens=hybrid 时 semi.children = 4, gics 时 semi.children = 0.
+    """
     xlk = ETF(symbol="XLK", name="Technology", type="sector", rank=1, score=80)
     soxx = ETF(symbol="SOXX", name="Semiconductors", type="industry",
                parent_sector="XLK", rank=1, score=85)
@@ -94,57 +100,79 @@ def _seed_xlk_world(db) -> None:
     db.flush()
 
     db.add_all([
-        AnalyticNode(
-            node_id="XLK", label="科技板块",
-            node_type=NodeType.GICS.value, level=0,
-            representation_confidence=1.0,
-        ),
-        AnalyticNode(
-            node_id="semi", label="半导体",
-            node_type=NodeType.GICS.value, level=1,
-            representation_confidence=0.95,
-        ),
-        AnalyticNode(
-            node_id="semi-compute", label="计算",
-            node_type=NodeType.CHAIN.value, level=2,
-            representation_confidence=0.9,
-        ),
+        AnalyticNode(node_id="XLK", label="科技板块",
+                     node_type=NodeType.GICS.value, level=0,
+                     representation_confidence=1.0),
+        AnalyticNode(node_id="semi", label="半导体",
+                     node_type=NodeType.GICS.value, level=1,
+                     representation_confidence=0.95),
+        AnalyticNode(node_id="semi-equip", label="设备",
+                     node_type=NodeType.CHAIN.value, level=2,
+                     representation_confidence=0.85),
+        AnalyticNode(node_id="semi-compute", label="计算",
+                     node_type=NodeType.CHAIN.value, level=2,
+                     representation_confidence=0.9),
+        AnalyticNode(node_id="semi-mem", label="存储",
+                     node_type=NodeType.CHAIN.value, level=2,
+                     representation_confidence=0.85),
+        AnalyticNode(node_id="semi-conn", label="连接",
+                     node_type=NodeType.CHAIN.value, level=2,
+                     representation_confidence=0.7),
+        AnalyticNode(node_id="conn-optical", label="光互联",
+                     node_type=NodeType.LEAF.value, level=3,
+                     representation_confidence=0.65),
+        AnalyticNode(node_id="conn-copper", label="铜缆",
+                     node_type=NodeType.LEAF.value, level=3,
+                     representation_confidence=0.65),
     ])
     db.add_all([
-        NodeEdge(
-            src_node_id="XLK", dst_node_id="semi",
-            edge_type=NodeEdgeType.CLASSIFICATION_PARENT.value, weight=1.0,
-        ),
-        NodeEdge(
-            src_node_id="semi", dst_node_id="semi-compute",
-            edge_type=NodeEdgeType.CLASSIFICATION_PARENT.value, weight=1.0,
-        ),
+        NodeEdge(src_node_id="XLK", dst_node_id="semi",
+                 edge_type=NodeEdgeType.CLASSIFICATION_PARENT.value, weight=1.0),
+        NodeEdge(src_node_id="semi", dst_node_id="semi-equip",
+                 edge_type=NodeEdgeType.CHAIN_PARENT.value, weight=1.0),
+        NodeEdge(src_node_id="semi", dst_node_id="semi-compute",
+                 edge_type=NodeEdgeType.CHAIN_PARENT.value, weight=1.0),
+        NodeEdge(src_node_id="semi", dst_node_id="semi-mem",
+                 edge_type=NodeEdgeType.CHAIN_PARENT.value, weight=1.0),
+        NodeEdge(src_node_id="semi", dst_node_id="semi-conn",
+                 edge_type=NodeEdgeType.CHAIN_PARENT.value, weight=1.0),
+        NodeEdge(src_node_id="semi-conn", dst_node_id="conn-optical",
+                 edge_type=NodeEdgeType.CHAIN_PARENT.value, weight=1.0),
+        NodeEdge(src_node_id="semi-conn", dst_node_id="conn-copper",
+                 edge_type=NodeEdgeType.CHAIN_PARENT.value, weight=1.0),
     ])
     db.add_all([
-        NodeProxy(
-            node_id="XLK", etf_symbol="XLK",
-            role=NodeProxyRole.PRIMARY.value, purity=1.0,
-        ),
-        NodeProxy(
-            node_id="semi", etf_symbol="SOXX",
-            role=NodeProxyRole.PRIMARY.value, purity=0.95,
-        ),
+        NodeProxy(node_id="XLK", etf_symbol="XLK",
+                  role=NodeProxyRole.PRIMARY.value, purity=1.0),
+        NodeProxy(node_id="semi", etf_symbol="SOXX",
+                  role=NodeProxyRole.PRIMARY.value, purity=0.95),
+        # SMH 同时作为 semi 的 secondary 与 semi-equip 的 primary 共存
+        NodeProxy(node_id="semi", etf_symbol="SMH",
+                  role=NodeProxyRole.SECONDARY.value, purity=0.85),
+        NodeProxy(node_id="semi-equip", etf_symbol="SMH",
+                  role=NodeProxyRole.PRIMARY.value, purity=0.85),
+        NodeProxy(node_id="semi-mem", etf_symbol="DRAM",
+                  role=NodeProxyRole.PRIMARY.value, purity=0.80),
+        NodeProxy(node_id="semi-conn", etf_symbol="SIXG",
+                  role=NodeProxyRole.PRIMARY.value, purity=0.70),
     ])
 
-    # synthetic basket: NVDA + AMD + AVGO 用于 semi-compute
+    # synthetic basket: semi-compute / conn-optical / conn-copper
     db.add_all([
-        SyntheticBasketDefinition(
-            node_id="semi-compute", ticker="NVDA",
-            weighting_strategy="equal",
-        ),
-        SyntheticBasketDefinition(
-            node_id="semi-compute", ticker="AMD",
-            weighting_strategy="equal",
-        ),
-        SyntheticBasketDefinition(
-            node_id="semi-compute", ticker="AVGO",
-            weighting_strategy="equal",
-        ),
+        SyntheticBasketDefinition(node_id="semi-compute", ticker="NVDA",
+                                  weighting_strategy="equal"),
+        SyntheticBasketDefinition(node_id="semi-compute", ticker="AMD",
+                                  weighting_strategy="equal"),
+        SyntheticBasketDefinition(node_id="semi-compute", ticker="AVGO",
+                                  weighting_strategy="equal"),
+        SyntheticBasketDefinition(node_id="conn-optical", ticker="CIEN",
+                                  weighting_strategy="equal", chain_extension=True),
+        SyntheticBasketDefinition(node_id="conn-optical", ticker="LITE",
+                                  weighting_strategy="equal", chain_extension=True),
+        SyntheticBasketDefinition(node_id="conn-optical", ticker="COHR",
+                                  weighting_strategy="equal", chain_extension=True),
+        SyntheticBasketDefinition(node_id="conn-optical", ticker="AAOI",
+                                  weighting_strategy="equal", chain_extension=True),
     ])
 
     # ETFHolding 用于 GICS 节点 holdings (semi -> SOXX 成分)
@@ -164,6 +192,10 @@ def _seed_xlk_world(db) -> None:
     _seed_prices(db, "NVDA", days=80, daily_change=0.004)
     _seed_prices(db, "AMD", days=80, daily_change=0.0025)
     _seed_prices(db, "AVGO", days=80, daily_change=0.0028)
+    _seed_prices(db, "CIEN", days=80, daily_change=0.002)
+    _seed_prices(db, "LITE", days=80, daily_change=0.002)
+    _seed_prices(db, "COHR", days=80, daily_change=0.002)
+    _seed_prices(db, "AAOI", days=80, daily_change=0.002)
 
     # Stock 表 (持仓接口需读 score)
     db.add_all([
@@ -175,7 +207,7 @@ def _seed_xlk_world(db) -> None:
               changes={"delta3d": 2.5, "delta5d": 4.0}),
     ])
 
-    # 任务 (id=1: Node-Centric drilldown; root_node = XLK)
+    # 任务 (id=1: Node-Centric drilldown; root_node = XLK; default hybrid)
     db.add(Task(
         title="XLK Drilldown",
         type="drilldown",
@@ -183,7 +215,7 @@ def _seed_xlk_world(db) -> None:
         sector="XLK",
         etfs=["SOXX"],
         root_node="XLK",
-        view_mode="gics",
+        view_mode="hybrid",
         selected_nodes=["XLK", "semi", "semi-compute"],
         max_depth=3,
     ))
@@ -358,3 +390,92 @@ async def test_node_trend_unknown_node_returns_404(override_db):
         )
 
     assert resp.status_code == 404
+
+
+# ---------- 4. Task 4.12: hybrid 默认 lens / chain proxy / chain-extension holdings ----------
+
+
+def _find_node(payload, target_id):
+    """递归找节点 payload (BFS)."""
+    stack = list(payload)
+    while stack:
+        n = stack.pop(0)
+        if n["id"] == target_id:
+            return n
+        stack.extend(n.get("children", []) or [])
+    return None
+
+
+@pytest.mark.asyncio
+async def test_default_lens_is_hybrid(override_db):
+    """不传 lens 时 task.view_mode='hybrid' 兜底, semi 下渲染 4 chain, semi-conn 下 2 leaf."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        resp = await client.get("/api/tasks/1/nodes")
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    root = payload[0]
+    assert root["id"] == "XLK"
+    assert "semi" in {c["id"] for c in root["children"]}
+
+    semi = _find_node(payload, "semi")
+    assert semi is not None
+    chain_children = {c["id"] for c in semi.get("children", [])}
+    assert {"semi-equip", "semi-compute", "semi-mem", "semi-conn"}.issubset(chain_children)
+
+    semi_conn = _find_node(payload, "semi-conn")
+    assert semi_conn is not None
+    leaf_children = {c["id"] for c in semi_conn.get("children", [])}
+    assert leaf_children == {"conn-optical", "conn-copper"}
+
+
+@pytest.mark.asyncio
+async def test_lens_gics_still_filters(override_db):
+    """显式 lens=gics 仍只走 classification_parent: semi 在该视图下无 chain 子节点."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        resp = await client.get("/api/tasks/1/nodes?lens=gics")
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    semi = _find_node(payload, "semi")
+    assert semi is not None
+    assert (semi.get("children") or []) == []
+
+
+@pytest.mark.asyncio
+async def test_chain_node_proxy_resolved(override_db):
+    """catalog 接口暴露 chain 节点的 primary proxy ETF (SMH/DRAM/SIXG)."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        resp = await client.get("/api/nodes/catalog?root_node=XLK")
+
+    assert resp.status_code == 200
+    by_id = {n["id"]: n for n in resp.json()}
+    assert by_id["semi-equip"]["proxy_etf"] == "SMH"
+    assert by_id["semi-mem"]["proxy_etf"] == "DRAM"
+    assert by_id["semi-conn"]["proxy_etf"] == "SIXG"
+
+
+@pytest.mark.asyncio
+async def test_holdings_for_chain_synthetic_node(override_db):
+    """conn-optical 的 chain-extension 成分股应出现在 holdings 接口."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        resp = await client.get("/api/tasks/1/nodes/conn-optical/holdings")
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    tickers = {h["ticker"] for h in payload}
+    # CIEN/LITE/COHR/AAOI 全部 seed
+    assert {"CIEN", "LITE", "COHR", "AAOI"}.issubset(tickers)
+    assert len(payload) >= 3

@@ -1998,6 +1998,27 @@ def cmd_load_node_taxonomy(args):
     )
 
 
+def cmd_refresh_node_pipeline(args):
+    """处理 refresh-node-pipeline 命令 (Task 4.12)."""
+    from app.models.database import SessionLocal, init_db
+    from app.services.node_refresh_service import refresh_node_pipeline
+
+    init_db()
+
+    db = SessionLocal()
+    try:
+        result = refresh_node_pipeline(args.root, db)
+    finally:
+        db.close()
+
+    print(json.dumps(
+        {k: v for k, v in result.items() if k != "errors"},
+        ensure_ascii=False,
+    ))
+    for err in result.get("errors", []):
+        print(f"  [error] node={err.get('node_id')} stage={err.get('stage')}: {err.get('error')}")
+
+
 def cmd_migrate_drilldown_tasks(args):
     """处理 migrate-drilldown-tasks 命令"""
     from app.models.database import SessionLocal, init_db
@@ -2321,6 +2342,16 @@ def build_parser():
     )
     load_taxonomy_parser.set_defaults(func=cmd_load_node_taxonomy)
 
+    refresh_node_parser = subparsers.add_parser(
+        'refresh-node-pipeline',
+        help='合成 synthetic 节点价格 + 批量算分 + 写 ScoreSnapshot（Task 4.12）',
+    )
+    refresh_node_parser.add_argument(
+        '--root', required=True,
+        help='根节点 ID, 例如 XLK',
+    )
+    refresh_node_parser.set_defaults(func=cmd_refresh_node_pipeline)
+
     migrate_drilldown_parser = subparsers.add_parser(
         'migrate-drilldown-tasks',
         help='把现有 drilldown 任务从 sector+etfs[] 迁移到 root_node+selected_nodes（Phase 4）',
@@ -2346,7 +2377,7 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    if args.command in {"uploads", "update", "init", "list-etfs", "list-holdings", "finviz", "mc", "load-node-taxonomy", "migrate-drilldown-tasks"}:
+    if args.command in {"uploads", "update", "init", "list-etfs", "list-holdings", "finviz", "mc", "load-node-taxonomy", "migrate-drilldown-tasks", "refresh-node-pipeline"}:
         _ensure_db_dependencies()
 
     try:

@@ -113,7 +113,9 @@ def test_commit_migrates_to_node_first(db_session):
         assert task.root_node == "XLK"
         # selected_nodes 必须包含 root + 三个 ETF 反查到的 node_id（顺序按 ETF 出现顺序）
         assert task.selected_nodes == ["XLK", "semi", "soft", "soft-cloud"]
-        assert task.view_mode == "gics"
+        # Task 4.12: 列默认值改为 'hybrid', 新建任务 (无 view_mode) 入库后即为 hybrid;
+        # migration 对已有 view_mode 不覆写, 故继续是 'hybrid'.
+        assert task.view_mode == "hybrid"
         assert task.max_depth == 3
 
 
@@ -244,6 +246,65 @@ async def test_legacy_create_still_rejects_industry_mismatch(override_api_db):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
         resp = await c.post("/api/tasks", json=payload)
     assert resp.status_code == 400
+
+
+# ---------- Task 4.12: view_mode 列默认 'hybrid' + 列补齐迁移 ----------
+
+
+def test_view_mode_default_is_hybrid_on_new_drilldown(db_session):
+    """新建 drilldown 任务 (不指定 view_mode) 列默认应落到 'hybrid'."""
+    db_session.add(Task(title="DD", type="drilldown", base_index="SPY",
+                        sector="XLK", etfs=["SOXX"]))
+    db_session.commit()
+    task = db_session.query(Task).filter(Task.title == "DD").one()
+    assert task.view_mode == "hybrid"
+
+
+def test_view_mode_backfill_promotes_existing_drilldown_to_hybrid(db_session):
+    """旧 view_mode='gics' 的 drilldown 任务 (root_node 已设) 跑列补齐后变 'hybrid'.
+
+    模拟 _ensure_task_view_mode_default_hybrid 的 SQL 行为 (函数本身依赖全局 engine,
+    测试里直接复现 UPDATE 逻辑).
+    """
+    db_session.add_all([
+        Task(title="OldDrill", type="drilldown", base_index="SPY",
+             sector="XLK", etfs=["SOXX"], root_node="XLK", view_mode="gics"),
+        Task(title="LegacyNoRoot", type="drilldown", base_index="SPY",
+             sector="XLK", etfs=["SOXX"], root_node=None, view_mode="gics"),
+    ])
+    db_session.commit()
+
+    from sqlalchemy import text
+    db_session.execute(text(
+        "UPDATE tasks SET view_mode='hybrid' "
+        "WHERE type='drilldown' AND root_node IS NOT NULL AND view_mode='gics'"
+    ))
+    db_session.commit()
+
+    promoted = db_session.query(Task).filter(Task.title == "OldDrill").one()
+    untouched = db_session.query(Task).filter(Task.title == "LegacyNoRoot").one()
+    assert promoted.view_mode == "hybrid"
+    # root_node IS NULL 的旧任务不被升级 (Phase4 §0.6 R10)
+    assert untouched.view_mode == "gics"
+
+
+def test_view_mode_backfill_skips_rotation_tasks(db_session):
+    """rotation 任务 root_node IS NULL, 列补齐应保持原样."""
+    db_session.add(Task(
+        title="Rotate", type="rotation", base_index="SPY",
+        sector=None, etfs=["XLK", "XLF"], root_node=None, view_mode="gics",
+    ))
+    db_session.commit()
+
+    from sqlalchemy import text
+    db_session.execute(text(
+        "UPDATE tasks SET view_mode='hybrid' "
+        "WHERE type='drilldown' AND root_node IS NOT NULL AND view_mode='gics'"
+    ))
+    db_session.commit()
+
+    rotation = db_session.query(Task).filter(Task.title == "Rotate").one()
+    assert rotation.view_mode == "gics"
 
 
 @pytest.mark.asyncio

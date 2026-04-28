@@ -50,8 +50,24 @@ function flattenTree(nodes: ResearchNode[]): ResearchNode[] {
   return out;
 }
 
+// Task 4.12: 给定目标 nodeId, 返回从 root 到 target 的祖先 ID 链 (含 target).
+// 找不到返回空数组. 用于 selectedNodeId 复位后自动展开整条路径.
+function findPathToNode(
+  nodes: ResearchNode[],
+  targetId: string
+): string[] {
+  for (const node of nodes) {
+    if (node.id === targetId) return [node.id];
+    if (node.children?.length) {
+      const sub = findPathToNode(node.children, targetId);
+      if (sub.length > 0) return [node.id, ...sub];
+    }
+  }
+  return [];
+}
+
 export function DrilldownView({ task, onViewStockDetail }: DrilldownViewProps) {
-  const [lens, setLens] = useState<TaskViewMode>('gics');
+  const [lens, setLens] = useState<TaskViewMode>('hybrid');
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
   const [trendPeriod, setTrendPeriod] = useState<NodeTrendPeriod>('20d');
@@ -93,6 +109,17 @@ export function DrilldownView({ task, onViewStockDetail }: DrilldownViewProps) {
     staleTime: TREE_STALE_MS,
   });
 
+  // Task 4.12: 兜底 — localStorage 里的 selectedNodeId 在最新 nodeTree 中找不到时,
+  // 回退到 root.id; 否则会卡在 selectedNode=null, 中右栏全空.
+  useEffect(() => {
+    if (!nodeTree || nodeTree.length === 0 || !selectedNodeId) return;
+    const flat = flattenTree(nodeTree);
+    const exists = flat.some((n) => n.id === selectedNodeId);
+    if (!exists) {
+      setSelectedNodeId(nodeTree[0].id);
+    }
+  }, [nodeTree, selectedNodeId]);
+
   const allNodes = useMemo<ResearchNode[]>(
     () => (nodeTree ? flattenTree(nodeTree) : []),
     [nodeTree]
@@ -102,17 +129,25 @@ export function DrilldownView({ task, onViewStockDetail }: DrilldownViewProps) {
     [allNodes, selectedNodeId]
   );
 
-  // Auto-expand root and first child on initial tree load
+  // Task 4.12: 树加载或 selectedNodeId 变化时, 把从 root 到 selectedNode 的整条
+  // 路径展开. 只加不删, 保留用户手动折叠的兄弟分支. 首次加载 (prev.size===0) 额外
+  // 展开 root 的直接子节点, 让 NodeTree 一进入就有视觉层次.
   useEffect(() => {
     if (!nodeTree || nodeTree.length === 0) return;
     setExpandedIds((prev) => {
       const next = new Set(prev);
       const root = nodeTree[0];
       next.add(root.id);
-      if (root.children?.length) next.add(root.children[0].id);
+      if (selectedNodeId) {
+        const path = findPathToNode(nodeTree, selectedNodeId);
+        for (const id of path) next.add(id);
+      }
+      if (prev.size === 0) {
+        for (const c of root.children ?? []) next.add(c.id);
+      }
       return next;
     });
-  }, [nodeTree]);
+  }, [nodeTree, selectedNodeId]);
 
   // Holdings for selected node
   const { data: holdings = [] } = useQuery({

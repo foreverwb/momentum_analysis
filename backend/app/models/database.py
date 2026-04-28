@@ -205,8 +205,8 @@ class Task(Base):
     # 旧字段 sector / etfs 保留用于向后兼容（Phase 4.10 之后再清理）
     root_node = Column(String(64), nullable=True, index=True)
     # node_id, e.g. 'XLK'；旧 drilldown 任务迁移时取值 = sector
-    view_mode = Column(String(20), default='gics')
-    # 'gics' / 'chain' / 'hybrid'
+    view_mode = Column(String(20), default='hybrid')
+    # 'gics' / 'chain' / 'hybrid'  (Task 4.12: 默认改 hybrid 让 semi 子节点可见)
     selected_nodes = Column(JSON, default=list)
     # 用户在节点树中选中的 node_id 列表
     pinned_evidence_nodes = Column(JSON, default=list)
@@ -556,6 +556,7 @@ def init_db():
     _ensure_options_overlay_indexes()
     _ensure_node_tables_indexes()
     _ensure_tasks_node_fields_columns()
+    _ensure_task_view_mode_default_hybrid()
     logger.info("数据库表已创建")
 
 
@@ -574,7 +575,7 @@ def _ensure_tasks_node_fields_columns():
     # (col_name, col_type, default_sql)
     new_columns = [
         ("root_node", "VARCHAR(64)", "NULL"),
-        ("view_mode", "VARCHAR(20)", "'gics'"),
+        ("view_mode", "VARCHAR(20)", "'hybrid'"),
         ("selected_nodes", "JSON", "'[]'"),
         ("pinned_evidence_nodes", "JSON", "'[]'"),
         ("max_depth", "INTEGER", "3"),
@@ -592,6 +593,30 @@ def _ensure_tasks_node_fields_columns():
             conn.execute(text(
                 "CREATE INDEX IF NOT EXISTS idx_tasks_root_node ON tasks(root_node)"
             ))
+
+
+def _ensure_task_view_mode_default_hybrid():
+    """把存量 drilldown 任务的 view_mode 从 'gics' 提升到 'hybrid' (Task 4.12)。
+
+    仅命中 root_node 已设置的 drilldown 任务 — rotation/momentum 的 root_node 为 NULL,
+    完全不被影响 (Phase 4 §0.6 R10)。
+    """
+    if engine.dialect.name != "sqlite":
+        return
+    inspector = inspect(engine)
+    if "tasks" not in inspector.get_table_names():
+        return
+    column_names = {col["name"] for col in inspector.get_columns("tasks")}
+    if "view_mode" not in column_names or "root_node" not in column_names:
+        return
+    with engine.begin() as conn:
+        result = conn.execute(text(
+            "UPDATE tasks SET view_mode='hybrid' "
+            "WHERE type='drilldown' AND root_node IS NOT NULL AND view_mode='gics'"
+        ))
+        affected = result.rowcount or 0
+        if affected > 0:
+            logger.info(f"已把 {affected} 个 drilldown 任务 view_mode 升级为 hybrid")
 
 
 def _ensure_etfs_parent_sector_column():

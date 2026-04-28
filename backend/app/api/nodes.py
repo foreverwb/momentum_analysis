@@ -202,7 +202,7 @@ async def get_task_node_tree(
 
     Args:
         task_id: 任务 ID。
-        lens: 视图; 缺省时回退到 task.view_mode, 仍缺省时为 'gics'。
+        lens: 视图; 缺省时回退到 task.view_mode, 仍缺省时为 'hybrid' (Task 4.12)。
         db: SQLAlchemy session。
 
     Returns:
@@ -218,7 +218,7 @@ async def get_task_node_tree(
         raise HTTPException(status_code=404, detail="Task not found")
 
     root_node_id, view_mode, max_depth = _resolve_task_node_config(task)
-    resolved_lens = (lens or view_mode or "gics").strip().lower()
+    resolved_lens = (lens or view_mode or "hybrid").strip().lower()
     if resolved_lens not in _VALID_LENS:
         raise HTTPException(
             status_code=400,
@@ -402,7 +402,8 @@ def _resolve_task_node_config(task: Task) -> Tuple[Optional[str], str, int]:
     root_node = (getattr(task, "root_node", None) or "").strip() or None
     if not root_node and task.sector:
         root_node = str(task.sector).strip().upper() or None
-    view_mode = (getattr(task, "view_mode", None) or "gics").strip().lower()
+    # Task 4.12: 兜底由 'gics' 改 'hybrid', 让 semi 下的 chain 子节点默认可见
+    view_mode = (getattr(task, "view_mode", None) or "hybrid").strip().lower()
     max_depth_val = getattr(task, "max_depth", None)
     try:
         max_depth = int(max_depth_val) if max_depth_val is not None else 3

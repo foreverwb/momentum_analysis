@@ -32,7 +32,7 @@ _YAML_PATH = Path(__file__).parents[1] / "data" / "node_taxonomy" / "xlk.yaml"
 # 按需求文档 §4 固定期望计数
 _EXPECTED_NODES = 12
 _EXPECTED_EDGES = 15
-_EXPECTED_PROXIES = 6
+_EXPECTED_PROXIES = 9  # +3 (semi-equip/SMH, semi-mem/DRAM, semi-conn/SIXG) Task 4.12
 _EXPECTED_BASKETS_MIN = 26
 
 

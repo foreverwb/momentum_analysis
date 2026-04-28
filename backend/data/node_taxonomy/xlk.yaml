@@ -117,6 +117,12 @@ proxies:
   - {node_id: soft,       etf: IGV,  role: primary,   purity: 0.9}
   - {node_id: soft-cloud, etf: SKYY, role: primary,   purity: 0.75}
   - {node_id: soft-cyber, etf: HACK, role: primary,   purity: 0.8}
+  # 设计稿 Panel 2 徽章: SMH/DRAM/SIXG (Task 4.12)
+  # SMH 同时作为 semi 的 secondary 与 semi-equip 的 primary 共存合法
+  # (UniqueConstraint 是 (node_id, etf_symbol, role))
+  - {node_id: semi-equip, etf: SMH,  role: primary,   purity: 0.85}
+  - {node_id: semi-mem,   etf: DRAM, role: primary,   purity: 0.80}
+  - {node_id: semi-conn,  etf: SIXG, role: primary,   purity: 0.70}
 
 baskets:
   # 硬件 — 父 ETF 内聚合
