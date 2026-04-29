@@ -27,6 +27,15 @@ export function scoreTierColor(score: number | null | undefined): string {
   return SCORE_COLORS.base;
 }
 
+// Sparkline 折线专用色 — 500-series 更鲜亮，阈值 80/65（原型 §Sparkline colors）
+// 与 scoreTierColor 刻意区分：文字用 600 系高对比度，折线用 500 系高饱和
+export function sparklineTierColor(score: number | null | undefined): string {
+  if (score === null || score === undefined) return '#f59e0b';
+  if (score >= 80) return '#22c55e';  // green-500
+  if (score >= 65) return '#3b82f6';  // blue-500
+  return '#f59e0b';                   // amber-500
+}
+
 export function deltaColor(v: number | null | undefined): string {
   if (v === null || v === undefined) return '#94a3b8';
   if (v > 0) return '#22c55e';

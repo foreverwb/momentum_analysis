@@ -183,34 +183,37 @@ export function DrilldownView({ task, onBack, onViewStockDetail }: DrilldownView
   });
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-      {/* Drilldown breadcrumb bar — sits below the global app header */}
-      <div
-        style={{
-          height: 44,
-          flexShrink: 0,
-          background: 'linear-gradient(to right, #f8fafc, #eff6ff, #f8fafc)',
-          borderBottom: '1px solid #e2e8f0',
-          padding: '0 20px',
-          display: 'flex',
-          alignItems: 'center',
-          gap: 8,
-        }}
-      >
-        {/* Breadcrumb */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 0 }}>
-          <span style={{ fontSize: 13, color: '#94a3b8', whiteSpace: 'nowrap' }}>监控任务</span>
+    /*
+     * Integrates with MainLayout's global header — no fixed overlay.
+     * Height: 100vh minus global header offset (p-4=16 + header=80 + mb-6=24 = 120px) + 4px buffer.
+     * Negative margin breaks out of the container's 16px horizontal padding for full-width columns.
+     */
+    <div style={{
+      display: 'flex',
+      flexDirection: 'column',
+      height: 'calc(100vh - 124px)',
+      overflow: 'hidden',
+      margin: '0 -16px',
+      width: 'calc(100% + 32px)',
+    }}>
+      {/* Breadcrumb sub-header — 48px, matches CoreTerminal's section-header style */}
+      <div style={{
+        height: 48,
+        flexShrink: 0,
+        background: '#fff',
+        borderBottom: '1px solid #e2e8f0',
+        padding: '0 24px',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ fontSize: 13, color: '#94a3b8' }}>监控任务</span>
           <span style={{ color: '#cbd5e1', fontSize: 14 }}>›</span>
-          <span
-            style={{
-              fontSize: 13,
-              color: '#64748b',
-              maxWidth: 200,
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
-            }}
-          >
+          <span style={{
+            fontSize: 13, color: '#475569',
+            maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          }}>
             {task.title}
           </span>
           <span style={{ color: '#cbd5e1', fontSize: 14 }}>›</span>
@@ -219,22 +222,24 @@ export function DrilldownView({ task, onBack, onViewStockDetail }: DrilldownView
           </span>
         </div>
 
-        {/* Action buttons */}
-        <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <button
             onClick={onBack}
             style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 5,
-              padding: '5px 12px',
-              borderRadius: 6,
-              border: '1px solid #e2e8f0',
-              background: '#fff',
-              fontSize: 13,
-              color: '#475569',
-              cursor: 'pointer',
-              fontFamily: 'inherit',
+              display: 'flex', alignItems: 'center', gap: 5,
+              padding: '6px 14px', borderRadius: 8,
+              border: '1px solid #e2e8f0', background: '#fff',
+              fontSize: 13, color: '#475569', cursor: 'pointer', fontFamily: 'inherit',
+            }}
+          >
+            ← 返回列表
+          </button>
+          <button
+            style={{
+              display: 'flex', alignItems: 'center', gap: 5,
+              padding: '6px 14px', borderRadius: 8,
+              border: '1px solid #e2e8f0', background: '#fff',
+              fontSize: 13, color: '#475569', cursor: 'pointer', fontFamily: 'inherit',
             }}
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -246,14 +251,10 @@ export function DrilldownView({ task, onBack, onViewStockDetail }: DrilldownView
           </button>
           <button
             style={{
-              padding: '5px 12px',
-              borderRadius: 6,
+              padding: '6px 14px', borderRadius: 8,
               background: 'linear-gradient(to right,#2563eb,#4f46e5)',
-              color: '#fff',
-              border: 'none',
-              fontSize: 13,
-              cursor: 'pointer',
-              fontFamily: 'inherit',
+              color: '#fff', border: 'none',
+              fontSize: 13, cursor: 'pointer', fontFamily: 'inherit',
             }}
           >
             + 添加 ETF

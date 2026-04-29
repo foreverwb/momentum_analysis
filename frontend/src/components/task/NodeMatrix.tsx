@@ -8,7 +8,7 @@
 import React, { useMemo } from 'react';
 import type { ResearchNode } from '../../types';
 import { Sparkline } from './Sparkline';
-import { scoreTierColor, deltaColor, fmtDelta, fmtScore, fmtPercent } from './nodeStyles';
+import { scoreTierColor, sparklineTierColor, deltaColor, fmtDelta, fmtScore, fmtPercent } from './nodeStyles';
 
 // ─── Contribution progress bar — 需求文档 §Card 3 Sub-Node Matrix ─────────────
 function ContribBar({
@@ -60,6 +60,7 @@ interface ChildCardProps {
 function ChildCard({ child, onSelect }: ChildCardProps): React.ReactElement {
   const sparkData = useMemo(() => buildSparkData(child), [child]);
   const scoreColor = scoreTierColor(child.score);
+  const sparkColor = sparklineTierColor(child.score);
   const contribVal = child.contribution ?? 0;
 
   const [hovered, setHovered] = React.useState(false);
@@ -126,7 +127,7 @@ function ChildCard({ child, onSelect }: ChildCardProps): React.ReactElement {
 
       {/* Sparkline */}
       <div style={{ marginBottom: 8 }}>
-        <Sparkline data={sparkData} color={scoreColor} width={220} height={28} />
+        <Sparkline data={sparkData} color={sparkColor} width={220} height={28} />
       </div>
 
       {/* Contribution row */}

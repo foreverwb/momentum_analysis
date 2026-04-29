@@ -176,25 +176,20 @@ export function NodeTrendChart({
           flexWrap: 'wrap',
         }}
       >
-        {/* Left: node label + proxy + sublabel */}
+        {/* Left: node label + proxy annotation + sublabel */}
         <div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
-            <span style={{ fontSize: 14, fontWeight: 700, color: '#1e293b' }}>{nodeLabel}</span>
-            <span
-              style={{
-                fontSize: 10,
-                padding: '1px 6px',
-                borderRadius: 4,
-                fontWeight: 600,
-                background:
-                  selectedNode.proxyType === 'etf'
-                    ? 'rgba(59,130,246,0.1)'
-                    : 'rgba(245,158,11,0.1)',
-                color: selectedNode.proxyType === 'etf' ? '#2563eb' : '#d97706',
-              }}
-            >
-              {tag}
-            </span>
+          <div style={{ fontSize: 14, fontWeight: 700, color: '#1e293b', marginBottom: 2 }}>
+            {nodeLabel}
+            {selectedNode.proxyType === 'etf' && selectedNode.proxy && (
+              <span style={{ marginLeft: 8, fontSize: 12, color: '#2563eb', fontWeight: 500 }}>
+                ({selectedNode.proxy})
+              </span>
+            )}
+            {selectedNode.proxyType === 'synthetic' && (
+              <span style={{ marginLeft: 8, fontSize: 11, color: '#d97706', fontWeight: 500 }}>
+                合成篮
+              </span>
+            )}
           </div>
           <div style={{ fontSize: 12, color: '#64748b' }}>相对走势对比 · {selectedNode.sublabel}</div>
         </div>

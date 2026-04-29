@@ -7,7 +7,7 @@
 import React, { useMemo } from 'react';
 import type { ResearchNode, TaskViewMode } from '../../types';
 import { Sparkline } from './Sparkline';
-import { scoreTierColor, fmtScore } from './nodeStyles';
+import { scoreTierColor, sparklineTierColor, fmtScore } from './nodeStyles';
 
 // ─── Pixel constants — 需求文档 §Panel 2 ─────────────────────────────────────
 const INDENT_BASE = 12;
@@ -96,6 +96,7 @@ function NodeItem({
   const paddingLeft = INDENT_BASE + node.level * INDENT_PER_LEVEL;
   const sparkData = useMemo(() => buildSparkData(node), [node]);
   const scoreColor = scoreTierColor(node.score);
+  const sparkColor = sparklineTierColor(node.score);
 
   function handleClick() {
     onSelect(node);
@@ -178,7 +179,7 @@ function NodeItem({
 
         {/* Sparkline + score */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
-          <Sparkline data={sparkData} color={scoreColor} width={44} height={18} />
+          <Sparkline data={sparkData} color={sparkColor} width={44} height={18} />
           <span
             style={{
               fontWeight: 700,
