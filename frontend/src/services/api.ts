@@ -20,7 +20,8 @@ import type {
   NodeTrendResponse,
   NodeTrendPeriod,
   NodeTrendMetric,
-  TaskViewMode
+  TaskViewMode,
+  ChainSignalResult,
 } from '../types';
 import { getBeijingCutoffBoundaryMs, getBeijingSyncWindowKey, parseUtcTimestampMs } from '../utils/beijingTime';
 
@@ -2352,6 +2353,25 @@ export async function getNodeTrendSeries(
   );
 }
 
+export async function getChainSignals(
+  taskId: number,
+  sector?: string
+): Promise<ChainSignalResult | null> {
+  const params = sector ? `?sector=${encodeURIComponent(sector)}` : '';
+  // Backend returns flat fields or {signals:null, warning} when no config exists.
+  const raw = await fetchApi<Record<string, unknown>>(
+    `/tasks/${taskId}/nodes/chain-signals${params}`
+  );
+  if (raw.signals === null || raw.warning) return null;
+  return {
+    upstream: Boolean(raw.upstream),
+    broad: Boolean(raw.broad),
+    downstream: Boolean(raw.downstream),
+    label: String(raw.label ?? ''),
+    color: String(raw.color ?? '#94a3b8'),
+  };
+}
+
 export const drilldownQueryKeys = {
   nodeTree: (taskId: number, lens: TaskViewMode) =>
     ['task-nodes', taskId, lens] as const,
@@ -2363,4 +2383,6 @@ export const drilldownQueryKeys = {
     period: NodeTrendPeriod,
     metric: NodeTrendMetric
   ) => ['node-trend', taskId, nodeId, period, metric] as const,
+  chainSignals: (taskId: number) =>
+    ['chain-signals', taskId] as const,
 };

@@ -26,6 +26,7 @@ import { NodeMatrix } from './NodeMatrix';
 import { NodeHoldingsTable } from './NodeHoldingsTable';
 import { DataSourceBar } from './DataSourceBar';
 import { NodeDetailPanel } from './NodeDetailPanel';
+import { ChainSignalBar } from './ChainSignalBar';
 
 interface DrilldownViewProps {
   task: Task;
@@ -169,6 +170,14 @@ export function DrilldownView({ task, onBack, onViewStockDetail }: DrilldownView
     staleTime: NODE_DATA_STALE_MS,
   });
 
+  // Chain signals — only fetched when lens=chain (DD-8)
+  const { data: chainSignals = null } = useQuery({
+    queryKey: api.drilldownQueryKeys.chainSignals(task.id),
+    queryFn: () => api.getChainSignals(task.id),
+    enabled: lens === 'chain',
+    staleTime: TREE_STALE_MS,
+  });
+
   // Trend series for selected node
   const { data: trendData } = useQuery({
     queryKey: selectedNode
@@ -221,6 +230,8 @@ export function DrilldownView({ task, onBack, onViewStockDetail }: DrilldownView
             板块内下钻
           </span>
         </div>
+
+        {lens === 'chain' && <ChainSignalBar signals={chainSignals} />}
 
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <button

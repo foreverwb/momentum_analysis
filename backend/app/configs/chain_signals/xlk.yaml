@@ -1,0 +1,28 @@
+# Chain signal rules for XLK (Technology sector) — 产业链共振信号配置
+#
+# upstream:   上游节点分 > threshold 时触发「上游共振」
+# broad:      同层节点中分 > threshold 的数量 >= min_count 时触发「同层扩散」
+# downstream: 任一下游节点分 > threshold 时触发「下游确认」
+#
+# 节点 ID 对应 xlk.yaml 种子数据中的 node_id。
+# 调整阈值或节点清单不需要改任何 .py 文件。
+
+upstream:
+  watched_nodes:
+    - semi-equip         # 半导体设备：最上游，最先见顶放量
+  threshold: 70
+
+broad:
+  watched_nodes:
+    - semi-equip         # 设备
+    - semi-compute       # 算力芯片
+    - semi-mem           # 存储芯片
+    - semi-conn          # 连接芯片
+  threshold: 75
+  min_count: 3           # ≥3 个节点超过阈值才算扩散
+
+downstream:
+  watched_nodes:
+    - conn-optical       # 光互联（chain extension）
+    - conn-copper        # 铜互联（chain extension）
+  threshold: 75

@@ -507,6 +507,27 @@ export interface NodeTrendResponse {
   series: NodeTrendSeries[];
 }
 
+// ─── Phase 4 DD-8: Chain Signal Types ─────────────────────────────────────────
+
+export interface ChainSignalResult {
+  upstream: boolean;
+  broad: boolean;
+  downstream: boolean;
+  label: string;
+  color: string;
+}
+
+export interface ChainSignalsResponse {
+  /** null when sector has no config file */
+  signals: ChainSignalResult | null;
+  warning?: string;
+  upstream?: boolean;
+  broad?: boolean;
+  downstream?: boolean;
+  label?: string;
+  color?: string;
+}
+
 export interface RefreshResult {
   status: 'success' | 'error' | 'partial' | 'snapshot' | 'failed' | 'warning';
   symbol: string;

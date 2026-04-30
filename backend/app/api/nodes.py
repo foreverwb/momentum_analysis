@@ -37,6 +37,12 @@ from app.services.calculators.node_score import (
     NodeScoreResult,
     batch_calculate_node_scores,
 )
+from app.services.calculators.chain_signals import (
+    ChainSignalResult,
+    compute_chain_signals_for_sector,
+    load_chain_signal_rules,
+    compute_chain_signals,
+)
 
 
 router = APIRouter()
@@ -388,6 +394,88 @@ async def get_node_trend_comparison(
         "dates": dates,
         "series": enriched_series,
     }
+
+
+# ============ 4. GET /api/tasks/{task_id}/nodes/chain-signals ============
+
+
+@router.get(
+    "/{task_id}/nodes/chain-signals",
+    response_model=Dict[str, Any],
+)
+async def get_chain_signals(
+    task_id: int,
+    sector: Optional[str] = Query(
+        None,
+        description="板块标识（小写），如 'xlk'。缺省时从 task.root_node / task.sector 推断。",
+    ),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """计算产业链三维共振信号（上游共振 / 同层扩散 / 下游确认）。
+
+    规则从 configs/chain_signals/<sector>.yaml 读取，节点分数从
+    batch_calculate_node_scores 实时计算。
+
+    Args:
+        task_id: 任务 ID。
+        sector: 板块标识；缺省时从 task.root_node 或 task.sector 推断（转小写）。
+        db: SQLAlchemy session。
+
+    Returns:
+        {upstream, broad, downstream, label, color}。
+        upstream/broad/downstream 为 bool；label/color 为综合信号字符串/色值。
+        若板块无对应配置文件，返回 signals=null + warning 字段。
+
+    Raises:
+        HTTPException 404: task 不存在。
+    """
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    resolved_sector = _resolve_sector(task, sector)
+
+    # 若无配置文件，优雅降级，不报 500
+    try:
+        rules = load_chain_signal_rules(resolved_sector)
+    except FileNotFoundError:
+        return {
+            "signals": None,
+            "warning": f"No chain signal config for sector '{resolved_sector}'. "
+                       f"Create backend/app/configs/chain_signals/{resolved_sector}.yaml to enable.",
+        }
+
+    # 收集规则中所有关注节点，批量计算分数
+    all_watched = (
+        rules.upstream.watched_nodes
+        + rules.broad.watched_nodes
+        + rules.downstream.watched_nodes
+    )
+    unique_nodes = list(dict.fromkeys(all_watched))  # 去重保序
+
+    score_results = batch_calculate_node_scores(unique_nodes, db)
+    node_scores: Dict[str, float] = {
+        r.node_id: float(r.total_score) for r in score_results
+    }
+
+    result: ChainSignalResult = compute_chain_signals(node_scores, rules)
+    return {
+        "upstream": result.upstream,
+        "broad": result.broad,
+        "downstream": result.downstream,
+        "label": result.label,
+        "color": result.color,
+    }
+
+
+def _resolve_sector(task: Task, override: Optional[str]) -> str:
+    """从 query param / root_node / sector 字段推断板块名（转小写）。"""
+    if override:
+        return override.strip().lower()
+    root = (getattr(task, "root_node", None) or "").strip()
+    if root:
+        return root.lower()
+    return (task.sector or "xlk").strip().lower()
 
 
 # ============ 内部辅助: 任务配置解析 ============
