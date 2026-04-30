@@ -27,6 +27,7 @@ import { NodeHoldingsTable } from './NodeHoldingsTable';
 import { DataSourceBar } from './DataSourceBar';
 import { NodeDetailPanel } from './NodeDetailPanel';
 import { ChainSignalBar } from './ChainSignalBar';
+import { StrategicPanel } from './chain/StrategicPanel';
 
 interface DrilldownViewProps {
   task: Task;
@@ -174,6 +175,14 @@ export function DrilldownView({ task, onBack, onViewStockDetail }: DrilldownView
   const { data: chainSignals = null } = useQuery({
     queryKey: api.drilldownQueryKeys.chainSignals(task.id),
     queryFn: () => api.getChainSignals(task.id),
+    enabled: lens === 'chain',
+    staleTime: TREE_STALE_MS,
+  });
+
+  // Chain strategy (StrategicPanel data) — only fetched when lens=chain (DD-4)
+  const { data: chainStrategy = null } = useQuery({
+    queryKey: api.drilldownQueryKeys.chainGraph(task.id),
+    queryFn: () => api.getChainGraph(task.id),
     enabled: lens === 'chain',
     staleTime: TREE_STALE_MS,
   });
@@ -355,12 +364,24 @@ export function DrilldownView({ task, onBack, onViewStockDetail }: DrilldownView
           }}
         >
           {selectedNode && (
-            <NodeDetailPanel
-              selectedNode={selectedNode}
-              allNodes={allNodes}
-              holdings={holdings}
-              onSelectNode={(n) => setSelectedNodeId(n.id)}
-            />
+            lens === 'chain' && chainStrategy ? (
+              <div style={{ overflowY: 'auto', padding: 12 }}>
+                <StrategicPanel
+                  strategy={chainStrategy}
+                  allNodes={allNodes}
+                  selectedNode={selectedNode}
+                  holdings={holdings}
+                  onSelectNode={(n) => setSelectedNodeId(n.id)}
+                />
+              </div>
+            ) : (
+              <NodeDetailPanel
+                selectedNode={selectedNode}
+                allNodes={allNodes}
+                holdings={holdings}
+                onSelectNode={(n) => setSelectedNodeId(n.id)}
+              />
+            )
           )}
         </aside>
       </div>

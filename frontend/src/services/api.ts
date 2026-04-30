@@ -22,6 +22,8 @@ import type {
   NodeTrendMetric,
   TaskViewMode,
   ChainSignalResult,
+  ChainStrategyResult,
+  ChainGraphResponse,
 } from '../types';
 import { getBeijingCutoffBoundaryMs, getBeijingSyncWindowKey, parseUtcTimestampMs } from '../utils/beijingTime';
 
@@ -2372,6 +2374,17 @@ export async function getChainSignals(
   };
 }
 
+export async function getChainGraph(
+  taskId: number,
+  sector?: string
+): Promise<ChainStrategyResult | null> {
+  const params = sector ? `?sector=${encodeURIComponent(sector)}` : '';
+  const raw = await fetchApi<ChainGraphResponse>(
+    `/tasks/${taskId}/nodes/chain-graph${params}`
+  );
+  return raw.strategy ?? null;
+}
+
 export const drilldownQueryKeys = {
   nodeTree: (taskId: number, lens: TaskViewMode) =>
     ['task-nodes', taskId, lens] as const,
@@ -2385,4 +2398,6 @@ export const drilldownQueryKeys = {
   ) => ['node-trend', taskId, nodeId, period, metric] as const,
   chainSignals: (taskId: number) =>
     ['chain-signals', taskId] as const,
+  chainGraph: (taskId: number) =>
+    ['chain-graph', taskId] as const,
 };

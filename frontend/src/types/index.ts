@@ -528,6 +528,43 @@ export interface ChainSignalsResponse {
   color?: string;
 }
 
+// ─── Phase 4 DD-4: Chain Strategy (StrategicPanel) Types ──────────────────────
+
+export interface StrategyNodeBrief {
+  id: string;
+  label: string;
+  sublabel: string;
+  score: number;
+  delta5d: number | null;
+}
+
+export interface StrategyBreadth {
+  label: '全面扩散' | '主线驱动' | '单点拉动';
+  strong_count: number;
+  total: number;
+}
+
+export interface StrategyConfirmation {
+  equip_score: number;
+  conn_score: number;
+  compute_score: number;
+  compute_leading: boolean;
+  message: string;
+}
+
+export interface ChainStrategyResult {
+  l1_ranking: StrategyNodeBrief[];
+  breadth: StrategyBreadth;
+  confirmation: StrategyConfirmation;
+  best_drill: StrategyNodeBrief | null;
+}
+
+export interface ChainGraphResponse {
+  /** null when sector has no strategy config */
+  strategy: ChainStrategyResult | null;
+  warning?: string;
+}
+
 export interface RefreshResult {
   status: 'success' | 'error' | 'partial' | 'snapshot' | 'failed' | 'warning';
   symbol: string;

@@ -43,6 +43,13 @@ from app.services.calculators.chain_signals import (
     load_chain_signal_rules,
     compute_chain_signals,
 )
+from app.services.calculators.chain_strategy import (
+    ChainStrategyResult,
+    StrategyConfig,
+    StrategyNodeBrief,
+    compute_chain_strategy,
+    load_chain_strategy_config,
+)
 
 
 router = APIRouter()
@@ -465,6 +472,156 @@ async def get_chain_signals(
         "downstream": result.downstream,
         "label": result.label,
         "color": result.color,
+    }
+
+
+# ============ 5. GET /api/tasks/{task_id}/nodes/chain-graph (Task DD-4) ============
+
+
+@router.get(
+    "/{task_id}/nodes/chain-graph",
+    response_model=Dict[str, Any],
+)
+async def get_chain_graph(
+    task_id: int,
+    sector: Optional[str] = Query(
+        None,
+        description="板块标识（小写），如 'xlk'。缺省时从 task.root_node / task.sector 推断。",
+    ),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """产业链下钻视图后端：当前阶段只输出 StrategicPanel 4 卡所需的 strategy 字段。
+
+    Args:
+        task_id: 任务 ID。
+        sector: 板块标识；缺省时从 task 推断。
+        db: SQLAlchemy session。
+
+    Returns:
+        {strategy: {l1_ranking, breadth, confirmation, best_drill}}
+        若该 sector 没有 strategy 配置，返回 {strategy: null, warning}。
+
+    Raises:
+        HTTPException 404: task 不存在。
+    """
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    resolved_sector = _resolve_sector(task, sector)
+    try:
+        config = load_chain_strategy_config(resolved_sector)
+    except (FileNotFoundError, KeyError) as exc:
+        return {
+            "strategy": None,
+            "warning": (
+                f"No chain strategy config for sector '{resolved_sector}': {exc}. "
+                f"Add a `strategy:` section to backend/app/configs/chain_signals/{resolved_sector}.yaml."
+            ),
+        }
+
+    nodes_map, children_map = _collect_strategy_inputs(db, config)
+    result = compute_chain_strategy(nodes_map, children_map, config)
+    return {"strategy": _serialize_strategy(result)}
+
+
+def _collect_strategy_inputs(
+    db: Session,
+    config: StrategyConfig,
+) -> Tuple[Dict[str, StrategyNodeBrief], Dict[str, List[str]]]:
+    """聚合 chain_strategy 所需的两个输入：节点 brief 字典 + 父子映射。
+
+    节点 ID 集合 = l1 ∪ l1 的子节点 ∪ {equip,conn,compute} ∪ l2_drill_nodes。
+    children_map 仅为 l1 节点查 classification/chain 子节点（与节点树同一 lens）。
+    """
+    seed_ids: List[str] = list(dict.fromkeys(
+        [*config.l1_nodes, config.equip_node, config.conn_node,
+         config.compute_node, *config.l2_drill_nodes]
+    ))
+
+    children_map: Dict[str, List[str]] = {}
+    for parent_id in config.l1_nodes:
+        child_ids = _query_chain_children(db, parent_id)
+        children_map[parent_id] = child_ids
+        seed_ids.extend(c for c in child_ids if c not in seed_ids)
+
+    score_results = batch_calculate_node_scores(seed_ids, db)
+    score_map = {r.node_id: r for r in score_results}
+
+    meta_rows = (
+        db.query(AnalyticNode)
+        .filter(AnalyticNode.node_id.in_(seed_ids))
+        .all()
+    )
+    meta_map = {n.node_id: n for n in meta_rows}
+
+    nodes: Dict[str, StrategyNodeBrief] = {}
+    for nid in seed_ids:
+        meta = meta_map.get(nid)
+        scored = score_map.get(nid)
+        if meta is None and scored is None:
+            continue
+        label = (scored.label if scored else None) or (meta.label if meta else nid)
+        sublabel = (meta.sublabel if meta and meta.sublabel else label)
+        score_val = float(scored.total_score) if scored else 0.0
+        delta5d = scored.delta5d if scored else None
+        nodes[nid] = StrategyNodeBrief(
+            id=nid,
+            label=label,
+            sublabel=sublabel,
+            score=score_val,
+            delta5d=delta5d,
+        )
+    return nodes, children_map
+
+
+def _query_chain_children(db: Session, parent_id: str) -> List[str]:
+    """取节点的 chain_parent / classification_parent 子节点（hybrid lens 同口径）。"""
+    rows = (
+        db.query(NodeEdge.dst_node_id)
+        .filter(NodeEdge.src_node_id == parent_id)
+        .filter(NodeEdge.edge_type.in_([
+            NodeEdgeType.CHAIN_PARENT.value,
+            NodeEdgeType.CLASSIFICATION_PARENT.value,
+        ]))
+        .all()
+    )
+    seen: Set[str] = set()
+    out: List[str] = []
+    for r in rows:
+        cid = r[0]
+        if cid and cid not in seen:
+            seen.add(cid)
+            out.append(cid)
+    return out
+
+
+def _serialize_brief(b: StrategyNodeBrief) -> Dict[str, Any]:
+    return {
+        "id": b.id,
+        "label": b.label,
+        "sublabel": b.sublabel,
+        "score": round(b.score, 2),
+        "delta5d": b.delta5d,
+    }
+
+
+def _serialize_strategy(r: ChainStrategyResult) -> Dict[str, Any]:
+    return {
+        "l1_ranking": [_serialize_brief(b) for b in r.l1_ranking],
+        "breadth": {
+            "label": r.breadth.label,
+            "strong_count": r.breadth.strong_count,
+            "total": r.breadth.total,
+        },
+        "confirmation": {
+            "equip_score": round(r.confirmation.equip_score, 2),
+            "conn_score": round(r.confirmation.conn_score, 2),
+            "compute_score": round(r.confirmation.compute_score, 2),
+            "compute_leading": r.confirmation.compute_leading,
+            "message": r.confirmation.message,
+        },
+        "best_drill": _serialize_brief(r.best_drill) if r.best_drill else None,
     }
 
 

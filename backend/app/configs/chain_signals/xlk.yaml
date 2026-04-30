@@ -26,3 +26,23 @@ downstream:
     - conn-optical       # 光互联（chain extension）
     - conn-copper        # 铜互联（chain extension）
   threshold: 75
+
+# Task DD-4 — StrategicPanel（产业链下钻策略面板）配置
+# l1_nodes:               Q1 排名候选（XLK 直系 L1 子节点）
+# equip/conn/compute_node: Q3 上下游确认引用的三个节点 ID
+# l2_drill_nodes:         Q4 best_drill 候选（按 delta5d 取最大）
+strategy:
+  l1_nodes:
+    - semi
+    - soft
+    - hw
+  equip_node: semi-equip
+  conn_node: semi-conn
+  compute_node: semi-compute
+  l2_drill_nodes:
+    - semi-equip
+    - semi-compute
+    - semi-mem
+    - semi-conn
+    - soft-cloud
+    - soft-cyber
