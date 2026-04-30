@@ -226,3 +226,40 @@ def test_load_strategy_config_case_insensitive():
 def test_load_missing_sector_raises():
     with pytest.raises(FileNotFoundError):
         load_chain_strategy_config("nonexistent_sector_xyz")
+
+
+# ─── best_drill 边界：空集 / 全负 5D ─────────────────────────────────────────
+
+def test_best_drill_all_absent_from_nodes_dict():
+    """L2 候选节点完全不在 nodes dict 中（空集）→ best_drill=None。"""
+    res = compute_chain_strategy({}, _CHILDREN_MAP, _CONFIG)
+    assert res.best_drill is None
+
+
+def test_best_drill_all_negative_delta5d():
+    """所有 L2 候选 delta5d 均为负值 → 仍选出最大（绝对值最小的负数）。"""
+    nodes = _build_nodes(
+        score_map={
+            "semi-equip": 70.0, "semi-compute": 70.0, "semi-mem": 70.0,
+            "semi-conn": 70.0, "soft-cloud": 70.0, "soft-cyber": 70.0,
+        },
+        delta_map={
+            "semi-equip": -5.0, "semi-compute": -1.2, "semi-mem": -3.8,
+            "semi-conn": -2.0, "soft-cloud": -4.5, "soft-cyber": -6.0,
+        },
+    )
+    res = compute_chain_strategy(nodes, _CHILDREN_MAP, _CONFIG)
+    assert res.best_drill is not None
+    assert res.best_drill.id == "semi-compute"   # -1.2 是最大值
+
+
+# ─── breadth top_l1=None 分支（所有 L1 节点缺失） ────────────────────────────
+
+def test_breadth_top_l1_none_when_all_l1_absent():
+    """nodes dict 中无任何 L1 节点 → l1_ranking 为空 → top_l1=None → 单点/0/0。"""
+    nodes = _build_nodes({"semi-equip": 80.0, "semi-compute": 78.0})  # 只有 L2
+    res = compute_chain_strategy(nodes, _CHILDREN_MAP, _CONFIG)
+    assert res.l1_ranking == []
+    assert res.breadth.label == "单点拉动"
+    assert res.breadth.strong_count == 0
+    assert res.breadth.total == 0

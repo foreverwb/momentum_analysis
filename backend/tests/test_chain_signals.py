@@ -216,3 +216,57 @@ def test_downstream_or_semantics_copper_only():
     }
     result = compute_chain_signals(scores, _RULES)
     assert result.downstream is True
+
+
+# ─── 阈值边界：严格 > 而非 >= ─────────────────────────────────────────────────
+
+def test_upstream_exact_threshold_not_triggered():
+    """upstream score 恰好等于阈值 70 → 条件 > 70 不满足，不触发。"""
+    scores = {"semi-equip": 70.0}
+    result = compute_chain_signals(scores, _RULES)
+    assert result.upstream is False
+
+
+def test_broad_exact_threshold_not_counted():
+    """broad watched node score == 75 → 条件 > 75 不满足，不计入计数；min_count=3 不达标。"""
+    scores = {
+        "semi-equip": 75.0,
+        "semi-compute": 75.0,
+        "semi-mem": 75.0,
+        "semi-conn": 75.0,
+    }
+    result = compute_chain_signals(scores, _RULES)
+    assert result.broad is False
+
+
+def test_downstream_exact_threshold_not_triggered():
+    """downstream score == 75 → 条件 > 75 不满足，不触发。"""
+    scores = {"conn-optical": 75.0, "conn-copper": 75.0}
+    result = compute_chain_signals(scores, _RULES)
+    assert result.downstream is False
+
+
+# ─── 空 watched_nodes 列表的 else False 分支 ──────────────────────────────────
+
+def test_empty_upstream_watched_nodes_returns_false():
+    """upstream.watched_nodes 为空列表 → else False，不触发。"""
+    rules = ChainSignalRules(
+        upstream=UpstreamRule(watched_nodes=[], threshold=70.0),
+        broad=BroadRule(watched_nodes=[], threshold=75.0, min_count=0),
+        downstream=DownstreamRule(watched_nodes=["conn-optical"], threshold=75.0),
+    )
+    scores = {"conn-optical": 80.0}
+    result = compute_chain_signals(scores, rules)
+    assert result.upstream is False
+
+
+def test_empty_downstream_watched_nodes_returns_false():
+    """downstream.watched_nodes 为空列表 → else False，不触发。"""
+    rules = ChainSignalRules(
+        upstream=UpstreamRule(watched_nodes=["semi-equip"], threshold=70.0),
+        broad=BroadRule(watched_nodes=[], threshold=75.0, min_count=0),
+        downstream=DownstreamRule(watched_nodes=[], threshold=75.0),
+    )
+    scores = {"semi-equip": 80.0}
+    result = compute_chain_signals(scores, rules)
+    assert result.downstream is False
