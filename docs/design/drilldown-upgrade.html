@@ -1,0 +1,1665 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>板块内下钻 — 升级布局</title>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg-primary: #ffffff;
+  --bg-secondary: #f8fafc;
+  --bg-tertiary: #f1f5f9;
+  --text-primary: #1e293b;
+  --text-secondary: #475569;
+  --text-muted: #94a3b8;
+  --border-light: #e2e8f0;
+  --border-medium: #cbd5e1;
+  --accent-blue: #3b82f6;
+  --accent-purple: #8b5cf6;
+  --accent-green: #22c55e;
+  --accent-amber: #f59e0b;
+  --accent-red: #ef4444;
+  --accent-orange: #f97316;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+}
+html, body, #root { height: 100%; }
+body {
+  font-family: 'Noto Sans SC', 'Inter', -apple-system, sans-serif;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-medium); border-radius: 4px; }
+
+/* Mini sparkline */
+.sparkline { display: block; }
+
+/* Trend chart canvas area */
+.chart-area { position: relative; width: 100%; height: 220px; }
+.chart-svg { width: 100%; height: 100%; }
+
+/* Node active glow */
+.node-active { background: linear-gradient(135deg, rgba(37,99,235,0.08), rgba(147,51,234,0.08)); border-color: var(--accent-blue) !important; }
+
+/* Badge pill */
+.badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 500; }
+
+/* Transition */
+.transition-all { transition: all 0.15s ease; }
+
+/* Score tiers */
+.score-high { color: #059669; }
+.score-mid  { color: #2563eb; }
+.score-low  { color: #d97706; }
+.score-base { color: #64748b; }
+
+/* Proxy tag */
+.proxy-tag { font-size: 10px; padding: 1px 6px; border-radius: 4px; font-weight: 600; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useMemo, useCallback, useEffect, useRef } = React;
+
+// ─── Mock Data ─────────────────────────────────────────────────────────────
+
+const TASK = {
+  id: 7,
+  title: 'XLK 科技板块下钻',
+  type: 'drilldown',
+  sector: 'XLK',
+  baseIndices: ['SPY'],
+  etfs: ['SOXX', 'IGV', 'SKYY', 'HACK'],
+  createdAt: '2026-04-10',
+};
+
+// Research node tree – GICS lens
+const NODE_TREE = [
+  {
+    id: 'XLK', label: 'XLK', sublabel: 'Technology Select Sector', level: 0,
+    proxy: 'XLK', proxyType: 'etf',
+    score: 74.2, scoreVsParent: null, contribution: null,
+    relStrength: '+6.4%', breadth: 68,
+    delta3d: +1.2, delta5d: +2.8,
+    children: [
+      {
+        id: 'semi', label: '半导体', sublabel: 'Semiconductors & Equip.', level: 1,
+        proxy: 'SOXX', proxyType: 'etf',
+        score: 81.5, scoreVsParent: +7.3, contribution: 42,
+        relStrength: '+9.1%', breadth: 74,
+        delta3d: +2.1, delta5d: +4.3,
+        children: [
+          {
+            id: 'semi-equip', label: '设备', sublabel: 'Semiconductor Equipment', level: 2,
+            proxy: 'SMH', proxyType: 'etf',
+            score: 76.8, scoreVsParent: -4.7, contribution: 18,
+            relStrength: '+5.2%', breadth: 61,
+            delta3d: +0.8, delta5d: +1.9,
+            children: []
+          },
+          {
+            id: 'semi-mem', label: '存储', sublabel: 'Memory / DRAM', level: 2,
+            proxy: 'DRAM', proxyType: 'etf',
+            score: 88.3, scoreVsParent: +6.8, contribution: 14,
+            relStrength: '+12.4%', breadth: 82,
+            delta3d: +3.4, delta5d: +6.1,
+            children: []
+          },
+          {
+            id: 'semi-compute', label: '计算', sublabel: 'AI Compute / GPU', level: 2,
+            proxy: null, proxyType: 'synthetic',
+            proxyLabel: 'NVDA + AMD + AVGO',
+            score: 91.2, scoreVsParent: +9.7, contribution: 38,
+            relStrength: '+15.3%', breadth: 88,
+            delta3d: +4.1, delta5d: +7.8,
+            children: []
+          },
+          {
+            id: 'semi-conn', label: '连接', sublabel: 'High-Speed Interconnect', level: 2,
+            proxy: 'SIXG', proxyType: 'etf',
+            score: 83.7, scoreVsParent: +2.2, contribution: 12,
+            relStrength: '+8.6%', breadth: 71,
+            delta3d: +1.7, delta5d: +3.2,
+            children: [
+              {
+                id: 'conn-optical', label: '光互联', sublabel: 'Optical Transceivers', level: 3,
+                proxy: null, proxyType: 'synthetic',
+                proxyLabel: 'CIEN + LITE + FNSR',
+                score: 85.1, scoreVsParent: +1.4, contribution: 55,
+                relStrength: '+9.8%', breadth: 73,
+                delta3d: +2.0, delta5d: +3.8,
+                children: []
+              },
+              {
+                id: 'conn-copper', label: '铜缆', sublabel: 'Active Copper / Connectors', level: 3,
+                proxy: null, proxyType: 'synthetic',
+                proxyLabel: 'CRDO + APH + MTSI',
+                score: 79.4, scoreVsParent: -4.3, contribution: 45,
+                relStrength: '+6.1%', breadth: 66,
+                delta3d: +0.9, delta5d: +2.1,
+                children: []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        id: 'soft', label: '软件', sublabel: 'Application Software', level: 1,
+        proxy: 'IGV', proxyType: 'etf',
+        score: 68.4, scoreVsParent: -5.8, contribution: 31,
+        relStrength: '+2.1%', breadth: 54,
+        delta3d: -0.4, delta5d: +0.6,
+        children: [
+          {
+            id: 'soft-cloud', label: '云计算', sublabel: 'Cloud Platforms', level: 2,
+            proxy: 'SKYY', proxyType: 'etf',
+            score: 71.2, scoreVsParent: +2.8, contribution: 48,
+            relStrength: '+3.4%', breadth: 58,
+            delta3d: +0.2, delta5d: +1.1,
+            children: []
+          },
+          {
+            id: 'soft-cyber', label: '网络安全', sublabel: 'Cybersecurity', level: 2,
+            proxy: 'HACK', proxyType: 'etf',
+            score: 64.1, scoreVsParent: -7.1, contribution: 22,
+            relStrength: '-0.8%', breadth: 44,
+            delta3d: -1.2, delta5d: -0.9,
+            children: []
+          }
+        ]
+      },
+      {
+        id: 'hw', label: '硬件', sublabel: 'Tech Hardware & Equipment', level: 1,
+        proxy: null, proxyType: 'synthetic',
+        proxyLabel: 'AAPL + HPQ + DELL + NTAP',
+        score: 61.3, scoreVsParent: -12.9, contribution: 27,
+        relStrength: '-1.2%', breadth: 41,
+        delta3d: -0.8, delta5d: -2.1,
+        children: []
+      }
+    ]
+  }
+];
+
+// ─── Mock Holdings per Node ──────────────────────────────────────────────────
+
+const NODE_HOLDINGS = {
+  XLK: [
+    { ticker:'AAPL', name:'Apple Inc.',           weight:20.1, score:71.4, return20d:+4.2,  rs20d:+0.8,  delta3d:+0.9, delta5d:+2.1, status:'complete' },
+    { ticker:'MSFT', name:'Microsoft Corp.',       weight:18.6, score:69.8, return20d:+3.1,  rs20d:-0.2,  delta3d:-0.3, delta5d:+0.4, status:'complete' },
+    { ticker:'NVDA', name:'NVIDIA Corp.',           weight:12.4, score:91.2, return20d:+18.3, rs20d:+11.9, delta3d:+4.1, delta5d:+7.8, status:'complete' },
+    { ticker:'AVGO', name:'Broadcom Inc.',          weight: 7.2, score:84.6, return20d:+10.4, rs20d:+5.1,  delta3d:+2.2, delta5d:+4.4, status:'complete' },
+    { ticker:'AMD',  name:'Advanced Micro Devices', weight: 4.8, score:88.1, return20d:+14.2, rs20d:+8.6,  delta3d:+3.3, delta5d:+6.2, status:'complete' },
+    { ticker:'ORCL', name:'Oracle Corp.',           weight: 4.1, score:65.3, return20d:+1.8,  rs20d:-1.4,  delta3d:-0.6, delta5d:-0.8, status:'complete' },
+    { ticker:'CRM',  name:'Salesforce Inc.',        weight: 3.8, score:62.9, return20d:-0.4,  rs20d:-3.8,  delta3d:-1.1, delta5d:-2.3, status:'complete' },
+    { ticker:'CSCO', name:'Cisco Systems',          weight: 3.3, score:58.7, return20d:-1.2,  rs20d:-4.6,  delta3d:-0.8, delta5d:-1.9, status:'pending'  },
+    { ticker:'ACN',  name:'Accenture PLC',          weight: 2.9, score:61.4, return20d:+1.1,  rs20d:-1.9,  delta3d:-0.2, delta5d:+0.3, status:'complete' },
+    { ticker:'QCOM', name:'Qualcomm Inc.',          weight: 2.6, score:76.2, return20d:+7.3,  rs20d:+2.9,  delta3d:+1.4, delta5d:+3.1, status:'complete' },
+  ],
+  semi: [
+    { ticker:'NVDA', name:'NVIDIA Corp.',           weight:22.1, score:91.2, return20d:+18.3, rs20d:+11.9, delta3d:+4.1, delta5d:+7.8, status:'complete' },
+    { ticker:'AVGO', name:'Broadcom Inc.',          weight:14.3, score:84.6, return20d:+10.4, rs20d:+5.1,  delta3d:+2.2, delta5d:+4.4, status:'complete' },
+    { ticker:'AMD',  name:'Advanced Micro Devices', weight: 9.6, score:88.1, return20d:+14.2, rs20d:+8.6,  delta3d:+3.3, delta5d:+6.2, status:'complete' },
+    { ticker:'QCOM', name:'Qualcomm Inc.',          weight: 7.2, score:76.2, return20d:+7.3,  rs20d:+2.9,  delta3d:+1.4, delta5d:+3.1, status:'complete' },
+    { ticker:'INTC', name:'Intel Corp.',            weight: 6.1, score:44.3, return20d:-8.1,  rs20d:-14.7, delta3d:-2.8, delta5d:-5.3, status:'complete' },
+    { ticker:'MU',   name:'Micron Technology',      weight: 5.8, score:86.9, return20d:+13.1, rs20d:+7.8,  delta3d:+3.0, delta5d:+5.8, status:'complete' },
+    { ticker:'AMAT', name:'Applied Materials',      weight: 5.3, score:74.4, return20d:+5.8,  rs20d:+1.4,  delta3d:+0.7, delta5d:+1.7, status:'complete' },
+    { ticker:'LRCX', name:'Lam Research',           weight: 4.9, score:78.1, return20d:+8.2,  rs20d:+3.8,  delta3d:+1.6, delta5d:+3.3, status:'complete' },
+    { ticker:'KLAC', name:'KLA Corp.',              weight: 4.6, score:76.8, return20d:+7.4,  rs20d:+3.1,  delta3d:+1.2, delta5d:+2.6, status:'complete' },
+    { ticker:'MRVL', name:'Marvell Technology',     weight: 3.8, score:82.4, return20d:+11.6, rs20d:+6.3,  delta3d:+2.5, delta5d:+4.9, status:'pending'  },
+  ],
+  'semi-equip': [
+    { ticker:'AMAT', name:'Applied Materials',      weight:22.8, score:74.4, return20d:+5.8,  rs20d:+1.4,  delta3d:+0.7, delta5d:+1.7, status:'complete' },
+    { ticker:'LRCX', name:'Lam Research',           weight:18.4, score:78.1, return20d:+8.2,  rs20d:+3.8,  delta3d:+1.6, delta5d:+3.3, status:'complete' },
+    { ticker:'KLAC', name:'KLA Corp.',              weight:16.2, score:76.8, return20d:+7.4,  rs20d:+3.1,  delta3d:+1.2, delta5d:+2.6, status:'complete' },
+    { ticker:'ASML', name:'ASML Holding',           weight:14.1, score:79.3, return20d:+9.1,  rs20d:+4.7,  delta3d:+1.9, delta5d:+3.8, status:'complete' },
+    { ticker:'ONTO', name:'Onto Innovation',        weight: 7.3, score:68.2, return20d:+3.2,  rs20d:-0.8,  delta3d:+0.2, delta5d:+0.9, status:'complete' },
+    { ticker:'TER',  name:'Teradyne Inc.',          weight: 6.8, score:64.1, return20d:+1.4,  rs20d:-2.6,  delta3d:-0.4, delta5d:-0.8, status:'missing'  },
+    { ticker:'MKSI', name:'MKS Instruments',        weight: 5.2, score:61.7, return20d:+0.8,  rs20d:-3.2,  delta3d:-0.6, delta5d:-1.4, status:'complete' },
+  ],
+  'semi-mem': [
+    { ticker:'MU',   name:'Micron Technology',      weight:38.4, score:86.9, return20d:+13.1, rs20d:+7.8,  delta3d:+3.0, delta5d:+5.8, status:'complete' },
+    { ticker:'WDC',  name:'Western Digital',        weight:22.1, score:83.2, return20d:+11.4, rs20d:+6.1,  delta3d:+2.6, delta5d:+5.1, status:'complete' },
+    { ticker:'STX',  name:'Seagate Technology',     weight:18.6, score:79.8, return20d:+9.3,  rs20d:+4.4,  delta3d:+2.0, delta5d:+4.1, status:'complete' },
+    { ticker:'SYNA', name:'Synaptics Inc.',         weight:11.3, score:71.4, return20d:+5.1,  rs20d:+0.8,  delta3d:+0.9, delta5d:+2.0, status:'pending'  },
+    { ticker:'NTAP', name:'NetApp Inc.',            weight: 9.6, score:66.3, return20d:+2.8,  rs20d:-1.4,  delta3d:+0.1, delta5d:+0.6, status:'complete' },
+  ],
+  'semi-compute': [
+    { ticker:'NVDA', name:'NVIDIA Corp.',           weight:48.2, score:91.2, return20d:+18.3, rs20d:+11.9, delta3d:+4.1, delta5d:+7.8, status:'complete' },
+    { ticker:'AMD',  name:'Advanced Micro Devices', weight:26.4, score:88.1, return20d:+14.2, rs20d:+8.6,  delta3d:+3.3, delta5d:+6.2, status:'complete' },
+    { ticker:'AVGO', name:'Broadcom Inc.',          weight:18.8, score:84.6, return20d:+10.4, rs20d:+5.1,  delta3d:+2.2, delta5d:+4.4, status:'complete' },
+    { ticker:'INTC', name:'Intel Corp.',            weight: 6.6, score:44.3, return20d:-8.1,  rs20d:-14.7, delta3d:-2.8, delta5d:-5.3, status:'complete' },
+  ],
+  'semi-conn': [
+    { ticker:'ANET', name:'Arista Networks',        weight:24.6, score:87.3, return20d:+12.8, rs20d:+7.4,  delta3d:+2.8, delta5d:+5.4, status:'complete' },
+    { ticker:'CSCO', name:'Cisco Systems',          weight:18.2, score:58.7, return20d:-1.2,  rs20d:-4.6,  delta3d:-0.8, delta5d:-1.9, status:'pending'  },
+    { ticker:'CRDO', name:'Credo Technology',       weight:14.3, score:89.6, return20d:+16.4, rs20d:+10.1, delta3d:+3.6, delta5d:+6.8, status:'complete' },
+    { ticker:'APH',  name:'Amphenol Corp.',         weight:12.8, score:76.4, return20d:+7.1,  rs20d:+2.8,  delta3d:+1.3, delta5d:+2.9, status:'complete' },
+    { ticker:'MTSI', name:'MACOM Technology',       weight: 9.6, score:82.1, return20d:+10.8, rs20d:+5.5,  delta3d:+2.1, delta5d:+4.2, status:'complete' },
+    { ticker:'LITE', name:'Lumentum Holdings',      weight: 8.4, score:84.7, return20d:+12.1, rs20d:+6.8,  delta3d:+2.4, delta5d:+4.8, status:'complete' },
+  ],
+  'conn-optical': [
+    { ticker:'CIEN', name:'Ciena Corp.',            weight:32.4, score:86.2, return20d:+13.4, rs20d:+7.1,  delta3d:+2.7, delta5d:+5.1, status:'complete' },
+    { ticker:'LITE', name:'Lumentum Holdings',      weight:28.6, score:84.7, return20d:+12.1, rs20d:+6.8,  delta3d:+2.4, delta5d:+4.8, status:'complete' },
+    { ticker:'AAOI', name:'Applied Optoelectronics',weight:18.3, score:79.4, return20d:+9.6,  rs20d:+4.3,  delta3d:+1.8, delta5d:+3.6, status:'complete' },
+    { ticker:'IIVI', name:'II-VI Incorporated',    weight:14.2, score:76.8, return20d:+7.8,  rs20d:+2.5,  delta3d:+1.4, delta5d:+2.9, status:'pending'  },
+    { ticker:'FNSR', name:'Finisar Corp.',          weight: 6.5, score:71.2, return20d:+5.3,  rs20d:+0.9,  delta3d:+0.8, delta5d:+1.9, status:'complete' },
+  ],
+  'conn-copper': [
+    { ticker:'CRDO', name:'Credo Technology',       weight:36.2, score:89.6, return20d:+16.4, rs20d:+10.1, delta3d:+3.6, delta5d:+6.8, status:'complete' },
+    { ticker:'APH',  name:'Amphenol Corp.',         weight:28.4, score:76.4, return20d:+7.1,  rs20d:+2.8,  delta3d:+1.3, delta5d:+2.9, status:'complete' },
+    { ticker:'MTSI', name:'MACOM Technology',       weight:20.1, score:82.1, return20d:+10.8, rs20d:+5.5,  delta3d:+2.1, delta5d:+4.2, status:'complete' },
+    { ticker:'SMTC', name:'Semtech Corp.',          weight: 9.6, score:68.3, return20d:+3.6,  rs20d:-0.4,  delta3d:+0.3, delta5d:+0.8, status:'complete' },
+    { ticker:'TEL',  name:'TE Connectivity',        weight: 5.7, score:64.7, return20d:+2.1,  rs20d:-1.8,  delta3d:-0.2, delta5d:+0.4, status:'missing'  },
+  ],
+  soft: [
+    { ticker:'MSFT', name:'Microsoft Corp.',        weight:22.4, score:69.8, return20d:+3.1,  rs20d:-0.2,  delta3d:-0.3, delta5d:+0.4, status:'complete' },
+    { ticker:'CRM',  name:'Salesforce Inc.',        weight:12.6, score:62.9, return20d:-0.4,  rs20d:-3.8,  delta3d:-1.1, delta5d:-2.3, status:'complete' },
+    { ticker:'ORCL', name:'Oracle Corp.',           weight:11.2, score:65.3, return20d:+1.8,  rs20d:-1.4,  delta3d:-0.6, delta5d:-0.8, status:'complete' },
+    { ticker:'ADBE', name:'Adobe Inc.',             weight: 9.8, score:58.4, return20d:-2.1,  rs20d:-5.4,  delta3d:-1.4, delta5d:-3.1, status:'complete' },
+    { ticker:'NOW',  name:'ServiceNow Inc.',        weight: 8.4, score:74.6, return20d:+6.2,  rs20d:+1.9,  delta3d:+1.1, delta5d:+2.4, status:'complete' },
+    { ticker:'WDAY', name:'Workday Inc.',           weight: 6.3, score:61.8, return20d:+0.6,  rs20d:-2.7,  delta3d:-0.7, delta5d:-1.6, status:'pending'  },
+    { ticker:'PANW', name:'Palo Alto Networks',     weight: 5.8, score:67.3, return20d:+2.8,  rs20d:-0.5,  delta3d:+0.1, delta5d:+0.6, status:'complete' },
+    { ticker:'CRWD', name:'CrowdStrike Holdings',   weight: 5.2, score:71.9, return20d:+5.4,  rs20d:+1.1,  delta3d:+0.8, delta5d:+1.9, status:'complete' },
+  ],
+  'soft-cloud': [
+    { ticker:'MSFT', name:'Microsoft Corp.',        weight:28.3, score:69.8, return20d:+3.1,  rs20d:-0.2,  delta3d:-0.3, delta5d:+0.4, status:'complete' },
+    { ticker:'AMZN', name:'Amazon.com Inc.',        weight:22.1, score:73.4, return20d:+6.1,  rs20d:+2.8,  delta3d:+1.2, delta5d:+2.6, status:'complete' },
+    { ticker:'GOOG', name:'Alphabet Inc.',          weight:18.6, score:68.1, return20d:+2.6,  rs20d:-0.7,  delta3d:-0.4, delta5d:+0.2, status:'complete' },
+    { ticker:'SNOW', name:'Snowflake Inc.',         weight:12.4, score:76.8, return20d:+8.4,  rs20d:+4.1,  delta3d:+1.7, delta5d:+3.4, status:'complete' },
+    { ticker:'DDOG', name:'Datadog Inc.',           weight: 9.8, score:72.3, return20d:+5.8,  rs20d:+2.4,  delta3d:+1.0, delta5d:+2.1, status:'pending'  },
+    { ticker:'MDB',  name:'MongoDB Inc.',           weight: 8.8, score:64.4, return20d:+1.3,  rs20d:-2.0,  delta3d:-0.5, delta5d:-1.1, status:'complete' },
+  ],
+  'soft-cyber': [
+    { ticker:'CRWD', name:'CrowdStrike Holdings',   weight:26.4, score:71.9, return20d:+5.4,  rs20d:+1.1,  delta3d:+0.8, delta5d:+1.9, status:'complete' },
+    { ticker:'PANW', name:'Palo Alto Networks',     weight:22.8, score:67.3, return20d:+2.8,  rs20d:-0.5,  delta3d:+0.1, delta5d:+0.6, status:'complete' },
+    { ticker:'FTNT', name:'Fortinet Inc.',          weight:18.3, score:58.6, return20d:-2.4,  rs20d:-5.7,  delta3d:-1.6, delta5d:-3.4, status:'complete' },
+    { ticker:'ZS',   name:'Zscaler Inc.',           weight:14.2, score:62.1, return20d:+0.2,  rs20d:-3.1,  delta3d:-0.8, delta5d:-1.8, status:'pending'  },
+    { ticker:'CYBR', name:'CyberArk Software',      weight:10.6, score:65.8, return20d:+2.1,  rs20d:-1.2,  delta3d:-0.3, delta5d:+0.4, status:'complete' },
+    { ticker:'S',    name:'SentinelOne Inc.',       weight: 7.7, score:54.2, return20d:-4.8,  rs20d:-8.1,  delta3d:-2.1, delta5d:-4.6, status:'missing'  },
+  ],
+  hw: [
+    { ticker:'AAPL', name:'Apple Inc.',             weight:42.3, score:71.4, return20d:+4.2,  rs20d:+0.8,  delta3d:+0.9, delta5d:+2.1, status:'complete' },
+    { ticker:'HPQ',  name:'HP Inc.',                weight:18.6, score:52.3, return20d:-5.4,  rs20d:-8.9,  delta3d:-2.1, delta5d:-4.2, status:'complete' },
+    { ticker:'DELL', name:'Dell Technologies',      weight:16.2, score:58.1, return20d:-2.8,  rs20d:-6.2,  delta3d:-1.4, delta5d:-3.1, status:'complete' },
+    { ticker:'NTAP', name:'NetApp Inc.',            weight:13.4, score:66.3, return20d:+2.8,  rs20d:-1.4,  delta3d:+0.1, delta5d:+0.6, status:'complete' },
+    { ticker:'STX',  name:'Seagate Technology',     weight: 9.5, score:61.8, return20d:+0.6,  rs20d:-2.7,  delta3d:-0.6, delta5d:-1.4, status:'pending'  },
+  ],
+};
+
+// Flatten all nodes
+function flattenNodes(nodes, result = []) {
+  for (const node of nodes) {
+    result.push(node);
+    if (node.children && node.children.length) flattenNodes(node.children, result);
+  }
+  return result;
+}
+const ALL_NODES = flattenNodes(NODE_TREE);
+
+// Mock trend data generator
+function genTrendData(nodeId, period) {
+  const pts = period === '5d' ? 25 : period === '20d' ? 100 : 315;
+  const seeds = { XLK: 0, semi: 4, soft: -3, hw: -8, 'semi-mem': 9, 'semi-compute': 12, 'semi-conn': 6, 'semi-equip': 2, 'conn-optical': 7, 'conn-copper': 3, 'soft-cloud': 1, 'soft-cyber': -5 };
+  const seed = seeds[nodeId] ?? 0;
+  const arr = [];
+  let v = 0;
+  for (let i = 0; i < pts; i++) {
+    v += (Math.random() - 0.46) * 0.8 + seed * 0.03;
+    arr.push(+v.toFixed(2));
+  }
+  return arr;
+}
+
+// ─── Icons ──────────────────────────────────────────────────────────────────
+
+const Icon = {
+  ChevronRight: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="9 18 15 12 9 6"/></svg>,
+  ChevronDown: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="6 9 12 15 18 9"/></svg>,
+  Back: () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="15 18 9 12 15 6"/></svg>,
+  Refresh: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="23 4 23 10 17 10"/><path d="M1 20l4.64-4.36A9 9 0 0 0 20.49 15M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/></svg>,
+  Tree: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>,
+  Link: () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>,
+  Flame: () => <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/></svg>,
+  BarChart: () => <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>,
+  TrendUp: () => <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>,
+  Info: () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>,
+  Layers: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>,
+};
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+function scoreClass(s) {
+  if (s >= 85) return 'score-high';
+  if (s >= 70) return 'score-mid';
+  if (s >= 60) return 'score-low';
+  return 'score-base';
+}
+
+function deltaColor(v) {
+  if (v === null || v === undefined) return '#94a3b8';
+  return v > 0 ? '#22c55e' : v < 0 ? '#ef4444' : '#94a3b8';
+}
+
+function fmtDelta(v, suffix = '') {
+  if (v === null || v === undefined) return '--';
+  return (v > 0 ? '+' : '') + v.toFixed(1) + suffix;
+}
+
+// ─── Mini Sparkline ─────────────────────────────────────────────────────────
+
+function Sparkline({ data, color = '#3b82f6', width = 60, height = 24 }) {
+  if (!data || data.length < 2) return <span style={{ display: 'inline-block', width, height }} />;
+  const min = Math.min(...data), max = Math.max(...data);
+  const range = max - min || 1;
+  const pts = data.map((v, i) => {
+    const x = (i / (data.length - 1)) * width;
+    const y = height - ((v - min) / range) * (height - 2) - 1;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  return (
+    <svg width={width} height={height} style={{ display: 'block' }}>
+      <polyline points={pts} fill="none" stroke={color} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+// ─── Trend Chart ────────────────────────────────────────────────────────────
+
+function TrendChart({ selectedNode, period }) {
+  const series = useMemo(() => {
+    const colors = { node: '#3b82f6', parent: '#8b5cf6', spy: '#94a3b8' };
+    const parentId = (() => {
+      const nodeId = selectedNode.id;
+      function findParent(nodes, id, parent = null) {
+        for (const node of nodes) {
+          if (node.id === id) return parent?.id ?? null;
+          if (node.children?.length) {
+            const found = findParent(node.children, id, node);
+            if (found !== undefined) return found;
+          }
+        }
+        return undefined;
+      }
+      return findParent(NODE_TREE, nodeId) ?? 'XLK';
+    })();
+
+    return [
+      { label: selectedNode.proxy || selectedNode.proxyLabel || selectedNode.label, color: colors.node, data: genTrendData(selectedNode.id, period) },
+      parentId && parentId !== selectedNode.id ? { label: parentId, color: colors.parent, data: genTrendData(parentId, period) } : null,
+      { label: 'SPY', color: colors.spy, data: genTrendData('spy', period) },
+    ].filter(Boolean);
+  }, [selectedNode.id, period]);
+
+  const W = 600, H = 200, PAD = { t: 12, r: 16, b: 28, l: 44 };
+  const chartW = W - PAD.l - PAD.r;
+  const chartH = H - PAD.t - PAD.b;
+
+  const allVals = series.flatMap(s => s.data);
+  const minV = Math.min(...allVals), maxV = Math.max(...allVals);
+  const range = maxV - minV || 1;
+
+  function toX(i, len) { return PAD.l + (i / (len - 1)) * chartW; }
+  function toY(v) { return PAD.t + chartH - ((v - minV) / range) * chartH; }
+
+  const pts = (data) => data.map((v, i) => `${toX(i, data.length).toFixed(1)},${toY(v).toFixed(1)}`).join(' ');
+
+  // Y gridlines
+  const gridVals = [minV, (minV + maxV) / 2, maxV];
+
+  const pts20d = series[0].data.length;
+  // X-axis labels
+  const xLabels = (() => {
+    if (period === '5d') return ['5日前', '4日', '3日', '2日', '昨日', '今日'];
+    if (period === '20d') return ['20日前', '15日', '10日', '5日', '今日'];
+    return ['63日前', '45日', '30日', '15日', '今日'];
+  })();
+
+  return (
+    <div style={{ width: '100%', overflowX: 'hidden' }}>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: 'auto' }}>
+        {/* Grid */}
+        {gridVals.map((v, i) => (
+          <g key={i}>
+            <line x1={PAD.l} y1={toY(v)} x2={W - PAD.r} y2={toY(v)} stroke="#e2e8f0" strokeWidth="1" />
+            <text x={PAD.l - 6} y={toY(v) + 4} textAnchor="end" fontSize="10" fill="#94a3b8">
+              {v > 0 ? '+' : ''}{v.toFixed(1)}
+            </text>
+          </g>
+        ))}
+        {/* Zero line */}
+        {minV < 0 && maxV > 0 && (
+          <line x1={PAD.l} y1={toY(0)} x2={W - PAD.r} y2={toY(0)} stroke="#cbd5e1" strokeWidth="1" strokeDasharray="4,3" />
+        )}
+        {/* Series */}
+        {series.map((s, i) => (
+          <polyline key={i} points={pts(s.data)} fill="none" stroke={s.color} strokeWidth={i === 0 ? 2 : 1.5} strokeLinecap="round" strokeLinejoin="round" opacity={i === 0 ? 1 : 0.6} />
+        ))}
+        {/* X labels */}
+        {xLabels.map((lbl, i) => {
+          const x = PAD.l + (i / (xLabels.length - 1)) * chartW;
+          return <text key={i} x={x} y={H - 6} textAnchor="middle" fontSize="10" fill="#94a3b8">{lbl}</text>;
+        })}
+      </svg>
+      {/* Legend */}
+      <div style={{ display: 'flex', gap: 16, paddingLeft: PAD.l, marginTop: 4 }}>
+        {series.map((s, i) => (
+          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+            <div style={{ width: 20, height: 2.5, borderRadius: 2, background: s.color, opacity: i === 0 ? 1 : 0.65 }} />
+            <span style={{ fontSize: 11, color: '#475569' }}>{s.label}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── Node Tree Item ──────────────────────────────────────────────────────────
+
+function NodeItem({ node, selectedId, onSelect, expandedIds, onToggle }) {
+  const isSelected = selectedId === node.id;
+  const hasChildren = node.children && node.children.length > 0;
+  const isExpanded = expandedIds.has(node.id);
+  const indent = node.level * 16;
+  const sparkData = useMemo(() => genTrendData(node.id, '20d').slice(-30), [node.id]);
+
+  return (
+    <div>
+      <div
+        onClick={() => { onSelect(node); if (hasChildren) onToggle(node.id); }}
+        className="transition-all"
+        style={{
+          display: 'flex', alignItems: 'center', gap: 8,
+          padding: '8px 12px', paddingLeft: 12 + indent,
+          cursor: 'pointer', borderRadius: 8, margin: '1px 6px',
+          border: isSelected ? '1px solid var(--accent-blue)' : '1px solid transparent',
+          background: isSelected
+            ? 'linear-gradient(135deg, rgba(37,99,235,0.07), rgba(147,51,234,0.07))'
+            : 'transparent',
+        }}
+        onMouseEnter={e => { if (!isSelected) e.currentTarget.style.background = '#f1f5f9'; }}
+        onMouseLeave={e => { if (!isSelected) e.currentTarget.style.background = 'transparent'; }}
+      >
+        {/* Expand toggle */}
+        <span style={{ width: 14, color: '#94a3b8', flexShrink: 0 }}>
+          {hasChildren
+            ? (isExpanded ? <Icon.ChevronDown /> : <Icon.ChevronRight />)
+            : <span style={{ display: 'inline-block', width: 14 }} />}
+        </span>
+
+        {/* Name */}
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <span style={{ fontWeight: isSelected ? 700 : 500, fontSize: 13, color: isSelected ? '#1e293b' : '#334155', whiteSpace: 'nowrap' }}>
+              {node.label}
+            </span>
+            {node.proxy && (
+              <span className="proxy-tag" style={{ background: node.proxyType === 'etf' ? 'rgba(59,130,246,0.1)' : 'rgba(245,158,11,0.1)', color: node.proxyType === 'etf' ? '#2563eb' : '#d97706' }}>
+                {node.proxyType === 'etf' ? node.proxy : '合成'}
+              </span>
+            )}
+            {!node.proxy && node.proxyType === 'synthetic' && (
+              <span className="proxy-tag" style={{ background: 'rgba(245,158,11,0.1)', color: '#d97706' }}>合成</span>
+            )}
+          </div>
+          <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            {node.sublabel}
+          </div>
+        </div>
+
+        {/* Score + sparkline */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+          <Sparkline data={sparkData} color={node.score >= 80 ? '#22c55e' : node.score >= 65 ? '#3b82f6' : '#f59e0b'} width={44} height={18} />
+          <span className={scoreClass(node.score)} style={{ fontWeight: 700, fontSize: 13, minWidth: 28, textAlign: 'right' }}>
+            {node.score.toFixed(0)}
+          </span>
+        </div>
+      </div>
+
+      {/* Children */}
+      {hasChildren && isExpanded && (
+        <div>
+          {node.children.map(child => (
+            <NodeItem key={child.id} node={child} selectedId={selectedId} onSelect={onSelect} expandedIds={expandedIds} onToggle={onToggle} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Contribution Bar ────────────────────────────────────────────────────────
+
+function ContribBar({ value, max = 100, color = '#3b82f6' }) {
+  return (
+    <div style={{ height: 5, background: '#e2e8f0', borderRadius: 3, overflow: 'hidden', flex: 1 }}>
+      <div style={{ height: '100%', width: `${Math.min(100, (value / max) * 100)}%`, background: color, borderRadius: 3, transition: 'width 0.3s ease' }} />
+    </div>
+  );
+}
+
+// ─── Node Detail Panel ────────────────────────────────────────────────────────
+
+function NodeDetailPanel({ node, period }) {
+  if (!node) return null;
+  const sparkData = useMemo(() => genTrendData(node.id, period), [node.id, period]);
+  const siblingsData = useMemo(() => {
+    // find parent's children as siblings
+    function findSiblings(nodes, targetId) {
+      for (const n of nodes) {
+        if (n.children?.some(c => c.id === targetId)) return n.children;
+        if (n.children?.length) {
+          const found = findSiblings(n.children, targetId);
+          if (found) return found;
+        }
+      }
+      return null;
+    }
+    return findSiblings(NODE_TREE, node.id) || [];
+  }, [node.id]);
+
+  const relVal = node.scoreVsParent;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12, height: '100%', overflowY: 'auto' }}>
+      {/* Header card */}
+      <div style={{ background: '#fff', border: '1px solid var(--border-light)', borderRadius: 14, padding: '14px' }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 12 }}>
+          <div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+              <span style={{ fontSize: 17, fontWeight: 700, color: '#1e293b' }}>{node.label}</span>
+              {node.proxy && node.proxyType === 'etf' && (
+                <span style={{ fontSize: 12, padding: '2px 8px', borderRadius: 6, background: 'rgba(59,130,246,0.08)', color: '#2563eb', fontWeight: 600 }}>
+                  {node.proxy}
+                </span>
+              )}
+              {node.proxyType === 'synthetic' && (
+                <span style={{ fontSize: 11, padding: '2px 8px', borderRadius: 6, background: 'rgba(245,158,11,0.08)', color: '#d97706', fontWeight: 600 }}>
+                  合成篮
+                </span>
+              )}
+            </div>
+            <div style={{ fontSize: 12, color: '#64748b' }}>{node.sublabel}</div>
+            {node.proxyType === 'synthetic' && (
+              <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 3 }}>{node.proxyLabel}</div>
+            )}
+          </div>
+          <div style={{ textAlign: 'right' }}>
+            <div className={scoreClass(node.score)} style={{ fontSize: 30, fontWeight: 700, lineHeight: 1 }}>
+              {node.score.toFixed(1)}
+            </div>
+            <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 2 }}>综合分</div>
+          </div>
+        </div>
+
+        {/* 4 metrics */}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+          {[
+            { label: '相对母节点', value: relVal !== null ? fmtDelta(relVal, '分') : '--', color: deltaColor(relVal) },
+            { label: '相对强度', value: node.relStrength, color: parseFloat(node.relStrength) >= 0 ? '#22c55e' : '#ef4444' },
+            { label: '3D Δ分', value: fmtDelta(node.delta3d, ''), color: deltaColor(node.delta3d) },
+            { label: '5D Δ分', value: fmtDelta(node.delta5d, ''), color: deltaColor(node.delta5d) },
+          ].map(m => (
+            <div key={m.label} style={{ background: '#f8fafc', borderRadius: 8, padding: '7px 10px', border: '1px solid #f1f5f9' }}>
+              <div style={{ fontSize: 10, color: '#94a3b8', marginBottom: 3 }}>{m.label}</div>
+              <div style={{ fontSize: 14, fontWeight: 700, color: m.color, fontFeatureSettings: '"tnum"' }}>{m.value}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Contribution + Breadth */}
+      {node.contribution !== null && (
+        <div style={{ background: '#fff', border: '1px solid var(--border-light)', borderRadius: 14, padding: '14px' }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: '#475569', marginBottom: 12 }}>节点贡献与广度</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                <span style={{ fontSize: 12, color: '#64748b' }}>对母板块贡献</span>
+                <span style={{ fontSize: 12, fontWeight: 700, color: '#2563eb' }}>{node.contribution}%</span>
+              </div>
+              <ContribBar value={node.contribution} max={100} color="#3b82f6" />
+            </div>
+            <div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                <span style={{ fontSize: 12, color: '#64748b' }}>持仓广度 (>50MA)</span>
+                <span style={{ fontSize: 12, fontWeight: 700, color: node.breadth >= 70 ? '#22c55e' : node.breadth >= 50 ? '#2563eb' : '#d97706' }}>
+                  {node.breadth}%
+                </span>
+              </div>
+              <ContribBar value={node.breadth} max={100} color={node.breadth >= 70 ? '#22c55e' : node.breadth >= 50 ? '#3b82f6' : '#f59e0b'} />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Sibling rankings */}
+      {siblingsData.length > 0 && (
+        <div style={{ background: '#fff', border: '1px solid var(--border-light)', borderRadius: 14, padding: '14px' }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: '#475569', marginBottom: 12 }}>同层节点排名</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {[...siblingsData].sort((a, b) => b.score - a.score).map((sib, i) => (
+              <div key={sib.id} style={{
+                display: 'flex', alignItems: 'center', gap: 10,
+                padding: '7px 10px', borderRadius: 8,
+                background: sib.id === node.id ? 'rgba(37,99,235,0.06)' : 'transparent',
+                border: sib.id === node.id ? '1px solid rgba(59,130,246,0.2)' : '1px solid transparent',
+              }}>
+                <span style={{ fontSize: 11, color: '#94a3b8', minWidth: 16, textAlign: 'center' }}>#{i + 1}</span>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 12, fontWeight: sib.id === node.id ? 700 : 500, color: '#334155' }}>{sib.label}</div>
+                  {sib.proxy && <div style={{ fontSize: 10, color: '#94a3b8' }}>{sib.proxyType === 'etf' ? sib.proxy : '合成篮'}</div>}
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <Sparkline data={genTrendData(sib.id, '20d').slice(-20)} color={sib.score >= 80 ? '#22c55e' : '#3b82f6'} width={36} height={16} />
+                  <span className={scoreClass(sib.score)} style={{ fontSize: 13, fontWeight: 700, minWidth: 28, textAlign: 'right' }}>
+                    {sib.score.toFixed(0)}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Holdings compact */}
+      {(NODE_HOLDINGS[node.id] || []).length > 0 && (
+        <div style={{ background: '#fff', border: '1px solid var(--border-light)', borderRadius: 16, padding: '16px 20px' }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: '#475569', marginBottom: 10 }}>持仓标的 Top 5</div>
+          <StockHoldingsTable nodeId={node.id} compact />
+        </div>
+      )}
+
+      {/* Children quick view */}
+      {node.children && node.children.length > 0 && (
+        <div style={{ background: '#fff', border: '1px solid var(--border-light)', borderRadius: 16, padding: '16px 20px' }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: '#475569', marginBottom: 12 }}>子节点概览</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {[...node.children].sort((a, b) => b.score - a.score).map(child => (
+              <div key={child.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '6px 8px', borderRadius: 8, background: '#f8fafc' }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 12, fontWeight: 500, color: '#334155' }}>{child.label}</div>
+                  <div style={{ fontSize: 10, color: '#94a3b8' }}>{child.proxyType === 'etf' ? child.proxy : child.proxyLabel}</div>
+                </div>
+                <span style={{ fontSize: 11, color: deltaColor(child.delta5d), fontWeight: 600 }}>{fmtDelta(child.delta5d, '')}</span>
+                <span className={scoreClass(child.score)} style={{ fontSize: 13, fontWeight: 700, minWidth: 28, textAlign: 'right' }}>
+                  {child.score.toFixed(0)}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Chain View (full-body layout) ──────────────────────────────────────────────────
+
+// Node layout for SVG (cx/cy = center)
+const CN_NODES = [
+  { id: 'XLK',          cx: 380, cy: 44,  w: 122, h: 46, role: 'sector' },
+  { id: 'semi',         cx: 150, cy: 132, w: 110, h: 44, role: 'upstream' },
+  { id: 'soft',         cx: 385, cy: 132, w: 100, h: 44, role: 'platform' },
+  { id: 'hw',           cx: 614, cy: 132, w: 104, h: 44, role: 'upstream' },
+  { id: 'semi-equip',   cx: 44,  cy: 218, w: 88,  h: 40, role: 'upstream' },
+  { id: 'semi-compute', cx: 146, cy: 218, w: 88,  h: 40, role: 'compute' },
+  { id: 'semi-mem',     cx: 248, cy: 218, w: 88,  h: 40, role: 'memory' },
+  { id: 'semi-conn',    cx: 350, cy: 218, w: 88,  h: 40, role: 'interconnect' },
+  { id: 'soft-cloud',   cx: 466, cy: 218, w: 94,  h: 40, role: 'platform' },
+  { id: 'soft-cyber',   cx: 572, cy: 218, w: 94,  h: 40, role: 'application' },
+  { id: 'conn-optical', cx: 296, cy: 304, w: 102, h: 40, role: 'leaf' },
+  { id: 'conn-copper',  cx: 410, cy: 304, w: 92,  h: 40, role: 'leaf' },
+];
+
+const CN_EDGES = [
+  { from: 'XLK',       to: 'semi' },
+  { from: 'XLK',       to: 'soft' },
+  { from: 'XLK',       to: 'hw' },
+  { from: 'semi',      to: 'semi-equip' },
+  { from: 'semi',      to: 'semi-compute' },
+  { from: 'semi',      to: 'semi-mem' },
+  { from: 'semi',      to: 'semi-conn' },
+  { from: 'soft',      to: 'soft-cloud' },
+  { from: 'soft',      to: 'soft-cyber' },
+  { from: 'semi-conn', to: 'conn-optical' },
+  { from: 'semi-conn', to: 'conn-copper' },
+  { from: 'hw',        to: 'semi-conn', cross: true },
+];
+
+const CN_ROLE_COLORS = {
+  sector: '#1e293b', upstream: '#8b5cf6', compute: '#2563eb', memory: '#3b82f6',
+  interconnect: '#f59e0b', platform: '#22c55e', application: '#10b981', leaf: '#94a3b8',
+};
+
+function scoreTierStyle(score) {
+  if (score >= 85) return { border: '#059669', bg: 'rgba(5,150,105,0.07)',   text: '#059669' };
+  if (score >= 70) return { border: '#3b82f6', bg: 'rgba(59,130,246,0.07)', text: '#2563eb' };
+  if (score >= 60) return { border: '#d97706', bg: 'rgba(217,119,6,0.07)',   text: '#d97706' };
+  return              { border: '#cbd5e1', bg: 'rgba(148,163,184,0.05)', text: '#64748b' };
+}
+
+// ── Strategic Panel (right side of ChainView) ───────────────────────────────────
+
+function StrategicPanel({ selectedNode, onSelect, period }) {
+  const sm = useMemo(() => {
+    const m = {};
+    ALL_NODES.forEach(n => { m[n.id] = n; });
+    return m;
+  }, []);
+
+  const l1Ranking = useMemo(() =>
+    [sm['semi'], sm['soft'], sm['hw']].filter(Boolean).sort((a,b) => b.score - a.score),
+  [sm]);
+
+  const topL1 = l1Ranking[0];
+  const topL1Children = topL1?.children || [];
+  const strongChildren = topL1Children.filter(c => (sm[c.id]?.score ?? c.score) > 75);
+  const breadthLabel = strongChildren.length >= 3 ? '全面扩散' : strongChildren.length === 2 ? '主线驱动' : '单点拉动';
+  const breadthColor = strongChildren.length >= 3 ? '#059669' : strongChildren.length === 2 ? '#2563eb' : '#d97706';
+
+  const equipScore   = sm['semi-equip']?.score ?? 0;
+  const connScore    = sm['semi-conn']?.score ?? 0;
+  const computeScore = sm['semi-compute']?.score ?? 0;
+  const computeLeading = computeScore > equipScore && computeScore > connScore;
+
+  const l2Nodes = ['semi-equip','semi-compute','semi-mem','semi-conn','soft-cloud','soft-cyber'].map(id => sm[id]).filter(Boolean);
+  const bestDrill = l2Nodes.reduce((best, n) => (!best || (n.delta5d ?? -99) > (best.delta5d ?? -99)) ? n : best, null);
+
+  const QBadge = ({ n }) => (
+    <span style={{ background: '#f1f5f9', color: '#475569', width: 18, height: 18, borderRadius: 5,
+      display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: 10, fontWeight: 700, flexShrink: 0 }}>Q{n}</span>
+  );
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      {/* Header */}
+      <div style={{ padding: '12px 16px', background: 'linear-gradient(135deg,#f8fafc,#eff6ff)', borderRadius: 14, border: '1px solid #e2e8f0' }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: '#1e293b', marginBottom: 3 }}>下钔策略分析</div>
+        <div style={{ fontSize: 11, color: '#64748b' }}>基于 {topL1?.label ?? '--'} 当前动能结构自动计算</div>
+      </div>
+
+      {/* Q1: L1 ranking */}
+      <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 14, padding: '12px 14px' }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: '#94a3b8', marginBottom: 10, display: 'flex', alignItems: 'center', gap: 6 }}>
+          <QBadge n={1} /> 一级节点谁最强？
+        </div>
+        {l1Ranking.map((node, i) => {
+          const tier = scoreTierStyle(node.score);
+          return (
+            <div key={node.id} onClick={() => onSelect(node)}
+              style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: i < l1Ranking.length-1 ? 8 : 0, cursor: 'pointer' }}>
+              <span style={{ fontSize: 11, color: '#94a3b8', width: 16, fontWeight: 700 }}>#{i+1}</span>
+              <div style={{ flex: 1 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                  <span style={{ fontSize: 12, fontWeight: 600, color: '#1e293b' }}>{node.label}</span>
+                  <span style={{ fontSize: 12, fontWeight: 700, color: tier.text }}>{node.score.toFixed(1)}</span>
+                </div>
+                <div style={{ height: 4, background: '#f1f5f9', borderRadius: 2, overflow: 'hidden' }}>
+                  <div style={{ height: '100%', width: `${node.score}%`, background: tier.border, borderRadius: 2, transition: 'width 0.5s ease' }} />
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Q2: breadth */}
+      <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 14, padding: '12px 14px' }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: '#94a3b8', marginBottom: 10, display: 'flex', alignItems: 'center', gap: 6 }}>
+          <QBadge n={2} /> {topL1?.label} 内部广还是窄？
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+          <span style={{ fontSize: 16, fontWeight: 800, color: breadthColor }}>{breadthLabel}</span>
+          <span style={{ fontSize: 11, color: '#64748b' }}>{strongChildren.length}/{topL1Children.length} 个子节点 &gt;75分</span>
+        </div>
+        <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+          {topL1Children.map(c => {
+            const cn = sm[c.id] || c;
+            const strong = cn.score > 75;
+            return (
+              <div key={c.id} onClick={() => onSelect(cn)}
+                style={{ padding: '3px 9px', borderRadius: 20, fontSize: 11, cursor: 'pointer',
+                  background: strong ? 'rgba(5,150,105,0.08)' : 'rgba(148,163,184,0.08)',
+                  border: `1px solid ${strong ? 'rgba(5,150,105,0.25)' : '#e2e8f0'}`,
+                  color: strong ? '#059669' : '#94a3b8', fontWeight: 500 }}>
+                {cn.label} <span style={{ fontWeight: 700 }}>{cn.score.toFixed(0)}</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Q3: upstream/downstream */}
+      <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 14, padding: '12px 14px' }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: '#94a3b8', marginBottom: 10, display: 'flex', alignItems: 'center', gap: 6 }}>
+          <QBadge n={3} /> 上下游是否开始确认？
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {[
+            { label: '上游设备', score: equipScore, ok: equipScore > 70 },
+            { label: '高速互联', score: connScore,  ok: connScore > 70 },
+          ].map(item => (
+            <div key={item.label} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <div style={{ width: 66, display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
+                <span style={{ fontSize: 11, color: item.ok ? '#059669' : '#d97706', fontWeight: 700 }}>{item.ok ? '✓' : '○'}</span>
+                <span style={{ fontSize: 11, color: '#475569' }}>{item.label}</span>
+              </div>
+              <div style={{ flex: 1, height: 4, background: '#f1f5f9', borderRadius: 2, overflow: 'hidden' }}>
+                <div style={{ height: '100%', width: `${item.score}%`, background: item.ok ? '#22c55e' : '#f59e0b', borderRadius: 2 }} />
+              </div>
+              <span style={{ fontSize: 11, fontWeight: 700, color: item.ok ? '#059669' : '#d97706', minWidth: 24, textAlign: 'right', flexShrink: 0 }}>{item.score.toFixed(0)}</span>
+            </div>
+          ))}
+          <div style={{ marginTop: 2, padding: '7px 10px', borderRadius: 8, fontSize: 11, lineHeight: 1.5,
+            background: computeLeading ? 'rgba(37,99,235,0.06)' : 'rgba(5,150,105,0.06)',
+            color: computeLeading ? '#2563eb' : '#059669', border: `1px solid ${computeLeading ? 'rgba(59,130,246,0.15)' : 'rgba(5,150,105,0.15)'}` }}>
+            {computeLeading
+              ? '⚡ 算力领涨，设备 / 连接尚在跟进中，属主线扩散中段'
+              : '✔️ 上下游联动信号已出现，全链景气提升中'}
+          </div>
+        </div>
+      </div>
+
+      {/* Q4: drill recommendation */}
+      <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 14, padding: '12px 14px' }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: '#94a3b8', marginBottom: 10, display: 'flex', alignItems: 'center', gap: 6 }}>
+          <QBadge n={4} /> 建议下钔方向？
+        </div>
+        {bestDrill && (
+          <div onClick={() => onSelect(bestDrill)}
+            style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px',
+              borderRadius: 10, background: 'rgba(37,99,235,0.05)', border: '1px solid rgba(59,130,246,0.2)' }}>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: '#1e293b' }}>{bestDrill.label}</div>
+              <div style={{ fontSize: 10, color: '#64748b', marginTop: 2 }}>{bestDrill.sublabel}</div>
+            </div>
+            <div style={{ textAlign: 'right', flexShrink: 0 }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: '#22c55e' }}>5D {bestDrill.delta5d > 0 ? '+' : ''}{bestDrill.delta5d?.toFixed(1)}</div>
+              <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 1 }}>动能最强</div>
+            </div>
+            <span style={{ color: '#3b82f6', fontSize: 16, marginLeft: 4 }}>→</span>
+          </div>
+        )}
+      </div>
+
+      {/* Selected node quick detail */}
+      {selectedNode && (
+        <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 14, padding: '12px 14px' }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: '#94a3b8', marginBottom: 10 }}>当前选中节点</div>
+          <NodeDetailPanel node={selectedNode} period={period} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Chain Graph Canvas (SVG) + full-body ChainView ───────────────────────────────
+
+function ChainView({ selectedNode, onSelect, onBackToGics, period, setPeriod }) {
+  const [hoverId, setHoverId] = useState(null);
+  const scoreMap = useMemo(() => {
+    const m = {};
+    ALL_NODES.forEach(n => { m[n.id] = n; });
+    return m;
+  }, []);
+  const nodeMap = useMemo(() => {
+    const m = {};
+    CN_NODES.forEach(n => { m[n.id] = n; });
+    return m;
+  }, []);
+
+  const sig = useMemo(() => {
+    const s = id => scoreMap[id]?.score ?? 0;
+    const upstreamOk   = s('semi-equip') > 70;
+    const broadOk      = ['semi-equip','semi-compute','semi-mem','semi-conn'].filter(id => s(id) > 75).length >= 3;
+    const downstreamOk = s('conn-optical') > 75 || s('conn-copper') > 75;
+    const n = [upstreamOk, broadOk, downstreamOk].filter(Boolean).length;
+    return {
+      upstream: upstreamOk, broad: broadOk, downstream: downstreamOk,
+      label: ['链条断裂','单点拉动','主线扩散','全链共振'][n],
+      color: ['#dc2626','#d97706','#2563eb','#059669'][n],
+    };
+  }, [scoreMap]);
+
+  const VW = 760, VH = 350;
+
+  return (
+    <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
+
+      {/* ── LEFT: Graph ── */}
+      <div style={{ flex: 3, display: 'flex', flexDirection: 'column', borderRight: '1px solid #e2e8f0', overflow: 'hidden', minWidth: 0 }}>
+
+        {/* Toolbar */}
+        <div style={{ padding: '10px 18px', borderBottom: '1px solid #e2e8f0', background: '#fff', display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
+          <button onClick={onBackToGics} style={{
+            display: 'flex', alignItems: 'center', gap: 5, padding: '5px 10px', borderRadius: 6,
+            border: '1px solid #e2e8f0', background: '#f8fafc', fontSize: 11, color: '#475569',
+            cursor: 'pointer', fontFamily: 'inherit', fontWeight: 500,
+          }}>← GICS 分类视图</button>
+
+          <div style={{ width: 1, height: 16, background: '#e2e8f0' }} />
+          <span style={{ fontSize: 13, fontWeight: 700, color: '#1e293b' }}>XLK 产业链图</span>
+          <span style={{ fontSize: 11, color: '#94a3b8' }}>点击节点查看详情分析</span>
+
+          {/* Signal badges */}
+          <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6 }}>
+            {[
+              { label: '上游共振', ok: sig.upstream },
+              { label: '同层扩散', ok: sig.broad },
+              { label: '下游确认', ok: sig.downstream },
+            ].map(s => (
+              <div key={s.label} style={{
+                display: 'flex', alignItems: 'center', gap: 4, padding: '4px 10px', borderRadius: 20,
+                background: s.ok ? 'rgba(34,197,94,0.08)' : 'rgba(245,158,11,0.07)',
+                border: `1px solid ${s.ok ? 'rgba(34,197,94,0.22)' : 'rgba(245,158,11,0.22)'}`,
+              }}>
+                <span style={{ fontSize: 11, color: s.ok ? '#059669' : '#d97706', fontWeight: 700 }}>{s.ok ? '✓' : '○'}</span>
+                <span style={{ fontSize: 11, color: s.ok ? '#059669' : '#d97706', fontWeight: 500 }}>{s.label}</span>
+              </div>
+            ))}
+            <div style={{
+              padding: '4px 12px', borderRadius: 20, fontSize: 12, fontWeight: 700,
+              color: sig.color, background: `${sig.color}18`, border: `1px solid ${sig.color}40`,
+            }}>{sig.label}</div>
+          </div>
+        </div>
+
+        {/* SVG Graph */}
+        <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', background: '#fafbfc' }}>
+          <svg viewBox={`0 0 ${VW} ${VH}`} style={{ width: '100%', flex: 1, display: 'block' }} preserveAspectRatio="xMidYMid meet">
+
+            {/* Tier bands */}
+            {[
+              { y: 0,   h: 88,  label: '板块层 L0' },
+              { y: 88,  h: 88,  label: '主题层 L1' },
+              { y: 176, h: 88,  label: '细分层 L2' },
+              { y: 264, h: 86,  label: '叶子层 L3' },
+            ].map((t, i) => (
+              <g key={i}>
+                <rect x={0} y={t.y} width={VW} height={t.h} fill={i % 2 === 0 ? '#f8fafc' : '#f1f5f9'} />
+                <text x={8} y={t.y+15} fontSize={9} fill="#d1d5db" fontFamily="Inter, sans-serif">{t.label}</text>
+              </g>
+            ))}
+
+            {/* Edges */}
+            {CN_EDGES.map((edge, i) => {
+              const src = nodeMap[edge.from], tgt = nodeMap[edge.to];
+              if (!src || !tgt) return null;
+              const x1 = src.cx, y1 = src.cy + src.h/2;
+              const x2 = tgt.cx, y2 = tgt.cy - tgt.h/2;
+              const cmy = (y1 + y2) / 2;
+              const srcScore = scoreMap[edge.from]?.score ?? 0;
+              const tgtScore = scoreMap[edge.to]?.score ?? 0;
+              const strong = srcScore > 75 && tgtScore > 75 && !edge.cross;
+              return (
+                <path key={i}
+                  d={`M ${x1} ${y1} C ${x1} ${cmy}, ${x2} ${cmy}, ${x2} ${y2}`}
+                  fill="none"
+                  stroke={edge.cross ? '#f59e0b' : strong ? '#93c5fd' : '#dde5f0'}
+                  strokeWidth={strong ? 2.5 : 1.5}
+                  strokeDasharray={edge.cross ? '5,3' : 'none'}
+                  opacity={edge.cross ? 0.75 : 1}
+                />
+              );
+            })}
+
+            {/* Nodes */}
+            {CN_NODES.map(cn => {
+              const node = scoreMap[cn.id];
+              if (!node) return null;
+              const isSelected = cn.id === selectedNode?.id;
+              const isHovered  = cn.id === hoverId;
+              const tier = scoreTierStyle(node.score);
+              const roleColor = CN_ROLE_COLORS[cn.role] || '#94a3b8';
+              const x0 = cn.cx - cn.w/2, y0 = cn.cy - cn.h/2;
+              const proxyStr = node.proxy || (node.proxyType === 'synthetic' ? '合成篹' : '');
+
+              return (
+                <g key={cn.id} style={{ cursor: 'pointer' }}
+                  onClick={() => onSelect(node)}
+                  onMouseEnter={() => setHoverId(cn.id)}
+                  onMouseLeave={() => setHoverId(null)}
+                >
+                  {(isSelected || isHovered) && (
+                    <rect x={x0-2} y={y0-2} width={cn.w+4} height={cn.h+4} rx={9}
+                      fill="none"
+                      stroke={isSelected ? '#3b82f6' : '#cbd5e1'}
+                      strokeWidth={isSelected ? 2 : 1.5} opacity={0.7}
+                    />
+                  )}
+                  <rect x={x0} y={y0} width={cn.w} height={cn.h} rx={7}
+                    fill={isSelected ? '#eff6ff' : tier.bg}
+                    stroke={isSelected ? '#3b82f6' : isHovered ? '#94a3b8' : tier.border}
+                    strokeWidth={isSelected ? 1.5 : 1}
+                  />
+                  {/* Role stripe */}
+                  <rect x={x0} y={y0+6} width={3} height={cn.h-12} rx={1.5} fill={roleColor} />
+                  {/* Label */}
+                  <text x={x0+11} y={cn.cy-(cn.h>40?7:5)}
+                    fontSize={cn.id==='XLK' ? 13 : 11} fontWeight="700"
+                    fill={isSelected ? '#1e293b' : '#334155'}
+                    fontFamily="Noto Sans SC, Inter, sans-serif">
+                    {node.label}
+                  </text>
+                  {/* Score */}
+                  <text x={x0+cn.w-8} y={cn.cy-(cn.h>40?7:5)}
+                    fontSize={cn.id==='XLK' ? 13 : 11} fontWeight="700"
+                    fill={tier.text} textAnchor="end"
+                    fontFamily="Inter, sans-serif">
+                    {node.score.toFixed(0)}
+                  </text>
+                  {/* Proxy */}
+                  <text x={x0+11} y={y0+cn.h-7}
+                    fontSize={8} fill="#94a3b8"
+                    fontFamily="Inter, sans-serif">
+                    {proxyStr}
+                  </text>
+                  {/* Delta5d */}
+                  {node.delta5d !== null && (
+                    <text x={x0+cn.w-8} y={y0+cn.h-7}
+                      fontSize={8} textAnchor="end"
+                      fill={node.delta5d >= 0 ? '#22c55e' : '#ef4444'}
+                      fontFamily="Inter, sans-serif">
+                      {node.delta5d > 0 ? '+' : ''}{node.delta5d?.toFixed(1)}
+                    </text>
+                  )}
+                </g>
+              );
+            })}
+
+            {/* Cross-link label near HW→semi-conn edge */}
+            <text x={490} y={172} fontSize={8} fill="#f59e0b" fontFamily="Noto Sans SC, sans-serif" opacity={0.85}>跨链</text>
+          </svg>
+
+          {/* Bottom legend */}
+          <div style={{ padding: '9px 18px', borderTop: '1px solid #e2e8f0', background: '#fff', display: 'flex', alignItems: 'center', gap: 14, flexShrink: 0 }}>
+            <span style={{ fontSize: 10, fontWeight: 600, color: '#94a3b8' }}>链条角色</span>
+            {[['上游','#8b5cf6'],['算力','#2563eb'],['存储','#3b82f6'],['互联','#f59e0b'],['平台','#22c55e'],['应用','#10b981']].map(([label, color]) => (
+              <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                <div style={{ width: 7, height: 7, borderRadius: 2, background: color }} />
+                <span style={{ fontSize: 10, color: '#64748b' }}>{label}</span>
+              </div>
+            ))}
+            <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 10 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                <svg width="22" height="6"><line x1="0" y1="3" x2="22" y2="3" stroke="#f59e0b" strokeWidth="1.5" strokeDasharray="4,3"/></svg>
+                <span style={{ fontSize: 10, color: '#94a3b8' }}>跨链关联</span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                <svg width="22" height="6"><line x1="0" y1="3" x2="22" y2="3" stroke="#93c5fd" strokeWidth="2.5"/></svg>
+                <span style={{ fontSize: 10, color: '#94a3b8' }}>强关联边</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── RIGHT: Strategic analysis ── */}
+      <div style={{ width: 380, flexShrink: 0, overflowY: 'auto', background: '#f8fafc', padding: '14px' }}>
+        <StrategicPanel selectedNode={selectedNode} onSelect={onSelect} period={period} />
+      </div>
+    </div>
+  );
+}
+
+// ── (old CG_ placeholder to delete below) ──
+const CG_W = 0, CG_H = 0;
+
+const CHAIN_ROLE_CFG = {
+  sector:       { label: '板块',   color: '#1e293b' },
+  upstream:     { label: '上游',   color: '#8b5cf6' },
+  compute:      { label: '算力',   color: '#2563eb' },
+  memory:       { label: '存储',   color: '#3b82f6' },
+  interconnect: { label: '互联',   color: '#f59e0b' },
+  platform:     { label: '平台',   color: '#22c55e' },
+  application:  { label: '应用',   color: '#10b981' },
+  leaf:         { label: '叶节点', color: '#94a3b8' },
+};
+
+const CG_NODES = [
+  // Tier 0 — Sector root
+  { id: 'XLK',          x: 176, y: 36,  w: 72, h: 34, role: 'sector' },
+  // Tier 1 — Theme nodes
+  { id: 'semi',         x: 74,  y: 102, w: 60, h: 30, role: 'upstream' },
+  { id: 'soft',         x: 176, y: 102, w: 56, h: 30, role: 'platform' },
+  { id: 'hw',           x: 294, y: 102, w: 52, h: 30, role: 'upstream' },
+  // Tier 2 — Segment nodes
+  { id: 'semi-equip',   x: 22,  y: 166, w: 44, h: 28, role: 'upstream' },
+  { id: 'semi-compute', x: 72,  y: 166, w: 44, h: 28, role: 'compute' },
+  { id: 'semi-mem',     x: 120, y: 166, w: 44, h: 28, role: 'memory' },
+  { id: 'semi-conn',    x: 170, y: 166, w: 44, h: 28, role: 'interconnect' },
+  { id: 'soft-cloud',   x: 232, y: 166, w: 44, h: 28, role: 'platform' },
+  { id: 'soft-cyber',   x: 290, y: 166, w: 44, h: 28, role: 'application' },
+  // Tier 3 — Leaf nodes
+  { id: 'conn-optical', x: 144, y: 228, w: 52, h: 28, role: 'leaf' },
+  { id: 'conn-copper',  x: 208, y: 228, w: 48, h: 28, role: 'leaf' },
+];
+
+const CG_EDGES = [
+  { from: 'XLK', to: 'semi' },
+  { from: 'XLK', to: 'soft' },
+  { from: 'XLK', to: 'hw' },
+  { from: 'semi', to: 'semi-equip' },
+  { from: 'semi', to: 'semi-compute' },
+  { from: 'semi', to: 'semi-mem' },
+  { from: 'semi', to: 'semi-conn' },
+  { from: 'soft', to: 'soft-cloud' },
+  { from: 'soft', to: 'soft-cyber' },
+  { from: 'semi-conn', to: 'conn-optical' },
+  { from: 'semi-conn', to: 'conn-copper' },
+  { from: 'hw', to: 'semi-conn', cross: true }, // 跨链：通信设备→互联
+];
+
+
+
+// ─── Stock Holdings Table ────────────────────────────────────────────────────
+
+const STATUS_CFG = {
+  complete: { label: '已更新', bg: 'rgba(34,197,94,0.1)',  color: '#16a34a' },
+  pending:  { label: '待计算', bg: 'rgba(245,158,11,0.1)', color: '#d97706' },
+  missing:  { label: '缺失',   bg: 'rgba(239,68,68,0.1)',  color: '#dc2626' },
+};
+
+function StockHoldingsTable({ nodeId, compact = false }) {
+  const holdings = NODE_HOLDINGS[nodeId] || [];
+  const [sortKey, setSortKey] = useState('score');
+  const [sortAsc, setSortAsc] = useState(false);
+  const [showAll, setShowAll] = useState(false);
+
+  const sorted = useMemo(() => {
+    return [...holdings].sort((a, b) => {
+      const va = a[sortKey], vb = b[sortKey];
+      return sortAsc ? va - vb : vb - va;
+    });
+  }, [holdings, sortKey, sortAsc]);
+
+  const displayed = showAll || compact ? sorted : sorted.slice(0, 8);
+  const handleSort = (key) => {
+    if (sortKey === key) setSortAsc(a => !a);
+    else { setSortKey(key); setSortAsc(false); }
+  };
+
+  const SortArrow = ({ k }) => (
+    <span style={{ marginLeft: 2, opacity: sortKey === k ? 1 : 0.3, fontSize: 9 }}>
+      {sortKey === k && sortAsc ? '▲' : '▼'}
+    </span>
+  );
+
+  if (holdings.length === 0) return (
+    <div style={{ padding: '16px', textAlign: 'center', color: '#94a3b8', fontSize: 12 }}>暂无持仓数据</div>
+  );
+
+  if (compact) {
+    // Compact version for right panel — top 5 only
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+        {sorted.slice(0, 5).map((h, i) => (
+          <div key={h.ticker} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 8px', borderRadius: 8, background: '#f8fafc' }}>
+            <span style={{ fontSize: 10, color: '#94a3b8', minWidth: 14, textAlign: 'center' }}>#{i+1}</span>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: '#1e293b' }}>{h.ticker}</div>
+              <div style={{ fontSize: 10, color: '#94a3b8', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{h.name}</div>
+            </div>
+            <div style={{ textAlign: 'right' }}>
+              <div className={scoreClass(h.score)} style={{ fontSize: 13, fontWeight: 700 }}>{h.score.toFixed(0)}</div>
+              <div style={{ fontSize: 10, color: deltaColor(h.return20d) }}>{h.return20d > 0 ? '+' : ''}{h.return20d.toFixed(1)}%</div>
+            </div>
+            <div style={{ width: 36, textAlign: 'right' }}>
+              <div style={{ fontSize: 10, color: '#94a3b8' }}>{h.weight.toFixed(1)}%</div>
+              <div style={{ fontSize: 10, color: STATUS_CFG[h.status]?.color }}>{STATUS_CFG[h.status]?.label}</div>
+            </div>
+          </div>
+        ))}
+        {sorted.length > 5 && (
+          <div style={{ fontSize: 11, color: '#94a3b8', textAlign: 'center', paddingTop: 4 }}>
+            +{sorted.length - 5} 只标的
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // Full table version for center panel
+  const colStyle = { fontSize: 11, color: '#64748b', cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap' };
+  const cellStyle = { fontSize: 12, color: '#1e293b' };
+  const numCell = { fontSize: 12, textAlign: 'right', fontVariantNumeric: 'tabular-nums' };
+
+  return (
+    <div>
+      {/* Table */}
+      <div style={{ overflowX: 'auto' }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+          <thead>
+            <tr style={{ borderBottom: '1px solid #f1f5f9' }}>
+              <th style={{ ...colStyle, padding: '6px 8px', textAlign: 'left', fontWeight: 600, width: 28 }}>#</th>
+              <th style={{ ...colStyle, padding: '6px 8px', textAlign: 'left', fontWeight: 600 }}>标的</th>
+              <th style={{ ...colStyle, padding: '6px 12px', textAlign: 'right', fontWeight: 600 }} onClick={() => handleSort('weight')}>权重<SortArrow k="weight" /></th>
+              <th style={{ ...colStyle, padding: '6px 12px', textAlign: 'right', fontWeight: 600 }} onClick={() => handleSort('score')}>动能分<SortArrow k="score" /></th>
+              <th style={{ ...colStyle, padding: '6px 12px', textAlign: 'right', fontWeight: 600 }} onClick={() => handleSort('return20d')}>20D收益<SortArrow k="return20d" /></th>
+              <th style={{ ...colStyle, padding: '6px 12px', textAlign: 'right', fontWeight: 600 }} onClick={() => handleSort('rs20d')}>RS节点<SortArrow k="rs20d" /></th>
+              <th style={{ ...colStyle, padding: '6px 12px', textAlign: 'right', fontWeight: 600 }} onClick={() => handleSort('delta3d')}>3D Δ<SortArrow k="delta3d" /></th>
+              <th style={{ ...colStyle, padding: '6px 12px', textAlign: 'right', fontWeight: 600 }} onClick={() => handleSort('delta5d')}>5D Δ<SortArrow k="delta5d" /></th>
+              <th style={{ ...colStyle, padding: '6px 12px', textAlign: 'center', fontWeight: 600 }}>状态</th>
+            </tr>
+          </thead>
+          <tbody>
+            {displayed.map((h, i) => {
+              const sc = STATUS_CFG[h.status] || STATUS_CFG.missing;
+              return (
+                <tr key={h.ticker} style={{ borderBottom: '1px solid #f8fafc' }}
+                  onMouseEnter={e => e.currentTarget.style.background = '#f8fafc'}
+                  onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+                >
+                  <td style={{ padding: '7px 8px', fontSize: 11, color: '#94a3b8', textAlign: 'center' }}>{i+1}</td>
+                  <td style={{ padding: '7px 8px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      {/* Mini score bar */}
+                      <div style={{ width: 3, height: 28, borderRadius: 2, background: h.score >= 85 ? '#059669' : h.score >= 70 ? '#2563eb' : h.score >= 60 ? '#d97706' : '#94a3b8', flexShrink: 0 }} />
+                      <div>
+                        <div style={{ fontSize: 13, fontWeight: 700, color: '#1e293b', letterSpacing: '0.01em' }}>{h.ticker}</div>
+                        <div style={{ fontSize: 10, color: '#94a3b8', maxWidth: 140, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{h.name}</div>
+                      </div>
+                    </div>
+                  </td>
+                  <td style={{ ...numCell, padding: '7px 12px', color: '#475569' }}>{h.weight.toFixed(1)}%</td>
+                  <td style={{ ...numCell, padding: '7px 12px' }}>
+                    <span className={scoreClass(h.score)} style={{ fontWeight: 700 }}>{h.score.toFixed(1)}</span>
+                  </td>
+                  <td style={{ ...numCell, padding: '7px 12px', color: deltaColor(h.return20d), fontWeight: 600 }}>
+                    {h.return20d > 0 ? '+' : ''}{h.return20d.toFixed(1)}%
+                  </td>
+                  <td style={{ ...numCell, padding: '7px 12px', color: deltaColor(h.rs20d), fontWeight: 600 }}>
+                    {h.rs20d > 0 ? '+' : ''}{h.rs20d.toFixed(1)}%
+                  </td>
+                  <td style={{ ...numCell, padding: '7px 12px', color: deltaColor(h.delta3d), fontWeight: 500 }}>
+                    {h.delta3d > 0 ? '+' : ''}{h.delta3d.toFixed(1)}
+                  </td>
+                  <td style={{ ...numCell, padding: '7px 12px', color: deltaColor(h.delta5d), fontWeight: 500 }}>
+                    {h.delta5d > 0 ? '+' : ''}{h.delta5d.toFixed(1)}
+                  </td>
+                  <td style={{ padding: '7px 12px', textAlign: 'center' }}>
+                    <span style={{ fontSize: 10, padding: '2px 7px', borderRadius: 5, background: sc.bg, color: sc.color, fontWeight: 500, whiteSpace: 'nowrap' }}>
+                      {sc.label}
+                    </span>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Show more */}
+      {!showAll && holdings.length > 8 && (
+        <div style={{ paddingTop: 10, textAlign: 'center' }}>
+          <button onClick={() => setShowAll(true)} style={{
+            fontSize: 12, color: '#2563eb', background: 'none', border: '1px solid #e2e8f0',
+            borderRadius: 6, padding: '5px 16px', cursor: 'pointer', fontFamily: 'inherit',
+          }}>
+            展开全部 ({holdings.length - 8} 更多)
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Regime Badge (compact) ──────────────────────────────────────────────────
+
+function RegimeBadge() {
+  const metrics = [['$SPY','536.40'],['距20MA','+1.8%'],['距50MA','+3.2%'],['广度','68%'],['VIX','16.2']];
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'stretch',
+      borderRadius: 12, overflow: 'hidden',
+      background: 'linear-gradient(105deg,#059669 0%,#10b981 50%,#34d399 100%)',
+      color: '#fff', boxShadow: '0 2px 10px rgba(16,185,129,0.2)',
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 16px', flexShrink: 0 }}>
+        <div style={{ width: 34, height: 34, background: 'rgba(255,255,255,0.2)', borderRadius: 9, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 800, fontSize: 16 }}>A</div>
+        <div>
+          <div style={{ fontWeight: 700, fontSize: 13 }}>Risk-On 满火力</div>
+          <div style={{ fontSize: 10, opacity: 0.75, marginTop: 1 }}>市场环境 · 实时</div>
+        </div>
+      </div>
+      <div style={{ width: 1, background: 'rgba(255,255,255,0.18)', margin: '8px 0' }} />
+      {metrics.map(([label, val], i) => (
+        <div key={label} style={{
+          flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+          padding: '8px 4px',
+          borderRight: i < metrics.length - 1 ? '1px solid rgba(255,255,255,0.15)' : 'none',
+          minWidth: 58,
+        }}>
+          <div style={{ fontSize: 10, opacity: 0.72, marginBottom: 2, whiteSpace: 'nowrap' }}>{label}</div>
+          <div style={{ fontWeight: 700, fontSize: 13, whiteSpace: 'nowrap' }}>{val}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ─── Main App ────────────────────────────────────────────────────────────────
+
+function App() {
+  const [selectedNode, setSelectedNode] = useState(ALL_NODES[0]);
+  const [expandedIds, setExpandedIds] = useState(new Set(['XLK', 'semi']));
+  const [period, setPeriod] = useState('20d');
+  const [metric, setMetric] = useState('relative');
+  const [lens, setLens] = useState('gics'); // 'gics' | 'chain'
+
+  const handleToggle = useCallback((id) => {
+    setExpandedIds(prev => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  }, []);
+
+  const handleSelect = useCallback((node) => {
+    setSelectedNode(node);
+  }, []);
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden' }}>
+
+      {/* ── Top Header ── */}
+      <header style={{
+        background: 'linear-gradient(to right, #f8fafc, #eff6ff, #f8fafc)',
+        borderBottom: '1px solid #e2e8f0',
+        padding: '0 24px',
+        height: 56, display: 'flex', alignItems: 'center', gap: 16, flexShrink: 0,
+        position: 'sticky', top: 0, zIndex: 50,
+      }}>
+        {/* Logo */}
+        <div style={{ width: 36, height: 36, borderRadius: 10, background: 'linear-gradient(135deg,#2563eb,#9333ea)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2">
+            <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
+          </svg>
+        </div>
+        <span style={{ fontWeight: 700, fontSize: 13, color: '#1e293b', flexShrink: 0 }}>Momentum Radar</span>
+        <div style={{ width: 1, height: 16, background: '#e2e8f0', flexShrink: 0 }} />
+        <div style={{ display: 'flex', gap: 2, background: '#fff', padding: 3, borderRadius: 8, border: '1px solid #e2e8f0', flexShrink: 0 }}>
+          {[['核心终端',''], ['板块ETF',''], ['行业ETF',''], ['动能股池',''], ['监控任务','active']].map(([lbl, active]) => (
+            <div key={lbl} style={{
+              padding: '4px 10px', borderRadius: 6, fontSize: 12, fontWeight: 500, cursor: 'pointer', whiteSpace: 'nowrap',
+              background: active ? 'linear-gradient(to right,#2563eb,#9333ea)' : 'transparent',
+              color: active ? '#fff' : '#475569',
+            }}>{lbl}</div>
+          ))}
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4, overflow: 'hidden', minWidth: 0 }}>
+          <span style={{ fontSize: 11, color: '#94a3b8', whiteSpace: 'nowrap', flexShrink: 0 }}>监控任务</span>
+          <span style={{ color: '#e2e8f0', flexShrink: 0 }}>›</span>
+          <span style={{ fontSize: 11, color: '#64748b', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 120 }}>{TASK.title}</span>
+          <span style={{ color: '#e2e8f0', flexShrink: 0 }}>›</span>
+          <span style={{ fontSize: 11, fontWeight: 600, color: '#2563eb', whiteSpace: 'nowrap', flexShrink: 0 }}>板块内下钻</span>
+        </div>
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center', flexShrink: 0 }}>
+          <button style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '5px 11px', borderRadius: 6, border: '1px solid #e2e8f0', background: '#fff', fontSize: 11, color: '#475569', cursor: 'pointer', fontFamily: 'inherit', whiteSpace: 'nowrap' }}>
+            <Icon.Refresh /> 刷新全部
+          </button>
+          <button style={{ padding: '5px 11px', borderRadius: 6, background: 'linear-gradient(to right,#2563eb,#4f46e5)', color: '#fff', border: 'none', fontSize: 11, cursor: 'pointer', fontFamily: 'inherit', whiteSpace: 'nowrap' }}>
+            + 添加 ETF
+          </button>
+        </div>
+      </header>
+
+      {/* ── Body ── */}
+      {lens === 'chain' ? (
+        <ChainView
+          selectedNode={selectedNode}
+          onSelect={handleSelect}
+          onBackToGics={() => setLens('gics')}
+          period={period}
+          setPeriod={setPeriod}
+        />
+      ) : (
+      <div style={{ display: 'flex', flex: 1, overflow: 'hidden', gap: 0 }}>
+
+        {/* ── LEFT: Research Node Tree ── */}
+        <div style={{
+          width: 280, flexShrink: 0, borderRight: '1px solid #e2e8f0',
+          background: '#fff', display: 'flex', flexDirection: 'column', overflow: 'hidden',
+        }}>
+          {/* Tree header */}
+          <div style={{ padding: '14px 16px 10px', borderBottom: '1px solid #f1f5f9' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+              <span style={{ fontSize: 13, fontWeight: 700, color: '#1e293b', display: 'flex', alignItems: 'center', gap: 6 }}>
+                <Icon.Layers /> 研究节点树
+              </span>
+              <span style={{ fontSize: 11, color: '#94a3b8' }}>{ALL_NODES.length} 节点</span>
+            </div>
+            {/* Lens toggle */}
+            <div style={{ display: 'flex', gap: 4, background: '#f1f5f9', padding: 3, borderRadius: 8 }}>
+              {[['gics', 'GICS 分类'], ['chain', '产业链图']].map(([val, lbl]) => (
+                <button key={val} onClick={() => setLens(val)} style={{
+                  flex: 1, padding: '4px 0', borderRadius: 6, border: 'none', fontSize: 11, fontWeight: 500, cursor: 'pointer', fontFamily: 'inherit',
+                  background: lens === val ? '#fff' : 'transparent',
+                  color: lens === val ? '#1e293b' : '#64748b',
+                  boxShadow: lens === val ? '0 1px 3px rgba(0,0,0,0.08)' : 'none',
+                  transition: 'all 0.15s ease',
+                }}>{lbl}</button>
+              ))}
+            </div>
+          </div>
+
+          {/* Score header row — only in GICS mode */}
+          {lens === 'gics' && (
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 6, padding: '6px 18px 4px', borderBottom: '1px solid #f1f5f9', flexShrink: 0 }}>
+              <span style={{ fontSize: 10, color: '#94a3b8', marginRight: 'auto', paddingLeft: 38 }}>节点 / 代理</span>
+              <span style={{ fontSize: 10, color: '#94a3b8', minWidth: 44, textAlign: 'right' }}>20D走势</span>
+              <span style={{ fontSize: 10, color: '#94a3b8', minWidth: 28, textAlign: 'right' }}>分数</span>
+            </div>
+          )}
+
+          {/* Tree (GICS) or Chain Graph */}
+          {lens === 'gics' ? (
+            <>
+              <div style={{ flex: 1, overflowY: 'auto', paddingBottom: 12, paddingTop: 4 }}>
+                {NODE_TREE.map(root => (
+                  <NodeItem key={root.id} node={root} selectedId={selectedNode?.id} onSelect={handleSelect} expandedIds={expandedIds} onToggle={handleToggle} />
+                ))}
+              </div>
+              <div style={{ padding: '10px 16px', borderTop: '1px solid #f1f5f9', display: 'flex', gap: 12, flexWrap: 'wrap', flexShrink: 0 }}>
+                {[['ETF 代理', '#2563eb', 'rgba(37,99,235,0.08)'], ['合成篮', '#d97706', 'rgba(245,158,11,0.08)']].map(([lbl, c, bg]) => (
+                  <div key={lbl} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                    <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 4, background: bg, color: c, fontWeight: 600 }}>{lbl}</span>
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : (
+            <ChainGraph selectedNodeId={selectedNode?.id} onSelect={handleSelect} />
+          )}
+        </div>
+
+        {/* ── CENTER: Chart + Controls ── */}
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: '#f8fafc' }}>
+          <div style={{ flex: 1, overflowY: 'auto', padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 14 }}>
+
+            {/* Regime badge */}
+            <RegimeBadge />
+
+            {/* Chart card */}
+            <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 16, padding: '18px 20px' }}>
+              {/* Chart controls */}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
+                <div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: '#1e293b' }}>
+                    {selectedNode.label}
+                    {selectedNode.proxy && (
+                      <span style={{ marginLeft: 8, fontSize: 12, color: '#2563eb', fontWeight: 500 }}>({selectedNode.proxy})</span>
+                    )}
+                    {!selectedNode.proxy && selectedNode.proxyType === 'synthetic' && (
+                      <span style={{ marginLeft: 8, fontSize: 11, color: '#d97706', fontWeight: 500 }}>合成篮</span>
+                    )}
+                  </div>
+                  <div style={{ fontSize: 12, color: '#64748b', marginTop: 2 }}>相对走势对比 · {selectedNode.sublabel}</div>
+                </div>
+                <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+                  {/* Period */}
+                  <div style={{ display: 'flex', gap: 2, background: '#f1f5f9', padding: 3, borderRadius: 8 }}>
+                    {['5d','20d','63d'].map(p => (
+                      <button key={p} onClick={() => setPeriod(p)} style={{
+                        padding: '4px 10px', borderRadius: 6, border: 'none', fontSize: 12, fontWeight: 500, cursor: 'pointer', fontFamily: 'inherit',
+                        background: period === p ? '#fff' : 'transparent',
+                        color: period === p ? '#1e293b' : '#64748b',
+                        boxShadow: period === p ? '0 1px 3px rgba(0,0,0,0.08)' : 'none',
+                      }}>{p}</button>
+                    ))}
+                  </div>
+                  {/* Metric */}
+                  <div style={{ display: 'flex', gap: 2, background: '#f1f5f9', padding: 3, borderRadius: 8 }}>
+                    {[['relative','相对走势'],['return20d','20D收益'],['score','综合评分']].map(([v, lbl]) => (
+                      <button key={v} onClick={() => setMetric(v)} style={{
+                        padding: '4px 10px', borderRadius: 6, border: 'none', fontSize: 12, fontWeight: 500, cursor: 'pointer', fontFamily: 'inherit',
+                        background: metric === v ? '#fff' : 'transparent',
+                        color: metric === v ? '#1e293b' : '#64748b',
+                        boxShadow: metric === v ? '0 1px 3px rgba(0,0,0,0.08)' : 'none',
+                      }}>{lbl}</button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <TrendChart selectedNode={selectedNode} period={period} />
+            </div>
+
+            {/* Sub-node matrix */}
+            {selectedNode.children && selectedNode.children.length > 0 && (
+              <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 16, padding: '16px 20px' }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: '#1e293b', marginBottom: 14 }}>子节点动能矩阵</div>
+                <div style={{ display: 'grid', gridTemplateColumns: `repeat(${Math.min(4, selectedNode.children.length)}, 1fr)`, gap: 10 }}>
+                  {selectedNode.children.map(child => (
+                    <div
+                      key={child.id}
+                      onClick={() => handleSelect(child)}
+                      style={{
+                        background: '#f8fafc', borderRadius: 12, padding: '12px 14px',
+                        border: '1px solid #e2e8f0', cursor: 'pointer',
+                        transition: 'all 0.15s ease',
+                      }}
+                      onMouseEnter={e => { e.currentTarget.style.borderColor = '#3b82f6'; e.currentTarget.style.background = 'rgba(59,130,246,0.03)'; }}
+                      onMouseLeave={e => { e.currentTarget.style.borderColor = '#e2e8f0'; e.currentTarget.style.background = '#f8fafc'; }}
+                    >
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 8 }}>
+                        <div>
+                          <div style={{ fontSize: 13, fontWeight: 700, color: '#1e293b' }}>{child.label}</div>
+                          <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 1 }}>
+                            {child.proxyType === 'etf' ? child.proxy : '合成'}
+                          </div>
+                        </div>
+                        <span className={scoreClass(child.score)} style={{ fontSize: 20, fontWeight: 700, lineHeight: 1 }}>
+                          {child.score.toFixed(0)}
+                        </span>
+                      </div>
+                      <Sparkline data={genTrendData(child.id, '20d').slice(-40)} color={child.score >= 80 ? '#22c55e' : child.score >= 65 ? '#3b82f6' : '#f59e0b'} width={220} height={28} />
+                      <div style={{ marginTop: 7, borderTop: '1px solid #f1f5f9', paddingTop: 7 }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                          <span style={{ fontSize: 10, color: '#94a3b8' }}>对母板块贡献</span>
+                          <span style={{ fontSize: 11, fontWeight: 700, color: '#2563eb' }}>{child.contribution}%</span>
+                        </div>
+                        <ContribBar value={child.contribution} max={100} color="#3b82f6" />
+                      </div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 7 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
+                          <span style={{ fontSize: 10, color: '#94a3b8' }}>vs母</span>
+                          <span style={{ fontSize: 11, color: deltaColor(child.scoreVsParent), fontWeight: 600 }}>{child.scoreVsParent !== null ? fmtDelta(child.scoreVsParent, '') : '--'}</span>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
+                          <span style={{ fontSize: 10, color: '#94a3b8' }}>5D</span>
+                          <span style={{ fontSize: 11, color: deltaColor(child.delta5d), fontWeight: 600 }}>{fmtDelta(child.delta5d, '')}</span>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
+                          <span style={{ fontSize: 10, color: '#94a3b8' }}>广度</span>
+                          <span style={{ fontSize: 11, color: child.breadth >= 70 ? '#059669' : child.breadth >= 50 ? '#2563eb' : '#d97706', fontWeight: 600 }}>{child.breadth}%</span>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Holdings table */}
+            <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 16, padding: '16px 20px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+                <div>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: '#1e293b' }}>持仓标的</div>
+                  <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 2 }}>
+                    {selectedNode.proxyType === 'etf' ? `${selectedNode.proxy} 成分股` : `合成篮成分股 · ${selectedNode.proxyLabel || ''}`}
+                    　·　共 {(NODE_HOLDINGS[selectedNode.id] || []).length} 只
+                  </div>
+                </div>
+                <div style={{ display: 'flex', gap: 8, fontSize: 11 }}>
+                  {['complete','pending','missing'].map(s => {
+                    const cfg = STATUS_CFG[s];
+                    const cnt = (NODE_HOLDINGS[selectedNode.id] || []).filter(h => h.status === s).length;
+                    if (!cnt) return null;
+                    return <span key={s} style={{ padding:'2px 8px', borderRadius:5, background:cfg.bg, color:cfg.color, fontWeight:500 }}>{cfg.label} {cnt}</span>;
+                  })}
+                </div>
+              </div>
+              <StockHoldingsTable nodeId={selectedNode.id} />
+            </div>
+
+            {/* Data source status bar */}
+            <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 12, padding: '12px 18px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+                <span style={{ fontSize: 12, fontWeight: 600, color: '#475569' }}>数据来源状态</span>
+                {[
+                  { label: 'Finviz', color: '#93c5fd', status: '已更新', ok: true },
+                  { label: 'MarketChameleon', color: '#86efac', status: '已更新', ok: true },
+                  { label: 'IBKR 市场数据', color: '#fca5a5', status: '待更新', ok: false },
+                  { label: 'Futu 期权数据', color: '#fb923c', status: '已更新', ok: true },
+                ].map(src => (
+                  <div key={src.label} style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '3px 9px', borderRadius: 20, background: src.ok ? 'rgba(34,197,94,0.07)' : 'rgba(245,158,11,0.07)', border: `1px solid ${src.ok ? 'rgba(34,197,94,0.2)' : 'rgba(245,158,11,0.25)'}` }}>
+                    <div style={{ width: 6, height: 6, borderRadius: '50%', background: src.ok ? '#22c55e' : '#f59e0b', flexShrink: 0 }} />
+                    <span style={{ fontSize: 11, color: '#475569' }}>{src.label}</span>
+                    <span style={{ fontSize: 11, color: src.ok ? '#059669' : '#d97706', fontWeight: 600 }}>{src.status}</span>
+                  </div>
+                ))}
+                <span style={{ marginLeft: 'auto', fontSize: 10, color: '#94a3b8', flexShrink: 0 }}>北京时间 09:32</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* ── RIGHT: Node Detail Panel ── */}
+        <div style={{
+          width: 300, flexShrink: 0, borderLeft: '1px solid #e2e8f0',
+          background: '#f8fafc', display: 'flex', flexDirection: 'column', overflow: 'hidden',
+        }}>
+          <div style={{ padding: '12px 16px', borderBottom: '1px solid #e2e8f0', background: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: '#1e293b', display: 'flex', alignItems: 'center', gap: 6 }}>
+              <Icon.BarChart /> 节点详情
+            </div>
+            <span style={{ fontSize: 10, color: '#94a3b8', background: '#f1f5f9', padding: '2px 7px', borderRadius: 5 }}>L{selectedNode.level + 1}</span>
+          </div>
+          <div style={{ flex: 1, overflowY: 'auto', padding: '12px' }}>
+            <NodeDetailPanel node={selectedNode} period={period} />
+          </div>
+        </div>
+      </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
