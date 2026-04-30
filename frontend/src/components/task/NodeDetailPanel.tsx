@@ -7,6 +7,7 @@
 import React, { useMemo } from 'react';
 import type { ResearchNode, NodeHolding } from '../../types';
 import { Sparkline } from './Sparkline';
+import { NodeHoldingsTable } from './NodeHoldingsTable';
 
 // ─── Score / Delta helpers ────────────────────────────────────────────────────
 // score / breadth 在后端可能未就绪而返回 null，所有 helper 接受 null
@@ -284,66 +285,6 @@ function SiblingRankingCard({ siblings, selectedNode, onSelectNode }: SiblingRan
   );
 }
 
-interface HoldingsTop5CardProps {
-  holdings: NodeHolding[];
-}
-
-function HoldingsTop5Card({ holdings }: HoldingsTop5CardProps) {
-  const top5 = useMemo(
-    () => [...holdings].sort((a, b) => (b.score ?? 0) - (a.score ?? 0)).slice(0, 5),
-    [holdings]
-  );
-  if (top5.length === 0) return null;
-
-  return (
-    <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 14, padding: 14 }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
-        <span style={{ fontSize: 12, fontWeight: 700, color: '#475569' }}>持仓标的</span>
-        <span style={{ fontSize: 10, color: '#94a3b8' }}>共 {holdings.length} 只 · 按分数</span>
-      </div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-        {top5.map((h, i) => {
-          const status = STATUS_CFG[h.status ?? 'missing'] ?? STATUS_CFG.missing;
-          const ret = h.return20d;
-          return (
-            <div key={h.ticker} style={{
-              display: 'flex', alignItems: 'center', gap: 8,
-              padding: '6px 8px', borderRadius: 8, background: '#f8fafc',
-            }}>
-              <span style={{ fontSize: 10, color: '#94a3b8', minWidth: 14, textAlign: 'center' }}>#{i + 1}</span>
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontSize: 12, fontWeight: 700, color: '#1e293b' }}>{h.ticker}</div>
-                <div style={{
-                  fontSize: 10, color: '#94a3b8',
-                  whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-                }}>
-                  {h.name ?? ''}
-                </div>
-              </div>
-              <div style={{ textAlign: 'right' }}>
-                <div style={{ fontSize: 13, fontWeight: 700, color: scoreColor(h.score ?? 0) }}>
-                  {(h.score ?? 0).toFixed(0)}
-                </div>
-                <div style={{ fontSize: 10, color: deltaColor(ret) }}>
-                  {ret > 0 ? '+' : ''}{ret.toFixed(1)}%
-                </div>
-              </div>
-              <div style={{ width: 38, textAlign: 'right', flexShrink: 0 }}>
-                <div style={{ fontSize: 10, color: '#94a3b8' }}>{h.weight.toFixed(1)}%</div>
-                <div style={{ fontSize: 10, color: status.color }}>{status.label}</div>
-              </div>
-            </div>
-          );
-        })}
-        {holdings.length > 5 && (
-          <div style={{ fontSize: 11, color: '#94a3b8', textAlign: 'center', paddingTop: 4 }}>
-            +{holdings.length - 5} 只标的
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
 
 interface ChildrenOverviewCardProps {
   children: ResearchNode[];
@@ -476,7 +417,21 @@ export function NodeDetailPanel({
           selectedNode={selectedNode}
           onSelectNode={onSelectNode}
         />
-        <HoldingsTop5Card holdings={holdings} />
+        {holdings.length > 0 && (
+          <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 14, padding: 14 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+              <span style={{ fontSize: 12, fontWeight: 700, color: '#475569' }}>持仓标的</span>
+              <span style={{ fontSize: 10, color: '#94a3b8' }}>共 {holdings.length} 只 · 按分数</span>
+            </div>
+            <NodeHoldingsTable
+              compact
+              holdings={holdings}
+              showAll={false}
+              onShowAll={() => {}}
+              isLoading={false}
+            />
+          </div>
+        )}
         <ChildrenOverviewCard
           children={selectedNode.children ?? []}
           onSelectNode={onSelectNode}

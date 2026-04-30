@@ -41,6 +41,9 @@ function SortArrow({ active, asc }: { active: boolean; asc: boolean }): React.Re
   );
 }
 
+// ─── Compact mode: top-5 rows, no thead, no sort — NodeDetailPanel 侧边栏嵌入用 ──
+const COMPACT_ROWS = 5;
+
 export interface NodeHoldingsTableProps {
   holdings: NodeHolding[];
   showAll: boolean;
@@ -50,6 +53,8 @@ export interface NodeHoldingsTableProps {
   nodeProxyType?: NodeProxyType;
   nodeProxy?: string | null;
   nodeProxyLabel?: string | null;
+  /** compact 模式：仅渲 top 5，无表头无排序，列：# ticker name score 20D% 权重% 状态 */
+  compact?: boolean;
 }
 
 export function NodeHoldingsTable({
@@ -60,6 +65,7 @@ export function NodeHoldingsTable({
   isLoading,
   nodeProxyType,
   nodeProxy,
+  compact = false,
 }: NodeHoldingsTableProps): React.ReactElement {
   const [sortKey, setSortKey] = useState<SortKey>('score');
   const [sortAsc, setSortAsc] = useState(false);
@@ -75,6 +81,80 @@ export function NodeHoldingsTable({
 
   const displayed = showAll ? sorted : sorted.slice(0, DEFAULT_ROWS);
   const remaining = sorted.length - DEFAULT_ROWS;
+
+  // computed unconditionally to satisfy Rules of Hooks
+  const top5 = useMemo(
+    () => [...holdings].sort((a, b) => (b.score ?? 0) - (a.score ?? 0)).slice(0, COMPACT_ROWS),
+    [holdings],
+  );
+
+  // ── Compact mode: top-5 by score, no thead/sort ────────────────────────────
+  if (compact) {
+    if (isLoading) {
+      return (
+        <div style={{ padding: '8px 0', textAlign: 'center', color: '#94a3b8', fontSize: 12 }}>
+          加载中…
+        </div>
+      );
+    }
+    if (top5.length === 0) return <></>;
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+        {top5.map((h, i) => {
+          const sc = STATUS_CFG[h.status ?? 'missing'] ?? STATUS_CFG.missing;
+          const tierColor = scoreTierColor(h.score ?? 0);
+          return (
+            <div
+              key={h.ticker}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 6,
+                padding: '5px 6px', borderRadius: 7, background: '#f8fafc',
+                cursor: onRowClick ? 'pointer' : 'default',
+              }}
+              onClick={() => onRowClick?.(h.ticker)}
+            >
+              <span style={{ fontSize: 10, color: '#94a3b8', minWidth: 14, textAlign: 'center' }}>
+                #{i + 1}
+              </span>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 12, fontWeight: 700, color: '#1e293b' }}>{h.ticker}</div>
+                <div style={{
+                  fontSize: 10, color: '#94a3b8',
+                  whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                }}>
+                  {h.name ?? ''}
+                </div>
+              </div>
+              <div style={{ textAlign: 'right', flexShrink: 0 }}>
+                <div style={{ fontSize: 12, fontWeight: 700, color: tierColor, fontVariantNumeric: 'tabular-nums' }}>
+                  {(h.score ?? 0).toFixed(1)}
+                </div>
+                <div style={{ fontSize: 10, color: deltaColor(h.return20d), fontVariantNumeric: 'tabular-nums' }}>
+                  {fmtPctDirect(h.return20d)}
+                </div>
+              </div>
+              <div style={{ width: 36, textAlign: 'right', flexShrink: 0 }}>
+                <div style={{ fontSize: 10, color: '#475569', fontVariantNumeric: 'tabular-nums' }}>
+                  {h.weight.toFixed(1)}%
+                </div>
+                <span style={{
+                  fontSize: 10, padding: '1px 5px', borderRadius: 4,
+                  background: sc.bg, color: sc.color, fontWeight: 500,
+                }}>
+                  {sc.label}
+                </span>
+              </div>
+            </div>
+          );
+        })}
+        {holdings.length > COMPACT_ROWS && (
+          <div style={{ fontSize: 11, color: '#94a3b8', textAlign: 'center', paddingTop: 2 }}>
+            +{holdings.length - COMPACT_ROWS} 只标的
+          </div>
+        )}
+      </div>
+    );
+  }
 
   function handleSort(key: SortKey) {
     if (sortKey === key) {
