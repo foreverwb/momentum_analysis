@@ -28,6 +28,7 @@ import { DataSourceBar } from './DataSourceBar';
 import { NodeDetailPanel } from './NodeDetailPanel';
 import { ChainSignalBar } from './ChainSignalBar';
 import { StrategicPanel } from './chain/StrategicPanel';
+import { ChainGraph } from './chain/ChainGraph';
 
 interface DrilldownViewProps {
   task: Task;
@@ -187,6 +188,14 @@ export function DrilldownView({ task, onBack, onViewStockDetail }: DrilldownView
     staleTime: TREE_STALE_MS,
   });
 
+  // Chain topology graph (DD-7) — nodes with coords + edges for ChainGraph SVG
+  const { data: taskChainGraph = null } = useQuery({
+    queryKey: api.drilldownQueryKeys.taskChainGraph(task.id),
+    queryFn: () => api.getTaskChainGraph(task.id),
+    enabled: lens === 'chain',
+    staleTime: TREE_STALE_MS,
+  });
+
   // Trend series for selected node
   const { data: trendData } = useQuery({
     queryKey: selectedNode
@@ -297,58 +306,69 @@ export function DrilldownView({ task, onBack, onViewStockDetail }: DrilldownView
           isLoading={treeLoading}
         />
 
-        {/* CENTER flex — Regime / Trend / Matrix / Holdings / DataSource */}
+        {/* CENTER flex — chain lens: ChainGraph SVG; other lenses: Trend/Matrix/Holdings */}
         <main
           style={{
             flex: 1,
-            overflowY: 'auto',
-            padding: '16px 20px',
+            overflowY: lens === 'chain' ? 'hidden' : 'auto',
+            padding: lens === 'chain' ? 0 : '16px 20px',
             background: '#f8fafc',
+            display: 'flex',
+            flexDirection: 'column',
           }}
         >
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-            <RegimeBadge />
-            {selectedNode && (
-              <>
-                <NodeTrendChart
-                  selectedNode={selectedNode}
-                  data={trendData ?? null}
-                  period={trendPeriod}
-                  metric={trendMetric}
-                  onPeriodChange={setTrendPeriod}
-                  onMetricChange={setTrendMetric}
-                  isLoading={false}
-                />
-                {(selectedNode.children?.length ?? 0) > 0 && (
-                  <NodeMatrix
+          {lens === 'chain' ? (
+            <ChainGraph
+              chainGraph={taskChainGraph}
+              allNodes={allNodes}
+              selectedNodeId={selectedNodeId}
+              onSelect={handleSelect}
+            />
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+              <RegimeBadge />
+              {selectedNode && (
+                <>
+                  <NodeTrendChart
                     selectedNode={selectedNode}
-                    onSelectChild={(child) => {
-                      setSelectedNodeId(child.id);
-                      setExpandedIds((prev) => new Set([...prev, selectedNode.id, child.id]));
-                    }}
+                    data={trendData ?? null}
+                    period={trendPeriod}
+                    metric={trendMetric}
+                    onPeriodChange={setTrendPeriod}
+                    onMetricChange={setTrendMetric}
+                    isLoading={false}
                   />
-                )}
-                <NodeHoldingsTable
-                  holdings={holdings}
-                  showAll={showAllHoldings}
-                  onShowAll={() => setShowAllHoldings(true)}
-                  onRowClick={onViewStockDetail}
-                  isLoading={false}
-                  nodeProxyType={selectedNode.proxyType}
-                  nodeProxy={selectedNode.proxy}
-                  nodeProxyLabel={selectedNode.proxyLabel}
-                />
-                <DataSourceBar
-                  sourceUpdatedAt={task.updatedAt ? {
-                    finviz: task.updatedAt,
-                    marketchameleon: task.updatedAt,
-                    ibkr: task.updatedAt,
-                    futu: task.updatedAt,
-                  } : undefined}
-                />
-              </>
-            )}
-          </div>
+                  {(selectedNode.children?.length ?? 0) > 0 && (
+                    <NodeMatrix
+                      selectedNode={selectedNode}
+                      onSelectChild={(child) => {
+                        setSelectedNodeId(child.id);
+                        setExpandedIds((prev) => new Set([...prev, selectedNode.id, child.id]));
+                      }}
+                    />
+                  )}
+                  <NodeHoldingsTable
+                    holdings={holdings}
+                    showAll={showAllHoldings}
+                    onShowAll={() => setShowAllHoldings(true)}
+                    onRowClick={onViewStockDetail}
+                    isLoading={false}
+                    nodeProxyType={selectedNode.proxyType}
+                    nodeProxy={selectedNode.proxy}
+                    nodeProxyLabel={selectedNode.proxyLabel}
+                  />
+                  <DataSourceBar
+                    sourceUpdatedAt={task.updatedAt ? {
+                      finviz: task.updatedAt,
+                      marketchameleon: task.updatedAt,
+                      ibkr: task.updatedAt,
+                      futu: task.updatedAt,
+                    } : undefined}
+                  />
+                </>
+              )}
+            </div>
+          )}
         </main>
 
         {/* RIGHT 300 — NodeDetailPanel */}
