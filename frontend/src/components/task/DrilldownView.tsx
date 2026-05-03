@@ -26,9 +26,7 @@ import { NodeMatrix } from './NodeMatrix';
 import { NodeHoldingsTable } from './NodeHoldingsTable';
 import { DataSourceBar } from './DataSourceBar';
 import { NodeDetailPanel } from './NodeDetailPanel';
-import { ChainSignalBar } from './ChainSignalBar';
-import { StrategicPanel } from './chain/StrategicPanel';
-import { ChainGraph } from './chain/ChainGraph';
+import { ChainView } from './chain/ChainView';
 
 interface DrilldownViewProps {
   task: Task;
@@ -249,8 +247,6 @@ export function DrilldownView({ task, onBack, onViewStockDetail }: DrilldownView
           </span>
         </div>
 
-        {lens === 'chain' && <ChainSignalBar signals={chainSignals} />}
-
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <button
             onClick={onBack}
@@ -291,40 +287,47 @@ export function DrilldownView({ task, onBack, onViewStockDetail }: DrilldownView
         </div>
       </div>
 
-      {/* Three-column area */}
-      <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
-        {/* LEFT 280 — NodeTree */}
-        <NodeTree
-          nodes={nodeTree ?? []}
-          selectedNodeId={selectedNode?.id ?? null}
-          expandedIds={expandedIds}
-          lens={lens}
-          onSelect={handleSelect}
-          onToggleExpand={handleToggleExpand}
-          onLensChange={handleLensChange}
-          totalNodeCount={allNodes.length}
-          isLoading={treeLoading}
+      {lens === 'chain' ? (
+        <ChainView
+          task={task}
+          selectedNode={selectedNode}
+          allNodes={allNodes}
+          holdings={holdings}
+          chainGraph={taskChainGraph}
+          chainSignals={chainSignals}
+          chainStrategy={chainStrategy}
+          period={trendPeriod}
+          onSelectNode={handleSelect}
+          onPeriodChange={setTrendPeriod}
+          onBackToGics={() => handleLensChange('hybrid')}
         />
+      ) : (
+        /* Three-column area for GICS lenses */
+        <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
+          {/* LEFT 280 — NodeTree */}
+          <NodeTree
+            nodes={nodeTree ?? []}
+            selectedNodeId={selectedNode?.id ?? null}
+            expandedIds={expandedIds}
+            lens={lens}
+            onSelect={handleSelect}
+            onToggleExpand={handleToggleExpand}
+            onLensChange={handleLensChange}
+            totalNodeCount={allNodes.length}
+            isLoading={treeLoading}
+          />
 
-        {/* CENTER flex — chain lens: ChainGraph SVG; other lenses: Trend/Matrix/Holdings */}
-        <main
-          style={{
-            flex: 1,
-            overflowY: lens === 'chain' ? 'hidden' : 'auto',
-            padding: lens === 'chain' ? 0 : '16px 20px',
-            background: '#f8fafc',
-            display: 'flex',
-            flexDirection: 'column',
-          }}
-        >
-          {lens === 'chain' ? (
-            <ChainGraph
-              chainGraph={taskChainGraph}
-              allNodes={allNodes}
-              selectedNodeId={selectedNodeId}
-              onSelect={handleSelect}
-            />
-          ) : (
+          {/* CENTER flex — Trend / Matrix / Holdings */}
+          <main
+            style={{
+              flex: 1,
+              overflowY: 'auto',
+              padding: '16px 20px',
+              background: '#f8fafc',
+              display: 'flex',
+              flexDirection: 'column',
+            }}
+          >
             <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
               <RegimeBadge />
               {selectedNode && (
@@ -368,43 +371,31 @@ export function DrilldownView({ task, onBack, onViewStockDetail }: DrilldownView
                 </>
               )}
             </div>
-          )}
-        </main>
+          </main>
 
-        {/* RIGHT 300 — NodeDetailPanel */}
-        <aside
-          style={{
-            width: 300,
-            flexShrink: 0,
-            borderLeft: '1px solid #e2e8f0',
-            background: '#f8fafc',
-            display: 'flex',
-            flexDirection: 'column',
-            overflow: 'hidden',
-          }}
-        >
-          {selectedNode && (
-            lens === 'chain' && chainStrategy ? (
-              <div style={{ overflowY: 'auto', padding: 12 }}>
-                <StrategicPanel
-                  strategy={chainStrategy}
-                  allNodes={allNodes}
-                  selectedNode={selectedNode}
-                  holdings={holdings}
-                  onSelectNode={(n) => setSelectedNodeId(n.id)}
-                />
-              </div>
-            ) : (
+          {/* RIGHT 300 — NodeDetailPanel */}
+          <aside
+            style={{
+              width: 300,
+              flexShrink: 0,
+              borderLeft: '1px solid #e2e8f0',
+              background: '#f8fafc',
+              display: 'flex',
+              flexDirection: 'column',
+              overflow: 'hidden',
+            }}
+          >
+            {selectedNode && (
               <NodeDetailPanel
                 selectedNode={selectedNode}
                 allNodes={allNodes}
                 holdings={holdings}
                 onSelectNode={(n) => setSelectedNodeId(n.id)}
               />
-            )
-          )}
-        </aside>
-      </div>
+            )}
+          </aside>
+        </div>
+      )}
     </div>
   );
 }
