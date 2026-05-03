@@ -512,6 +512,61 @@ class NodePriceSeries(Base):
     )
 
 
+# ============ 产业链拓扑视图层 (Task DD-10 — chain_topology YAML 落库) ============
+# ChainNode / ChainEdge 是「板块下钻」前端图渲染所需的最小展示模型：
+# - 顶点坐标 (cx, cy, w, h) 直接由 chain_topology/<sector>.yaml 提供
+# - role / tier 控制视觉层级与配色
+# - proxy / proxy_type / proxy_label 是节点对外展示的"市场表达"标签
+# 启动时由 chain_topology_loader 幂等 upsert，task_id 为 NULL 表示「板块模板」。
+# 全部新列 nullable=True / 带 default，不破坏老数据行（CLAUDE.md §向后兼容 & 数据安全）。
+
+class ChainNode(Base):
+    """产业链拓扑节点（前端图渲染用）。"""
+    __tablename__ = "chain_nodes"
+
+    id = Column(Integer, primary_key=True)
+    task_id = Column(Integer, nullable=True, index=True)
+    # NULL = 板块模板；非空 = 任务级 override（预留，当前阶段不写）
+    sector = Column(String(20), nullable=True, index=True)  # 'xlk' / 'xlf' ...
+    node_id = Column(String(64), nullable=True, index=True)  # 与 AnalyticNode.node_id 对齐
+    role = Column(String(32), nullable=True)        # root / l1 / chain / leaf / evidence
+    tier = Column(Integer, nullable=True)           # 视觉层级（与 AnalyticNode.level 同义）
+    cx = Column(Float, nullable=True)               # 坐标系：百分比 (0-100)
+    cy = Column(Float, nullable=True)
+    w = Column(Float, nullable=True)
+    h = Column(Float, nullable=True)
+    proxy = Column(String(20), nullable=True)       # 'SOXX' / 'SMH' / 'NVDA-basket'
+    proxy_type = Column(String(20), nullable=True)  # 'primary' / 'secondary' / 'synthetic' / 'extension'
+    proxy_label = Column(String(64), nullable=True) # 前端徽章显示用（中文 / 简称）
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint('task_id', 'sector', 'node_id', name='uix_chain_node_task_sector_node'),
+    )
+
+
+class ChainEdge(Base):
+    """产业链拓扑边（前端图渲染用）。"""
+    __tablename__ = "chain_edges"
+
+    id = Column(Integer, primary_key=True)
+    task_id = Column(Integer, nullable=True, index=True)
+    sector = Column(String(20), nullable=True, index=True)
+    src_node_id = Column(String(64), nullable=True, index=True)
+    dst_node_id = Column(String(64), nullable=True, index=True)
+    is_cross = Column(Boolean, default=False)
+    # is_cross=True 表示跨视图边（如 corroborates / drives，不是纯父子结构）
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'task_id', 'sector', 'src_node_id', 'dst_node_id',
+            name='uix_chain_edge_task_sector_pair',
+        ),
+    )
+
+
 # ============ 辅助函数 ============
 
 def is_valid_ticker(ticker: str) -> bool:
@@ -557,6 +612,7 @@ def init_db():
     _ensure_node_tables_indexes()
     _ensure_tasks_node_fields_columns()
     _ensure_task_view_mode_default_hybrid()
+    _ensure_chain_topology_indexes()
     logger.info("数据库表已创建")
 
 
@@ -723,6 +779,29 @@ def _ensure_node_tables_indexes():
                 text(
                     "CREATE INDEX IF NOT EXISTS idx_node_proxies_etf_symbol "
                     "ON node_proxies(etf_symbol)"
+                )
+            )
+
+
+def _ensure_chain_topology_indexes():
+    """为 chain_topology 表（chain_nodes / chain_edges）补齐查询索引（仅 sqlite）"""
+    if engine.dialect.name != "sqlite":
+        return
+    inspector = inspect(engine)
+    table_names = set(inspector.get_table_names())
+    with engine.begin() as conn:
+        if "chain_nodes" in table_names:
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_chain_nodes_sector_task "
+                    "ON chain_nodes(sector, task_id)"
+                )
+            )
+        if "chain_edges" in table_names:
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_chain_edges_sector_task "
+                    "ON chain_edges(sector, task_id)"
                 )
             )
 

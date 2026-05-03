@@ -24,6 +24,15 @@ try:
 except Exception as e:
     logger.exception("默认板块 ETF 初始化失败", err=str(e))
 
+# Task DD-10: 启动时把 chain_topology/<sector>.yaml 幂等 upsert 进 chain_nodes/chain_edges
+try:
+    from app.services.chain_topology_loader import load_all_chain_topologies
+
+    summary = load_all_chain_topologies()
+    logger.info("chain_topology 已加载", sectors=summary)
+except Exception as e:
+    logger.exception("chain_topology 启动加载失败", err=str(e))
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

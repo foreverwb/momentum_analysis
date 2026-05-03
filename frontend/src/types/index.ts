@@ -565,6 +565,35 @@ export interface ChainGraphResponse {
   warning?: string;
 }
 
+// ─── Phase 4 DD-10: Chain Topology Graph (full nodes + edges + signals + strategy) ────
+
+export interface ChainGraphNode {
+  node_id: string;
+  role: string | null;
+  tier: number | null;
+  cx: number | null;
+  cy: number | null;
+  w: number | null;
+  h: number | null;
+  proxy: string | null;
+  proxy_type: string | null;
+  proxy_label: string | null;
+}
+
+export interface ChainGraphEdge {
+  src_node_id: string;
+  dst_node_id: string;
+  is_cross: boolean;
+}
+
+export interface TaskChainGraphResponse {
+  sector: string;
+  nodes: ChainGraphNode[];
+  edges: ChainGraphEdge[];
+  signals: ChainSignalResult | null;
+  strategy: ChainStrategyResult | null;
+}
+
 export interface RefreshResult {
   status: 'success' | 'error' | 'partial' | 'snapshot' | 'failed' | 'warning';
   symbol: string;

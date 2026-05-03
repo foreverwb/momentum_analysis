@@ -23,6 +23,8 @@ from sqlalchemy.orm import Session
 from app.models import get_db
 from app.models.database import (
     AnalyticNode,
+    ChainEdge,
+    ChainNode,
     NodeEdge,
     NodeEdgeType,
     NodeProxy,
@@ -523,6 +525,158 @@ async def get_chain_graph(
     nodes_map, children_map = _collect_strategy_inputs(db, config)
     result = compute_chain_strategy(nodes_map, children_map, config)
     return {"strategy": _serialize_strategy(result)}
+
+
+# ============ 6. GET /api/tasks/{task_id}/chain-graph (Task DD-10) ============
+# 与 §5 不同：此端点直接吐出 chain_topology YAML 落库的拓扑（节点+边），
+# 并把 chain_signals(DD-3) / chain_strategy(DD-4) 的输出一并返回，
+# 用于前端「板块下钻」整图渲染（含坐标 / 角色 / 跨视图边）。
+
+
+@router.get(
+    "/{task_id}/chain-graph",
+    response_model=Dict[str, Any],
+)
+async def get_task_chain_graph(
+    task_id: int,
+    sector: Optional[str] = Query(
+        None,
+        description="板块标识（小写）。缺省时从 task.root_node / task.sector 推断。",
+    ),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """返回某任务的产业链整图：nodes / edges / signals / strategy。
+
+    Args:
+        task_id: 任务 ID。
+        sector: 板块标识；缺省时从 task 推断。
+        db: SQLAlchemy session。
+
+    Returns:
+        {
+            sector: 'xlk',
+            nodes: [{node_id, role, tier, cx, cy, w, h, proxy, proxy_type, proxy_label}, ...],
+            edges: [{src_node_id, dst_node_id, is_cross}, ...],
+            signals: {upstream, broad, downstream, label, color} | null,
+            strategy: {l1_ranking, breadth, confirmation, best_drill} | null,
+        }
+
+    Raises:
+        HTTPException 404: task 不存在 / 该板块没有 chain_topology 拓扑。
+    """
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    resolved_sector = _resolve_sector(task, sector)
+
+    nodes_payload, edges_payload = _load_chain_graph_for_sector(db, resolved_sector)
+    if not nodes_payload:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No chain_topology loaded for sector '{resolved_sector}'. "
+                f"Add backend/app/configs/chain_topology/{resolved_sector}.yaml "
+                f"and restart, or run the loader explicitly."
+            ),
+        )
+
+    signals_payload = _safe_compute_chain_signals(db, resolved_sector)
+    strategy_payload = _safe_compute_chain_strategy(db, resolved_sector)
+
+    return {
+        "sector": resolved_sector,
+        "nodes": nodes_payload,
+        "edges": edges_payload,
+        "signals": signals_payload,
+        "strategy": strategy_payload,
+    }
+
+
+def _load_chain_graph_for_sector(
+    db: Session,
+    sector: str,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """读取 chain_nodes / chain_edges 中指定板块的模板行（task_id IS NULL）。"""
+    node_rows = (
+        db.query(ChainNode)
+        .filter(ChainNode.task_id.is_(None), ChainNode.sector == sector)
+        .order_by(ChainNode.tier.is_(None), ChainNode.tier, ChainNode.id)
+        .all()
+    )
+    edge_rows = (
+        db.query(ChainEdge)
+        .filter(ChainEdge.task_id.is_(None), ChainEdge.sector == sector)
+        .order_by(ChainEdge.id)
+        .all()
+    )
+    nodes_payload = [
+        {
+            "node_id": n.node_id,
+            "role": n.role,
+            "tier": n.tier,
+            "cx": n.cx,
+            "cy": n.cy,
+            "w": n.w,
+            "h": n.h,
+            "proxy": n.proxy,
+            "proxy_type": n.proxy_type,
+            "proxy_label": n.proxy_label,
+        }
+        for n in node_rows
+    ]
+    edges_payload = [
+        {
+            "src_node_id": e.src_node_id,
+            "dst_node_id": e.dst_node_id,
+            "is_cross": bool(e.is_cross),
+        }
+        for e in edge_rows
+    ]
+    return nodes_payload, edges_payload
+
+
+def _safe_compute_chain_signals(
+    db: Session,
+    sector: str,
+) -> Optional[Dict[str, Any]]:
+    """复用 DD-3 chain_signals 引擎；缺配置时返回 None（不阻断响应）。"""
+    try:
+        rules = load_chain_signal_rules(sector)
+    except FileNotFoundError:
+        return None
+
+    watched = (
+        rules.upstream.watched_nodes
+        + rules.broad.watched_nodes
+        + rules.downstream.watched_nodes
+    )
+    unique_nodes = list(dict.fromkeys(watched))
+    score_results = batch_calculate_node_scores(unique_nodes, db)
+    node_scores = {r.node_id: float(r.total_score) for r in score_results}
+
+    res = compute_chain_signals(node_scores, rules)
+    return {
+        "upstream": res.upstream,
+        "broad": res.broad,
+        "downstream": res.downstream,
+        "label": res.label,
+        "color": res.color,
+    }
+
+
+def _safe_compute_chain_strategy(
+    db: Session,
+    sector: str,
+) -> Optional[Dict[str, Any]]:
+    """复用 DD-4 chain_strategy 引擎；缺配置时返回 None（不阻断响应）。"""
+    try:
+        config = load_chain_strategy_config(sector)
+    except (FileNotFoundError, KeyError):
+        return None
+    nodes_map, children_map = _collect_strategy_inputs(db, config)
+    result = compute_chain_strategy(nodes_map, children_map, config)
+    return _serialize_strategy(result)
 
 
 def _collect_strategy_inputs(

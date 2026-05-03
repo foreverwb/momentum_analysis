@@ -1,0 +1,47 @@
+# XLK 产业链拓扑（前端图渲染配置）
+# 来源: drilldown.md §4 + node_taxonomy/xlk.yaml 节点 ID 对齐
+# 维护规则（CLAUDE.md §扩展性）：
+#   - 新增板块只需新增 <sector>.yaml，不改 .py
+#   - 节点 ID 必须与 node_taxonomy/<sector>.yaml 中的 node_id 一致
+#   - 坐标 cx/cy 为画布百分比（0-100），w/h 为节点矩形大小（百分比）
+#   - role: root / l1 / chain / leaf / evidence
+#   - is_cross: 跨结构关系（drives / corroborates 等非父子边），仅用于视觉区分
+
+sector: xlk
+
+nodes:
+  - {node_id: XLK,          role: root,     tier: 0, cx: 50, cy: 8,   w: 14, h: 8, proxy: XLK,  proxy_type: primary,   proxy_label: 科技板块}
+  - {node_id: semi,         role: l1,       tier: 1, cx: 22, cy: 28,  w: 14, h: 8, proxy: SOXX, proxy_type: primary,   proxy_label: 半导体}
+  - {node_id: soft,         role: l1,       tier: 1, cx: 50, cy: 28,  w: 14, h: 8, proxy: IGV,  proxy_type: primary,   proxy_label: 软件}
+  - {node_id: hw,           role: l1,       tier: 1, cx: 78, cy: 28,  w: 14, h: 8, proxy: HW,   proxy_type: synthetic, proxy_label: 硬件}
+  - {node_id: semi-equip,   role: chain,    tier: 2, cx: 6,  cy: 52,  w: 12, h: 7, proxy: SMH,  proxy_type: primary,   proxy_label: 设备}
+  - {node_id: semi-compute, role: chain,    tier: 2, cx: 22, cy: 52,  w: 12, h: 7, proxy: NVDA, proxy_type: synthetic, proxy_label: 计算}
+  - {node_id: semi-mem,     role: chain,    tier: 2, cx: 38, cy: 52,  w: 12, h: 7, proxy: DRAM, proxy_type: primary,   proxy_label: 存储}
+  - {node_id: semi-conn,    role: chain,    tier: 2, cx: 54, cy: 52,  w: 12, h: 7, proxy: SIXG, proxy_type: primary,   proxy_label: 连接}
+  - {node_id: conn-optical, role: leaf,     tier: 3, cx: 46, cy: 78,  w: 12, h: 7, proxy: CIEN, proxy_type: extension, proxy_label: 光互联}
+  - {node_id: conn-copper,  role: leaf,     tier: 3, cx: 62, cy: 78,  w: 12, h: 7, proxy: APH,  proxy_type: extension, proxy_label: 铜缆}
+  - {node_id: soft-cloud,   role: evidence, tier: 2, cx: 70, cy: 52,  w: 12, h: 7, proxy: SKYY, proxy_type: primary,   proxy_label: 云计算}
+  - {node_id: soft-cyber,   role: evidence, tier: 2, cx: 86, cy: 52,  w: 12, h: 7, proxy: HACK, proxy_type: primary,   proxy_label: 网络安全}
+
+edges:
+  # GICS 主干: XLK → 三个 L1 节点
+  - {src: XLK,          dst: semi,         is_cross: false}
+  - {src: XLK,          dst: soft,         is_cross: false}
+  - {src: XLK,          dst: hw,           is_cross: false}
+
+  # 半导体产业链
+  - {src: semi,         dst: semi-equip,   is_cross: false}
+  - {src: semi,         dst: semi-compute, is_cross: false}
+  - {src: semi,         dst: semi-mem,     is_cross: false}
+  - {src: semi,         dst: semi-conn,    is_cross: false}
+
+  # 连接叶子
+  - {src: semi-conn,    dst: conn-optical, is_cross: false}
+  - {src: semi-conn,    dst: conn-copper,  is_cross: false}
+
+  # 软件证据节点（corroborates，挂在 soft 下）
+  - {src: soft,         dst: soft-cloud,   is_cross: true}
+  - {src: soft,         dst: soft-cyber,   is_cross: true}
+
+  # 跨视图: 算力依赖连接（drives，非主干父子）
+  - {src: semi-compute, dst: semi-conn,    is_cross: true}

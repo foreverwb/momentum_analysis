@@ -24,6 +24,7 @@ import type {
   ChainSignalResult,
   ChainStrategyResult,
   ChainGraphResponse,
+  TaskChainGraphResponse,
 } from '../types';
 import { getBeijingCutoffBoundaryMs, getBeijingSyncWindowKey, parseUtcTimestampMs } from '../utils/beijingTime';
 
@@ -2385,6 +2386,16 @@ export async function getChainGraph(
   return raw.strategy ?? null;
 }
 
+export async function getTaskChainGraph(
+  taskId: number,
+  sector?: string
+): Promise<TaskChainGraphResponse> {
+  const params = sector ? `?sector=${encodeURIComponent(sector)}` : '';
+  return fetchApi<TaskChainGraphResponse>(
+    `/tasks/${taskId}/chain-graph${params}`
+  );
+}
+
 export const drilldownQueryKeys = {
   nodeTree: (taskId: number, lens: TaskViewMode) =>
     ['task-nodes', taskId, lens] as const,
@@ -2400,4 +2411,6 @@ export const drilldownQueryKeys = {
     ['chain-signals', taskId] as const,
   chainGraph: (taskId: number) =>
     ['chain-graph', taskId] as const,
+  taskChainGraph: (taskId: number) =>
+    ['task-chain-graph', taskId] as const,
 };
