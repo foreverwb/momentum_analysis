@@ -116,11 +116,22 @@ export function ChainGraph({
 }: ChainGraphProps): React.ReactElement {
   const [hoverId, setHoverId] = useState<string | null>(null);
 
-  // Prefer backend layout; fall back to mock when backend coords not yet available
-  const layoutNodes: ChainGraphNode[] =
-    chainGraph?.nodes?.length ? chainGraph.nodes : MOCK_LAYOUT_NODES;
+  // Backend coords are 0-100 percentage space; scale to SVG pixel space (VW×VH).
+  // 不使用 mock fallback 避免 mock→real 坐标跳变引发的初始抖动。
+  // chainGraph===null（加载中）→ 返回空数组 → 只渲染 tier bands + loading 文案。
+  const layoutNodes = useMemo<ChainGraphNode[]>(() => {
+    const backendNodes = chainGraph?.nodes;
+    if (!backendNodes?.length) return [];
+    return backendNodes.map((n) => ({
+      ...n,
+      cx: n.cx !== null ? (n.cx * VW) / 100 : null,
+      cy: n.cy !== null ? (n.cy * VH) / 100 : null,
+      w:  n.w  !== null ? (n.w  * VW) / 100 : null,
+      h:  n.h  !== null ? (n.h  * VH) / 100 : null,
+    }));
+  }, [chainGraph]);
   const edges: ChainGraphEdge[] =
-    chainGraph?.edges?.length ? chainGraph.edges : MOCK_EDGES;
+    chainGraph?.edges?.length ? chainGraph.edges : [];
 
   // Score/label lookup: mock as baseline, live allNodes overrides
   const scoreMap = useMemo<Map<string, ResearchNode>>(() => {
@@ -260,7 +271,7 @@ export function ChainGraph({
                 {/* Role stripe — 3px wide left-edge bar */}
                 <rect
                   x={x0} y={y0 + 6}
-                  width={3} height={ln.h - 12}
+                  width={3} height={Math.max(0, ln.h - 12)}
                   rx={1.5} fill={roleColor}
                 />
 
@@ -325,6 +336,18 @@ export function ChainGraph({
             </text>
           ))}
         </svg>
+        {/* Loading overlay — 加载中或无拓扑数据时居中显示提示 */}
+        {layoutNodes.length === 0 && (
+          <div style={{
+            position: 'absolute', inset: 0,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            pointerEvents: 'none',
+          }}>
+            <span style={{ fontSize: 13, color: '#94a3b8' }}>
+              {chainGraph === null ? '加载产业链图…' : '暂无拓扑数据'}
+            </span>
+          </div>
+        )}
       </div>
 
       {/* Bottom legend */}
